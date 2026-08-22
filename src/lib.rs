@@ -5,6 +5,8 @@
 //! modules; the modules themselves are exposed here so integration tests can
 //! exercise them directly.
 
+pub mod app;
 pub mod render;
+pub mod routes;
 pub mod server;
 pub mod watch;

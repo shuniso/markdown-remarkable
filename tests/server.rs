@@ -23,8 +23,12 @@ struct TestServer {
 }
 
 fn start_test_server(markdown: &str) -> TestServer {
+    start_test_server_named(markdown, "doc.md")
+}
+
+fn start_test_server_named(markdown: &str, file_name: &str) -> TestServer {
     let dir = tempfile::tempdir().expect("create tempdir");
-    let file_path = dir.path().join("doc.md");
+    let file_path = dir.path().join(file_name);
     std::fs::write(&file_path, markdown).expect("write temp markdown file");
 
     let http_server = server::bind(0).expect("bind test server to an OS-assigned port");
@@ -282,6 +286,92 @@ fn missing_host_header_is_tolerated_on_http_1_0() {
         response.starts_with("HTTP/1.0 200") || response.starts_with("HTTP/1.1 200"),
         "expected 200 for a missing Host header on HTTP/1.0, got: {response}"
     );
+}
+
+#[test]
+fn body_route_returns_fragment_with_title_header() {
+    let harness = start_test_server("# Hello\n\nSome *text*.\n");
+
+    let response = raw_get(harness.addr, "/body");
+    assert!(
+        response.starts_with("HTTP/1.1 200"),
+        "expected 200 for GET /body, got: {response}"
+    );
+
+    let headers = response_headers(&response);
+    assert!(
+        headers.contains("x-mdview-title: doc.md"),
+        "missing X-Mdview-Title header on /body: {headers}"
+    );
+    assert!(
+        headers.contains("content-type: text/html; charset=utf-8"),
+        "missing/incorrect Content-Type on /body: {headers}"
+    );
+    assert!(
+        headers.contains("cache-control: no-store"),
+        "missing Cache-Control on /body: {headers}"
+    );
+
+    let body = response_body(&response);
+    assert!(body.contains("<h1>Hello</h1>"));
+    assert!(body.contains("<em>text</em>"));
+    // /body is a fragment, not a full page.
+    assert!(!body.contains("<html"));
+    assert!(!body.contains("__mdviewVersion"));
+}
+
+#[test]
+fn body_route_survives_non_ascii_file_names() {
+    let harness = start_test_server_named("# Hello\n", "メモ.md");
+
+    let response = raw_get(harness.addr, "/body");
+    assert!(
+        response.starts_with("HTTP/1.1 200"),
+        "expected 200 for GET /body on a non-ASCII file name, got: {response}"
+    );
+    let headers = response_headers(&response);
+    assert!(
+        headers.contains("x-mdview-title: %e3%83%a1%e3%83%a2.md"),
+        "title header must be percent-encoded ASCII: {headers}"
+    );
+    assert!(response_body(&response).contains("<h1>Hello</h1>"));
+
+    // The server must still be alive afterwards (no panic on the header).
+    let again = raw_get(harness.addr, "/version");
+    assert!(again.starts_with("HTTP/1.1 200"), "{again}");
+}
+
+#[test]
+fn body_route_returns_200_error_fragment_after_the_file_is_deleted() {
+    let harness = start_test_server("# Hi\n");
+    std::fs::remove_file(&harness.file_path).expect("delete temp markdown file");
+
+    let response = raw_get(harness.addr, "/body");
+    assert!(
+        response.starts_with("HTTP/1.1 200"),
+        "expected 200 error fragment for /body after deletion, got: {response}"
+    );
+    let body = response_body(&response);
+    assert!(body.contains("Failed to read doc.md"), "{body}");
+    assert!(!body.contains(harness.file_path.to_str().unwrap()));
+
+    // The 500 page for `/` must still carry the live script so the view
+    // recovers on its own once the file is back.
+    let root = raw_get(harness.addr, "/");
+    assert!(root.starts_with("HTTP/1.1 500"), "{root}");
+    assert!(response_body(&root).contains("/version"), "{root}");
+}
+
+#[test]
+fn all_routes_carry_frame_ancestors_csp_header() {
+    let harness = start_test_server("# Hi\n");
+    for path in ["/", "/version", "/body"] {
+        let headers = response_headers(&raw_get(harness.addr, path));
+        assert!(
+            headers.contains("content-security-policy: frame-ancestors 'none'"),
+            "missing frame-ancestors on {path}: {headers}"
+        );
+    }
 }
 
 #[test]

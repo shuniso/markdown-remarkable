@@ -1,69 +1,112 @@
 //! `mdview` CLI entry point.
 //!
 //! This file only parses arguments and wires the library modules together
-//! (rendering, the HTTP server, and file watching); the actual logic lives
-//! in `markdown_remarkable::{render, server, watch}`.
+//! (rendering, the native app, the HTTP server, and file watching); the
+//! actual logic lives in `markdown_remarkable::{app, render, server,
+//! watch}`.
 
 use anyhow::{Context, Result};
 use clap::Parser;
 use markdown_remarkable::render::{page, to_html};
-use markdown_remarkable::{server, watch};
+use markdown_remarkable::{app, server, watch};
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::AtomicU64;
 use std::sync::Arc;
 
-/// A tiny Markdown viewer: renders a file to GitHub-flavored HTML, serves it
-/// locally, and reloads the browser whenever the file is saved.
+/// A tiny Markdown viewer: opens a native window (by default) or serves the
+/// file to a browser tab (`--browser`), reloading in place whenever the
+/// file is saved.
 #[derive(Parser, Debug)]
 #[command(name = "mdview", version, about)]
 struct Cli {
-    /// Markdown file to view.
-    file: PathBuf,
+    /// Markdown file to view. If omitted, the native window opens a
+    /// file-picker dialog on startup — cancelling it shows an empty "drop a
+    /// file here" page instead of exiting.
+    file: Option<PathBuf>,
 
-    /// Port to listen on. 0 lets the OS pick a free port.
-    #[arg(long, default_value_t = 0)]
+    /// Show the file in your default browser instead of opening a native
+    /// window (the original CLI's behavior, unchanged). Requires FILE.
+    #[arg(long, requires = "file")]
+    browser: bool,
+
+    /// Port to listen on. 0 lets the OS pick a free port. Only applies to
+    /// `--browser`.
+    #[arg(long, default_value_t = 0, requires = "browser")]
     port: u16,
 
-    /// Don't open the default browser automatically.
-    #[arg(long)]
+    /// Don't open the default browser automatically. Only applies to
+    /// `--browser`.
+    #[arg(long, requires = "browser")]
     no_open: bool,
 
     /// Render the file to a standalone HTML file and exit, instead of
-    /// starting a server. Not compatible with `--port`/`--no-open`, which
-    /// only apply to the server.
-    #[arg(long, value_name = "OUT.html", conflicts_with_all = ["port", "no_open"])]
+    /// showing it live. Requires FILE, and is mutually exclusive with
+    /// `--browser`/`--port`/`--no-open` (which only apply to the live
+    /// view).
+    #[arg(
+        long,
+        value_name = "OUT.html",
+        requires = "file",
+        conflicts_with_all = ["browser", "port", "no_open"]
+    )]
     export: Option<PathBuf>,
 }
 
 fn main() -> Result<()> {
     let cli = Cli::parse();
 
-    // Reading the file up front (rather than just checking existence)
-    // catches both "doesn't exist" and "exists but isn't readable" before
-    // we do anything else, and gives a clear exit-1 error for either.
-    let markdown = fs::read_to_string(&cli.file)
-        .with_context(|| format!("failed to read {}", cli.file.display()))?;
+    // If FILE was given, confirm up front that it's readable — this turns
+    // "doesn't exist"/"unreadable" into a clean exit-1 error before doing
+    // anything else (opening a server, a window, etc.) in every mode, the
+    // same as the original CLI did.
+    let markdown = cli
+        .file
+        .as_deref()
+        .map(|file| {
+            fs::read_to_string(file).with_context(|| format!("failed to read {}", file.display()))
+        })
+        .transpose()?;
 
-    if let Some(export_path) = &cli.export {
-        return export(&cli.file, &markdown, export_path);
+    if let Some(export_path) = cli.export.as_deref() {
+        // clap guarantees `file`/`markdown` are `Some` here (`--export`
+        // `requires = "file"`).
+        let file = cli.file.as_deref().expect("--export requires FILE");
+        let markdown = markdown.expect("--export requires FILE");
+        return export(file, &markdown, export_path);
     }
 
+    if cli.browser {
+        // clap guarantees `file` is `Some` here (`--browser` `requires =
+        // "file"`): the browser server has no equivalent of the native
+        // app's file-picker dialog / drag&drop, so there's nothing sensible
+        // to serve without one.
+        let file = cli.file.as_deref().expect("--browser requires FILE");
+        return run_browser(file, cli.port, cli.no_open);
+    }
+
+    app::run(cli.file)
+}
+
+/// The original `--browser` flow: bind a local HTTP server, watch the file,
+/// open the default browser, and serve forever. Unchanged from before this
+/// file gained a native-window default.
+fn run_browser(file: &Path, port: u16, no_open: bool) -> Result<()> {
     let version = Arc::new(AtomicU64::new(0));
 
-    let http_server = server::bind(cli.port).context("failed to start server")?;
-    let port = http_server
+    let http_server = server::bind(port).context("failed to start server")?;
+    let bound_port = http_server
         .server_addr()
         .to_ip()
         .context("server is not bound to a TCP address")?
         .port();
-    let url = format!("http://127.0.0.1:{port}/");
-    println!("Serving {} at {url}", cli.file.display());
+    let url = format!("http://127.0.0.1:{bound_port}/");
+    println!("Serving {} at {url}", file.display());
 
     // Keep the watcher bound for the lifetime of the program: dropping it
     // would stop the watch. A failure here is non-fatal — we just lose
     // live-reload and keep serving.
-    let _watcher = match watch::watch(&cli.file, Arc::clone(&version)) {
+    let _watcher = match watch::watch(file, Arc::clone(&version)) {
         Ok(watcher) => Some(watcher),
         Err(err) => {
             eprintln!("warning: live-reload disabled: {err}");
@@ -71,13 +114,13 @@ fn main() -> Result<()> {
         }
     };
 
-    if !cli.no_open {
+    if !no_open {
         if let Err(err) = open::that(&url) {
             eprintln!("warning: failed to open browser: {err}");
         }
     }
 
-    server::run(http_server, &cli.file, version)
+    server::run(http_server, file, version)
 }
 
 /// Renders `markdown` (already read from `file`, so `--export` doesn't pay

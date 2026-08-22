@@ -4,12 +4,17 @@
 //! — instead of a single blocking `serve` call, because `main` needs the
 //! actual bound address (to open the browser and print where it's
 //! listening) before it starts serving requests forever.
+//!
+//! Actual routing (which path maps to which content) lives in
+//! [`crate::routes`], shared with the native app's custom protocol handler.
+//! This module keeps only what's specific to being an HTTP server: `Host`
+//! header validation (a custom protocol has no such header to spoof) and
+//! converting a [`routes::Reply`] into a `tiny_http::Response`.
 
-use crate::render::{page, to_html};
+use crate::routes::{self, Reply};
 use anyhow::{anyhow, Context, Result};
-use std::fs;
 use std::path::Path;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::AtomicU64;
 use std::sync::Arc;
 use tiny_http::{Header, Method, Request, Response, Server};
 
@@ -21,28 +26,20 @@ pub fn bind(port: u16) -> Result<Server> {
         .map_err(|err| anyhow!("failed to bind to 127.0.0.1:{port}: {err}"))
 }
 
-/// Serves requests on `server` until the server is closed. Routing (after a
-/// `Host` header check — see [`host_rejection_reason`]; anything else is
-/// `403`):
+/// Serves requests on `server` until the server is closed.
 ///
-/// - `GET`/`HEAD /` — re-reads `path` from disk, renders it to HTML, and
-///   returns the full page (`text/html; charset=utf-8`, `Cache-Control:
-///   no-store`, `X-Content-Type-Options: nosniff`, and a
-///   `Content-Security-Policy: frame-ancestors 'none'` header). A read
-///   failure (file deleted, permissions changed, etc.) yields `500` with
-///   the error message as the body (same security headers) rather than
-///   tearing down the server.
-/// - `GET`/`HEAD /version` — returns the current value of `version` as
-///   plain text (`Cache-Control: no-store`, `X-Content-Type-Options:
-///   nosniff`), for the page's live-reload script to poll.
-/// - anything else — `404`.
+/// After a `Host` header check (see [`host_rejection_reason`]; anything
+/// suspicious is `403`), only `GET`/`HEAD` requests are routed at all —
+/// everything else is `404`, matching the original behavior before routing
+/// moved to [`crate::routes`]. The request path (query string included) is
+/// handed to `routes::handle`, and the resulting [`Reply`] is converted to a
+/// `tiny_http::Response` and sent.
 ///
-/// A query string on the request path (`/?x=1`) is ignored for routing
-/// purposes. A failure sending an individual response is logged to stderr
-/// and does not stop the server — one broken connection shouldn't take
-/// every other tab viewing the file down with it. This function itself only
-/// returns once the underlying `tiny_http` request iterator ends, which in
-/// practice means the server was shut down out from under it.
+/// A failure sending an individual response is logged to stderr and does
+/// not stop the server — one broken connection shouldn't take every other
+/// tab viewing the file down with it. This function itself only returns
+/// once the underlying `tiny_http` request iterator ends, which in practice
+/// means the server was shut down out from under it.
 pub fn run(server: Server, path: &Path, version: Arc<AtomicU64>) -> Result<()> {
     for request in server.incoming_requests() {
         if let Err(err) = handle_request(request, path, &version) {
@@ -59,14 +56,41 @@ fn handle_request(request: Request, path: &Path, version: &AtomicU64) -> Result<
             .context("failed to send 403 response");
     }
 
-    let request_path = request.url().split('?').next().unwrap_or("/");
-
-    match (request.method(), request_path) {
-        (Method::Get | Method::Head, "/") => respond_with_page(request, path, version),
-        (Method::Get | Method::Head, "/version") => respond_with_version(request, version),
+    match request.method() {
+        Method::Get | Method::Head => {
+            let reply = routes::handle(request.url(), Some(path), version);
+            send_reply(request, reply)
+        }
         _ => request
             .respond(Response::from_string("404 Not Found").with_status_code(404))
             .context("failed to send 404 response"),
+    }
+}
+
+/// Converts a [`Reply`] into a `tiny_http::Response` and sends it.
+fn send_reply(request: Request, reply: Reply) -> Result<()> {
+    let mut response = Response::from_data(reply.body).with_status_code(reply.status);
+    if let Some(content_type) = header("Content-Type", reply.content_type) {
+        response = response.with_header(content_type);
+    }
+    for (name, value) in &reply.headers {
+        if let Some(extra) = header(name, value) {
+            response = response.with_header(extra);
+        }
+    }
+    request.respond(response).context("failed to send response")
+}
+
+/// Builds a `tiny_http` header, or logs and returns `None` if the value
+/// isn't representable (tiny_http only accepts ASCII). A dropped header is
+/// always preferable to a panic that takes the whole server down.
+fn header(name: &str, value: &str) -> Option<Header> {
+    match Header::from_bytes(name.as_bytes(), value.as_bytes()) {
+        Ok(header) => Some(header),
+        Err(()) => {
+            eprintln!("warning: dropping response header {name}: value is not ASCII");
+            None
+        }
     }
 }
 
@@ -126,92 +150,4 @@ fn is_allowed_host(host_header: &str) -> bool {
 fn is_port_suffix(s: &str) -> bool {
     s.strip_prefix(':')
         .is_some_and(|digits| !digits.is_empty() && digits.bytes().all(|b| b.is_ascii_digit()))
-}
-
-fn respond_with_page(request: Request, path: &Path, version: &AtomicU64) -> Result<()> {
-    // Read the live-reload baseline *before* reading the file: if a save
-    // lands in between, the version we embed here is guaranteed to be no
-    // newer than the content we're about to render, so the client's first
-    // comparison can't spuriously miss that save. See `page`'s docs.
-    let baseline_version = version.load(Ordering::SeqCst);
-
-    let title = path
-        .file_name()
-        .map(|name| name.to_string_lossy().into_owned())
-        .unwrap_or_else(|| path.display().to_string());
-
-    match fs::read_to_string(path) {
-        Ok(markdown) => {
-            let body_html = to_html(&markdown);
-            let html = page(&title, &body_html, Some(baseline_version));
-            request
-                .respond(
-                    Response::from_string(html)
-                        .with_header(content_type_header())
-                        .with_header(no_store_header())
-                        .with_header(nosniff_header())
-                        .with_header(frame_ancestors_none_header()),
-                )
-                .context("failed to send / response")
-        }
-        Err(err) => {
-            // The client only gets the file name and no error detail — the
-            // full path and the OS error (permissions, exact reason, etc.)
-            // are none of a browser's business and go to stderr instead.
-            eprintln!("warning: failed to read {}: {err}", path.display());
-            let body = format!("Failed to read {title}");
-            request
-                .respond(
-                    Response::from_string(body)
-                        .with_status_code(500)
-                        .with_header(nosniff_header())
-                        .with_header(frame_ancestors_none_header()),
-                )
-                .context("failed to send 500 response")
-        }
-    }
-}
-
-fn respond_with_version(request: Request, version: &AtomicU64) -> Result<()> {
-    let body = version.load(Ordering::SeqCst).to_string();
-    request
-        .respond(
-            Response::from_string(body)
-                .with_header(no_store_header())
-                .with_header(nosniff_header()),
-        )
-        .context("failed to send /version response")
-}
-
-fn content_type_header() -> Header {
-    Header::from_bytes(&b"Content-Type"[..], &b"text/html; charset=utf-8"[..])
-        .expect("static header value is valid")
-}
-
-fn no_store_header() -> Header {
-    Header::from_bytes(&b"Cache-Control"[..], &b"no-store"[..])
-        .expect("static header value is valid")
-}
-
-/// Tells the browser not to try to sniff/reinterpret the response body as
-/// something other than the declared `Content-Type` (e.g. treating a
-/// Markdown-derived HTML page as a different content type based on its
-/// contents). Sent on both `/` and `/version`.
-fn nosniff_header() -> Header {
-    Header::from_bytes(&b"X-Content-Type-Options"[..], &b"nosniff"[..])
-        .expect("static header value is valid")
-}
-
-/// Blocks the rendered page from being framed by another site — belt and
-/// suspenders alongside the equivalent `<meta http-equiv="Content-Security-
-/// Policy">` tag `page()` already emits (an HTTP header can't be
-/// stripped/overridden by the page's own markup the way a `<meta>` tag
-/// theoretically could be). Sent only on `/`, since `/version` never
-/// returns anything framable.
-fn frame_ancestors_none_header() -> Header {
-    Header::from_bytes(
-        &b"Content-Security-Policy"[..],
-        &b"frame-ancestors 'none'"[..],
-    )
-    .expect("static header value is valid")
 }
