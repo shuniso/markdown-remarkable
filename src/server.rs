@@ -11,12 +11,19 @@
 //! header validation (a custom protocol has no such header to spoof) and
 //! converting a [`routes::Reply`] into a `tiny_http::Response`.
 
-use crate::routes::{self, Reply};
+use crate::routes::{self, Reply, RouteRequest};
 use anyhow::{anyhow, Context, Result};
+use std::io::Read;
 use std::path::Path;
 use std::sync::atomic::AtomicU64;
 use std::sync::Arc;
 use tiny_http::{Header, Method, Request, Response, Server};
+
+/// The largest request body accepted by any route. Only `PUT /review`
+/// actually has one; everything else ignores whatever a client sends. Big
+/// enough for a very large review document, small enough that a malicious
+/// or buggy client can't force unbounded memory use.
+const MAX_BODY_BYTES: usize = 1024 * 1024;
 
 /// Binds a `tiny_http` server on `127.0.0.1:<port>`. Pass `0` to let the OS
 /// assign an available port; the actual bound address is available via
@@ -49,7 +56,7 @@ pub fn run(server: Server, path: &Path, version: Arc<AtomicU64>) -> Result<()> {
     Err(anyhow!("server stopped unexpectedly"))
 }
 
-fn handle_request(request: Request, path: &Path, version: &AtomicU64) -> Result<()> {
+fn handle_request(mut request: Request, path: &Path, version: &AtomicU64) -> Result<()> {
     if let Some(reason) = host_rejection_reason(&request) {
         return request
             .respond(Response::from_string(reason).with_status_code(403))
@@ -57,14 +64,70 @@ fn handle_request(request: Request, path: &Path, version: &AtomicU64) -> Result<
     }
 
     match request.method() {
-        Method::Get | Method::Head => {
-            let reply = routes::handle(request.url(), Some(path), version);
+        Method::Get | Method::Head | Method::Put | Method::Post => {
+            let body = match read_limited_body(&mut request) {
+                Ok(body) => body,
+                Err(BodyTooLarge) => {
+                    return request
+                        .respond(
+                            Response::from_string("413 Payload Too Large").with_status_code(413),
+                        )
+                        .context("failed to send 413 response");
+                }
+            };
+            let headers: Vec<(String, String)> = request
+                .headers()
+                .iter()
+                .map(|header| (header.field.to_string(), header.value.to_string()))
+                .collect();
+            let route_request = RouteRequest {
+                method: request.method().as_str(),
+                path: request.url(),
+                headers: &headers,
+                body: &body,
+            };
+            let reply = routes::handle(&route_request, Some(path), version);
             send_reply(request, reply)
         }
         _ => request
             .respond(Response::from_string("404 Not Found").with_status_code(404))
             .context("failed to send 404 response"),
     }
+}
+
+/// Marker error: the request body exceeded [`MAX_BODY_BYTES`].
+struct BodyTooLarge;
+
+/// Reads `request`'s body, capped at [`MAX_BODY_BYTES`]. `GET`/`HEAD`
+/// requests have no body worth reading, so this always returns `Ok(vec![])`
+/// for them without touching the reader. The check happens twice: first
+/// against the declared `Content-Length` (so an oversized request can be
+/// rejected without reading a single byte of it), then again against what
+/// was actually read (`take(MAX_BODY_BYTES + 1)`, so a client that lies
+/// about — or omits — its `Content-Length` can't smuggle an unbounded body
+/// past the first check).
+fn read_limited_body(request: &mut Request) -> Result<Vec<u8>, BodyTooLarge> {
+    if !matches!(request.method(), Method::Put | Method::Post) {
+        return Ok(Vec::new());
+    }
+    if let Some(declared_len) = request.body_length() {
+        if declared_len > MAX_BODY_BYTES {
+            return Err(BodyTooLarge);
+        }
+    }
+
+    let mut buffer = Vec::new();
+    let mut limited = request.as_reader().take((MAX_BODY_BYTES + 1) as u64);
+    if limited.read_to_end(&mut buffer).is_err() {
+        // Treat a read failure (e.g. the connection dropped mid-body) the
+        // same as an empty body — routes.rs will reject it as invalid JSON
+        // rather than the server panicking or hanging.
+        return Ok(Vec::new());
+    }
+    if buffer.len() > MAX_BODY_BYTES {
+        return Err(BodyTooLarge);
+    }
+    Ok(buffer)
 }
 
 /// Converts a [`Reply`] into a `tiny_http::Response` and sends it.

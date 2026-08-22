@@ -46,6 +46,9 @@
               document.title = decodeURIComponent(title);
             } catch (_) {}
           }
+          if (window.__mdviewReview) {
+            window.__mdviewReview.onBodyReplaced();
+          }
         });
       })
       .catch(function () {

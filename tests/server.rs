@@ -94,6 +94,40 @@ fn raw_get(addr: SocketAddr, path: &str) -> String {
     raw_request(addr, "GET", path, "1.1", Some("127.0.0.1"))
 }
 
+/// Sends a raw HTTP/1.1 request with a body and (optionally) extra headers
+/// beyond `Host`/`Content-Length`/`Connection`, and returns the full raw
+/// response. Used for `PUT /review`, where headers (`X-Mdview-Request`) and
+/// the request body matter and the higher-level `raw_get` helper has no way
+/// to supply either.
+fn raw_request_with_body(
+    addr: SocketAddr,
+    method: &str,
+    path: &str,
+    extra_headers: &[(&str, &str)],
+    body: &[u8],
+) -> Vec<u8> {
+    let mut stream = TcpStream::connect(addr).expect("connect to test server");
+    let mut head = format!(
+        "{method} {path} HTTP/1.1\r\nHost: 127.0.0.1\r\nContent-Length: {}\r\nConnection: close\r\n",
+        body.len()
+    );
+    for (name, value) in extra_headers {
+        head.push_str(&format!("{name}: {value}\r\n"));
+    }
+    head.push_str("\r\n");
+
+    stream
+        .write_all(head.as_bytes())
+        .expect("write request head");
+    stream.write_all(body).expect("write request body");
+
+    let mut response = Vec::new();
+    stream
+        .read_to_end(&mut response)
+        .expect("read raw HTTP response");
+    response
+}
+
 fn response_headers(response: &str) -> String {
     response
         .split("\r\n\r\n")
@@ -398,4 +432,65 @@ fn root_body_embeds_the_version_it_was_rendered_against() {
         .expect("/version body is numeric");
     assert_eq!(second_baseline, second_version);
     assert_eq!(second_version, first_version + 1);
+}
+
+#[test]
+fn put_review_without_the_request_header_is_403_over_raw_http() {
+    let harness = start_test_server("# Hi\n");
+    let body = br#"{"version":1,"file":"doc.md","blocks":[]}"#;
+
+    let response = raw_request_with_body(harness.addr, "PUT", "/review", &[], body);
+    let response = String::from_utf8_lossy(&response);
+    assert!(
+        response.starts_with("HTTP/1.1 403"),
+        "expected 403 for PUT /review without X-Mdview-Request, got: {response}"
+    );
+}
+
+#[test]
+fn put_review_with_the_request_header_succeeds_over_raw_http() {
+    let harness = start_test_server("# Hi\n");
+    let body = br#"{"version":1,"file":"doc.md","blocks":[]}"#;
+
+    let response = raw_request_with_body(
+        harness.addr,
+        "PUT",
+        "/review",
+        &[("X-Mdview-Request", "1")],
+        body,
+    );
+    let response = String::from_utf8_lossy(&response);
+    assert!(
+        response.starts_with("HTTP/1.1 200"),
+        "expected 200 for PUT /review with X-Mdview-Request, got: {response}"
+    );
+    assert!(response.contains(r#""ok":true"#) || response.contains(r#""ok": true"#));
+
+    // The write actually landed: a follow-up GET reflects it.
+    let get_response = raw_get(harness.addr, "/review");
+    assert!(get_response.starts_with("HTTP/1.1 200"), "{get_response}");
+}
+
+#[test]
+fn put_review_body_over_1_mib_is_413_over_raw_http() {
+    let harness = start_test_server("# Hi\n");
+    // A JSON body comfortably over the 1 MiB limit.
+    let oversized_text = "x".repeat(2 * 1024 * 1024);
+    let body = format!(
+        r#"{{"version":1,"file":"doc.md","blocks":[{{"hash":"0123456789abcdef","excerpt":"x","comments":[{{"id":"c_1","text":"{oversized_text}","created":"2026-08-22T07:00:00Z","updated":"2026-08-22T07:00:00Z"}}]}}]}}"#
+    );
+
+    let response = raw_request_with_body(
+        harness.addr,
+        "PUT",
+        "/review",
+        &[("X-Mdview-Request", "1")],
+        body.as_bytes(),
+    );
+    let response = String::from_utf8_lossy(&response);
+    assert!(
+        response.starts_with("HTTP/1.1 413"),
+        "expected 413 for an oversized PUT /review body, got: {}",
+        &response[..response.len().min(200)]
+    );
 }

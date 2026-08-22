@@ -83,6 +83,25 @@ mdview notes.md --export notes.html
   untrusted file is safe.
 - HTML comments (`<!-- ... -->`), block-level or inline, are discarded
   entirely rather than shown as text.
+- **Inline review comments**: in the live view (native window or
+  `--browser`, not `--export`), every top-level block — a paragraph,
+  heading, list, code block, table, blockquote, etc. — gets a right-hand
+  review pane. Click a block to select it (highlighted; blocks that already
+  have comments get a left border and a count badge), then write a comment
+  and save it (a Save button, or Cmd/Ctrl+Enter). Comments live in
+  `<file>.review.json` next to the Markdown file (e.g. `notes.md` ->
+  `notes.md.review.json`) and are matched to blocks by a hash of the
+  block's trimmed source, so they survive reloads and reordering elsewhere
+  in the document. If a commented block's source changes (or is deleted),
+  its comments become "unanchored" — shown in a collapsible section at the
+  bottom of the pane, where you can re-attach them to the currently
+  selected block or delete them. The **Export** button in the pane header
+  writes `<stem>.review.md` (e.g. `notes.md` -> `notes.review.md`) — a
+  Markdown summary of every commented block, in document order, with its
+  source quoted and its comments listed; a **Copy to clipboard** button
+  then appears so you can put the same text on your clipboard in a
+  separate click — handy for pasting a review into an AI agent or a PR
+  description. The document itself is never edited by any of this.
 
 ## Limitations
 
@@ -111,6 +130,14 @@ mdview notes.md --export notes.html
 - The `.app` bundle is macOS-only and ad-hoc signed (no Developer ID, no
   notarization), so it's meant for your own machine. There's no installer
   for Linux or Windows.
+- Review comments are per-block, not per-line or per-selection, and there's
+  no reply thread or resolved/unresolved status — just a flat list of
+  comments per block. Two blocks with identical (trimmed) source hash the
+  same and so share comments; this only matters for exact duplicate
+  content. `--export`ed static HTML has no review pane at all (there's no
+  server for it to talk to). The `.review.json` sidecar isn't watched for
+  external changes — edit it by hand at your own risk, since the running
+  view won't notice until you interact with the pane again.
 
 ## Building
 
@@ -157,6 +184,13 @@ sudo pacman -S webkit2gtk-4.1 gtk3
 
 If WebKitGTK isn't available at runtime, the native window fails to start
 with an error message pointing at `--browser` as a fallback.
+
+Saving review comments (`PUT /review`) from the native window needs
+WebKit2GTK 2.40 or newer, which is what actually delivers the request body
+to `mdview`'s custom-protocol handler on Linux (older WebKit2GTK versions
+silently drop it). On an older system, the review pane's Save/Export
+actions won't work in the native window; use `--browser` instead, which
+isn't affected.
 
 ### Development
 

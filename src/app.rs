@@ -9,7 +9,8 @@
 //! to log every request the WebView makes through the custom protocol,
 //! which is how the live-reload path gets verified by hand.
 
-use crate::routes::{self, file_title};
+use crate::routes;
+use crate::util::file_title;
 use crate::watch;
 use anyhow::{Context, Result};
 use notify::RecommendedWatcher;
@@ -238,11 +239,39 @@ fn protocol_response(
     debug: bool,
 ) -> Response<Cow<'static, [u8]>> {
     let path = request.uri().path().to_owned();
+    let method = request.method().as_str().to_owned();
+    let headers: Vec<(String, String)> = request
+        .headers()
+        .iter()
+        .map(|(name, value)| {
+            (
+                name.to_string(),
+                value.to_str().unwrap_or_default().to_string(),
+            )
+        })
+        .collect();
+    let body = request.body().clone();
+    let route_request = routes::RouteRequest {
+        method: &method,
+        path: &path,
+        headers: &headers,
+        body: &body,
+    };
+
     let file = file_state.lock().expect("file state mutex poisoned");
-    let reply = routes::handle(&path, file.as_deref(), version);
+    let reply = routes::handle(&route_request, file.as_deref(), version);
     drop(file);
     if debug {
-        eprintln!("[mdview] GET {path} -> {}", reply.status);
+        // The body byte count is only interesting for state-changing
+        // requests (PUT/POST) — that's how the body reaches this handler
+        // gets confirmed to actually be non-empty when testing on macOS,
+        // where `MDVIEW_DEBUG=1` is the only visibility into the WebView's
+        // custom-protocol handler.
+        let body_suffix = match method.as_str() {
+            "PUT" | "POST" => format!(" (body {} bytes)", body.len()),
+            _ => String::new(),
+        };
+        eprintln!("[mdview] {method} {path} -> {}{body_suffix}", reply.status);
     }
 
     let mut response = match Response::builder()
