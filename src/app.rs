@@ -62,6 +62,9 @@ const OPEN_EVENT_GRACE: Duration = Duration::from_millis(400);
 /// menu handler, and (on macOS) the OS asking us to open a document.
 enum UserEvent {
     OpenFile(PathBuf),
+    /// Only the macOS menu (File ▸ Open…) posts this today; other
+    /// platforms have no menu bar, so there it's handled but never sent.
+    #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
     PickFile,
 }
 
