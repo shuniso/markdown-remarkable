@@ -307,8 +307,13 @@ fn install_menu() -> Result<muda::Menu> {
     Ok(menu)
 }
 
+/// Placeholder for platforms without a menu bar, so `run` can hold "the
+/// menu" uniformly (a unit value there would trip clippy's `let_unit_value`).
+#[cfg(not(target_os = "macos"))]
+struct NoMenu;
+
 /// Other platforms get no menu bar (window chrome provides close/quit).
 #[cfg(not(target_os = "macos"))]
-fn install_menu() -> Result<()> {
-    Ok(())
+fn install_menu() -> Result<NoMenu> {
+    Ok(NoMenu)
 }
