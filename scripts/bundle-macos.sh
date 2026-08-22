@@ -40,7 +40,11 @@ if [[ "${1:-}" == "--install" ]]; then
   DEST="/Applications/mdview.app"
   rm -rf "$DEST"
   cp -R "$APP" "$DEST"
-  # Let LaunchServices pick up the new bundle and its .md association.
-  /System/Library/Frameworks/CoreServices.framework/Versions/A/Frameworks/LaunchServices.framework/Versions/A/Support/lsregister -f "$DEST" >/dev/null 2>&1 || true
+  # Let LaunchServices pick up the installed bundle and its .md association,
+  # and forget the build copy under target/ so `open -a mdview` (and Finder's
+  # "Open With") resolve to /Applications rather than a stale build.
+  LSREGISTER=/System/Library/Frameworks/CoreServices.framework/Versions/A/Frameworks/LaunchServices.framework/Versions/A/Support/lsregister
+  "$LSREGISTER" -u "$ROOT/$APP" >/dev/null 2>&1 || true
+  "$LSREGISTER" -f "$DEST" >/dev/null 2>&1 || true
   echo "installed $DEST"
 fi
