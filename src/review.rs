@@ -248,8 +248,12 @@ pub fn unanchored<'a>(doc: &'a ReviewDoc, blocks: &[Block]) -> Vec<&'a str> {
         .collect()
 }
 
+/// Current UTC time as RFC 3339 with whole seconds (`2026-08-23T01:30:00Z`);
+/// sub-second precision is noise in a human-readable export header.
 fn now_rfc3339() -> String {
-    time::OffsetDateTime::now_utc()
+    let now = time::OffsetDateTime::now_utc();
+    now.replace_nanosecond(0)
+        .unwrap_or(now)
         .format(&time::format_description::well_known::Rfc3339)
         .unwrap_or_default()
 }
@@ -257,17 +261,24 @@ fn now_rfc3339() -> String {
 /// Renders the review as a standalone Markdown document: a heading, an
 /// "Exported: <timestamp> · N comments on M blocks" summary line (with an
 /// "(+K unanchored)" suffix appended whenever there are unanchored
-/// comments), then one numbered section per commented, anchored block (in
-/// document order; source quoted with `> `; comments as a bullet list,
-/// where a comment's second and later lines are indented two spaces as
-/// continuation lines rather than starting new top-level bullets),
-/// followed by an `## Unanchored` section for comments whose block no
-/// longer exists in `markdown` (only emitted when there is at least one).
+/// comments), then one section per commented, anchored block (in document
+/// order): a single quoted line giving the block's source line range and
+/// excerpt (`> L12-L18: <excerpt>`, or `> L40: <excerpt>` for a one-line
+/// block), followed by its comments as a bullet list, where a comment's
+/// second and later lines are indented two spaces as continuation lines
+/// rather than starting new top-level bullets. The block's full source is
+/// deliberately *not* quoted — for handing this off to an AI agent, the
+/// line range plus a short excerpt is enough to locate the block, and
+/// quoting the whole thing again would just be noise. An `## Unanchored`
+/// section follows for comments whose block no longer exists in `markdown`
+/// (only emitted when there is at least one), using the same one-line
+/// quote format but with `(not found)` in place of a line range, since
+/// there's no live block to report one for.
 ///
 /// If the same block hash occurs more than once in the live document (an
-/// exact-duplicate block), only its first occurrence gets a numbered
-/// section — so `M blocks` in the summary always equals the number of
-/// numbered sections actually shown, never double-counting a duplicate.
+/// exact-duplicate block), only its first occurrence gets a section — so
+/// `M blocks` in the summary always equals the number of sections actually
+/// shown, never double-counting a duplicate.
 ///
 /// `now` is the RFC3339 export timestamp; passed in (rather than computed
 /// here) so this stays a pure, deterministically-testable function — see
@@ -310,18 +321,12 @@ pub fn export_markdown(md_name: &str, markdown: &str, doc: &ReviewDoc, now: &str
     }
     out.push_str("\n\n");
 
-    for (index, (block, review_block)) in sections.iter().enumerate() {
-        out.push_str(&format!(
-            "## {}. {}\n\n",
-            index + 1,
-            single_line(&block.excerpt)
-        ));
-        for line in block.source.lines() {
-            out.push_str("> ");
-            out.push_str(line);
-            out.push('\n');
-        }
-        out.push('\n');
+    for (block, review_block) in &sections {
+        out.push_str("> ");
+        out.push_str(&line_label(block.line_start, block.line_end));
+        out.push_str(": ");
+        out.push_str(&single_line(&block.excerpt));
+        out.push_str("\n\n");
         for comment in &review_block.comments {
             push_comment_bullet(&mut out, "- ", &comment.text);
         }
@@ -330,19 +335,17 @@ pub fn export_markdown(md_name: &str, markdown: &str, doc: &ReviewDoc, now: &str
 
     if !unanchored_hashes.is_empty() {
         out.push_str("## Unanchored\n\n");
-        out.push_str("元のブロックが見つからないコメント（ブロックが編集・削除された可能性）:\n\n");
         for hash in &unanchored_hashes {
             let Some(review_block) = doc.blocks.iter().find(|rb| rb.hash == *hash) else {
                 continue;
             };
-            let prefix = format!(
-                "- `{}` 「{}」: ",
-                review_block.hash,
-                single_line(&review_block.excerpt)
-            );
+            out.push_str("> (not found): ");
+            out.push_str(&single_line(&review_block.excerpt));
+            out.push_str("\n\n");
             for comment in &review_block.comments {
-                push_comment_bullet(&mut out, &prefix, &comment.text);
+                push_comment_bullet(&mut out, "- ", &comment.text);
             }
+            out.push('\n');
         }
     }
 
@@ -350,6 +353,17 @@ pub fn export_markdown(md_name: &str, markdown: &str, doc: &ReviewDoc, now: &str
     out.truncate(trimmed_len);
     out.push('\n');
     out
+}
+
+/// The `Lstart-Lend`/`Lstart` label used in an exported block's quote line:
+/// a range (`L12-L18`) when the block spans more than one source line, or a
+/// single line number (`L40`) when `start == end`.
+fn line_label(start: usize, end: usize) -> String {
+    if start == end {
+        format!("L{start}")
+    } else {
+        format!("L{start}-L{end}")
+    }
 }
 
 /// Replaces any `\n`/`\r` in `s` with a space, so it's safe to place inside
@@ -790,22 +804,22 @@ mod tests {
         let expected = format!(
             "# Review: notes.md\n\n\
              Exported: 2026-08-22T07:10:00Z · 3 comments on 2 blocks\n\n\
-             ## 1. ## 設計方針\n\n\
-             > ## 設計方針\n\n\
+             > L1: ## 設計方針\n\n\
              - ここは根拠が弱い\n\
              - 代替案も書く\n\n\
-             ## 2. {}\n\n\
-             > {}\n\n\
+             > L3: {}\n\n\
              - …\n",
-            live[1].excerpt, live[1].source
+            live[1].excerpt
         );
         assert_eq!(out, expected);
     }
 
     #[test]
-    fn export_markdown_quotes_multiline_block_source_on_each_line() {
+    fn export_markdown_labels_a_multiline_block_with_a_line_range() {
         let markdown = "> line one\n> line two\n";
         let live = render::blocks(markdown);
+        assert_eq!(live[0].line_start, 1);
+        assert_eq!(live[0].line_end, 2);
         let doc = ReviewDoc {
             version: 1,
             file: "notes.md".to_string(),
@@ -817,11 +831,30 @@ mod tests {
         };
 
         let out = export_markdown("notes.md", markdown, &doc, "2026-08-22T07:10:00Z");
-        // The block's source is itself a blockquote (`> line one`), and
-        // quoting prefixes every source line with another `> ` — so the
-        // export doubles up the marker, same as quoting any other already
-        // `>`-prefixed text.
-        assert!(out.contains("> > line one\n> > line two\n"));
+        // No full-source quote any more — just the line range and excerpt,
+        // followed directly by the comment list.
+        assert!(out.contains("> L1-L2: > line one\n\n- check this\n"));
+        assert!(!out.contains("line two"));
+    }
+
+    #[test]
+    fn export_markdown_labels_a_single_line_block_without_a_range() {
+        let markdown = "# Heading\n";
+        let live = render::blocks(markdown);
+        assert_eq!(live[0].line_start, live[0].line_end);
+        let doc = ReviewDoc {
+            version: 1,
+            file: "notes.md".to_string(),
+            blocks: vec![ReviewBlock {
+                hash: live[0].hash.clone(),
+                excerpt: live[0].excerpt.clone(),
+                comments: vec![comment("c_1", "ok")],
+            }],
+        };
+
+        let out = export_markdown("notes.md", markdown, &doc, "2026-08-22T07:10:00Z");
+        assert!(out.contains("> L1: # Heading\n\n"));
+        assert!(!out.contains("L1-L1"));
     }
 
     #[test]
@@ -855,12 +888,11 @@ mod tests {
         };
 
         let out = export_markdown("notes.md", markdown, &doc, "2026-08-22T07:10:00Z");
-        assert!(out.contains("## Unanchored\n"));
-        assert!(out
-            .contains("元のブロックが見つからないコメント（ブロックが編集・削除された可能性）:\n"));
-        assert!(out.contains("- `0000000000000000` 「旧 excerpt」: コメント本文\n"));
-        // The summary counts only anchored/numbered sections, plus an
-        // explicit unanchored suffix — not a total across everything.
+        assert!(out.contains("## Unanchored\n\n"));
+        assert!(out.contains("> (not found): 旧 excerpt\n\n"));
+        assert!(out.contains("- コメント本文\n"));
+        // The summary counts only anchored sections, plus an explicit
+        // unanchored suffix — not a total across everything.
         assert!(out.contains("0 comments on 0 blocks (+1 unanchored)"));
     }
 
@@ -897,7 +929,7 @@ mod tests {
         };
         let out = export_markdown("notes.md", markdown, &doc, "2026-08-22T07:10:00Z");
         assert!(!out.contains("Uncommented paragraph"));
-        assert!(!out.contains("## 2."));
+        assert_eq!(out.matches("> L").count(), 1);
     }
 
     #[test]
@@ -926,7 +958,6 @@ mod tests {
         let first_idx = out.find("First heading").expect("first heading present");
         let second_idx = out.find("Second heading").expect("second heading present");
         assert!(first_idx < second_idx);
-        assert!(out.find("## 1.").unwrap() < out.find("## 2.").unwrap());
     }
 
     #[test]
@@ -948,8 +979,7 @@ mod tests {
             }],
         };
         let out = export_markdown("notes.md", markdown, &doc, "2026-08-22T07:10:00Z");
-        assert_eq!(out.matches("## 1.").count(), 1);
-        assert!(!out.contains("## 2."));
+        assert_eq!(out.matches("> L").count(), 1);
         assert!(out.contains("1 comments on 1 blocks"));
     }
 

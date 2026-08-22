@@ -100,6 +100,27 @@
     return firstLine.length > 80 ? firstLine.slice(0, 80) : firstLine;
   }
 
+  // "L12-L18" (multi-line block) or "L40" (single-line block), sourced from
+  // the `data-line-start`/`data-line-end` render.rs stamps on every `.blk`
+  // div. Returns null (badge omitted) if either attribute is missing —
+  // e.g. `blockEl` is null because the selected block is no longer present
+  // in the live DOM.
+  function lineRangeLabel(blockEl) {
+    if (!blockEl) {
+      return null;
+    }
+    var start = blockEl.dataset
+      ? blockEl.dataset.lineStart
+      : blockEl.getAttribute("data-line-start");
+    var end = blockEl.dataset
+      ? blockEl.dataset.lineEnd
+      : blockEl.getAttribute("data-line-end");
+    if (!start || !end) {
+      return null;
+    }
+    return start === end ? "L" + start : "L" + start + "-L" + end;
+  }
+
   // -- state helpers --------------------------------------------------
 
   function findBlock(hash) {
@@ -519,7 +540,13 @@
     var blockEl = findBlockElement(hash);
     var excerpt = block ? block.excerpt : blockEl ? excerptForBlockElement(blockEl) : "";
 
-    wrap.appendChild(el("blockquote", "review-quote", excerpt));
+    var quoteWrap = el("div", "review-quote-wrap");
+    var lineLabel = lineRangeLabel(blockEl);
+    if (lineLabel) {
+      quoteWrap.appendChild(el("span", "review-line-badge", lineLabel));
+    }
+    quoteWrap.appendChild(el("blockquote", "review-quote", excerpt));
+    wrap.appendChild(quoteWrap);
 
     var list = el("div", "review-comments");
     var comments = block ? block.comments : [];

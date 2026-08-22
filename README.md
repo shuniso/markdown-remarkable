@@ -88,7 +88,9 @@ mdview notes.md --export notes.html
   heading, list, code block, table, blockquote, etc. — gets a right-hand
   review pane. Click a block to select it (highlighted; blocks that already
   have comments get a left border and a count badge), then write a comment
-  and save it (a Save button, or Cmd/Ctrl+Enter). Comments live in
+  and save it (a Save button, or Cmd/Ctrl+Enter). The pane shows the
+  selected block's source line range (e.g. `L12-L18`) above its excerpt.
+  Comments live in
   `<file>.review.json` next to the Markdown file (e.g. `notes.md` ->
   `notes.md.review.json`) and are matched to blocks by a hash of the
   block's trimmed source, so they survive reloads and reordering elsewhere
@@ -97,11 +99,16 @@ mdview notes.md --export notes.html
   bottom of the pane, where you can re-attach them to the currently
   selected block or delete them. The **Export** button in the pane header
   writes `<stem>.review.md` (e.g. `notes.md` -> `notes.review.md`) — a
-  Markdown summary of every commented block, in document order, with its
-  source quoted and its comments listed; a **Copy to clipboard** button
-  then appears so you can put the same text on your clipboard in a
-  separate click — handy for pasting a review into an AI agent or a PR
-  description. The document itself is never edited by any of this.
+  Markdown summary of every commented block, in document order: each one as
+  a one-line quote giving its source line range and excerpt (`> L12-L18:
+  ## Design notes`, or `> L40: ...` for a one-line block) followed by its
+  comments. The block's full source isn't quoted — for handing a review to
+  an AI agent, the line range plus a short excerpt is enough to locate the
+  block, and repeating the whole thing again would just be noise. A **Copy
+  to clipboard** button then appears so you can put the same text on your
+  clipboard in a separate click — handy for pasting a review into an AI
+  agent or a PR description. The document itself is never edited by any of
+  this.
 
 ## Limitations
 

@@ -51,6 +51,15 @@ pub struct Block {
     /// The block's first line, truncated to 80 characters (code fences are
     /// skipped in favor of the first line of actual code content).
     pub excerpt: String,
+    /// 1-based line number of the block's first line in the original
+    /// Markdown source. Counts the `\n` characters before the block's
+    /// (untrimmed) start offset — see [`line_range`].
+    pub line_start: usize,
+    /// 1-based line number of the block's last line in the original
+    /// Markdown source, computed after trimming only trailing whitespace
+    /// off the block's source (so a block's own trailing blank lines never
+    /// inflate this) — see [`line_range`].
+    pub line_end: usize,
 }
 
 /// Converts Markdown source into an HTML fragment (no surrounding
@@ -64,14 +73,16 @@ pub struct Block {
 /// image targets.
 ///
 /// Every top-level block (as split by [`blocks`]) is wrapped in
-/// `<div class="blk" data-hash="...">...</div>` so the review UI can locate
-/// and mark up individual blocks. The sanitization pass runs per block
-/// (each block's event slice is self-contained — raw HTML blocks never
-/// straddle a block boundary — so this is equivalent to sanitizing the
-/// whole document at once).
+/// `<div class="blk" data-hash="..." data-line-start="..."
+/// data-line-end="...">...</div>` so the review UI can locate and mark up
+/// individual blocks, and label them with their source line range. The
+/// sanitization pass runs per block (each block's event slice is
+/// self-contained — raw HTML blocks never straddle a block boundary — so
+/// this is equivalent to sanitizing the whole document at once).
 pub fn to_html(markdown: &str) -> String {
     let mut html_output = String::new();
     for (range, events) in parsed_blocks(markdown) {
+        let (line_start, line_end) = line_range(markdown, &range);
         let source = markdown[range].trim();
         let hash = hash_source(source);
         let sanitized = sanitize_events(events);
@@ -94,6 +105,10 @@ pub fn to_html(markdown: &str) -> String {
         html::push_html(&mut block_html, sanitized.into_iter());
         html_output.push_str("<div class=\"blk\" data-hash=\"");
         html_output.push_str(&hash);
+        html_output.push_str("\" data-line-start=\"");
+        html_output.push_str(&line_start.to_string());
+        html_output.push_str("\" data-line-end=\"");
+        html_output.push_str(&line_end.to_string());
         html_output.push_str("\" data-excerpt=\"");
         html_output.push_str(&escape_html_text(&excerpt));
         html_output.push_str("\">");
@@ -142,6 +157,7 @@ pub fn blocks(markdown: &str) -> Vec<Block> {
     parsed_blocks(markdown)
         .into_iter()
         .map(|(range, _events)| {
+            let (line_start, line_end) = line_range(markdown, &range);
             let source = markdown[range].trim().to_string();
             let hash = hash_source(&source);
             let excerpt = excerpt_of(&source);
@@ -149,9 +165,35 @@ pub fn blocks(markdown: &str) -> Vec<Block> {
                 hash,
                 source,
                 excerpt,
+                line_start,
+                line_end,
             }
         })
         .collect()
+}
+
+/// Computes a block's 1-based `(line_start, line_end)` within `markdown`,
+/// given its (untrimmed) byte `range` as reported by
+/// [`Parser::into_offset_iter`]. `line_start` counts the `\n` characters
+/// before `range.start`, plus one. `line_end` counts the `\n` characters
+/// before the position where the block's source ends *after trimming only
+/// trailing whitespace* (so a block's own trailing blank lines inside
+/// `range` — which [`parsed_blocks`] doesn't otherwise strip — never
+/// inflate the reported end line), plus one.
+///
+/// Counting raw `\n` bytes rather than reasoning about line contents means
+/// this gives the same, correct answer whether `markdown` uses `\n` or
+/// `\r\n` line endings: a `\r\n` pair still contributes exactly one `\n`
+/// per line.
+fn line_range(markdown: &str, range: &Range<usize>) -> (usize, usize) {
+    let line_start = count_newlines_before(markdown, range.start) + 1;
+    let trimmed_end = range.start + markdown[range.clone()].trim_end().len();
+    let line_end = count_newlines_before(markdown, trimmed_end) + 1;
+    (line_start, line_end)
+}
+
+fn count_newlines_before(markdown: &str, byte_pos: usize) -> usize {
+    markdown[..byte_pos].bytes().filter(|&b| b == b'\n').count()
 }
 
 fn markdown_options() -> Options {
@@ -873,6 +915,50 @@ mod tests {
         assert_eq!(block.excerpt, "let x = 1;");
     }
 
+    // -- line_start / line_end -------------------------------------------
+
+    #[test]
+    fn line_start_and_line_end_are_computed_per_block() {
+        // Line numbers (1-based):
+        // 1: # Title
+        // 2: (blank)
+        // 3: Line 1
+        // 4: Line 2
+        // 5: Line 3
+        // 6: (blank)
+        // 7: ```
+        // 8: code line
+        // 9: ```
+        let md = "# Title\n\nLine 1\nLine 2\nLine 3\n\n```\ncode line\n```\n";
+        let blocks = blocks(md);
+        assert_eq!(blocks.len(), 3);
+
+        assert_eq!(blocks[0].source, "# Title");
+        assert_eq!(blocks[0].line_start, 1);
+        assert_eq!(blocks[0].line_end, 1);
+
+        assert_eq!(blocks[1].source, "Line 1\nLine 2\nLine 3");
+        assert_eq!(blocks[1].line_start, 3);
+        assert_eq!(blocks[1].line_end, 5);
+
+        assert!(blocks[2].source.starts_with("```"));
+        assert_eq!(blocks[2].line_start, 7);
+        assert_eq!(blocks[2].line_end, 9);
+    }
+
+    #[test]
+    fn line_numbers_are_correct_with_crlf_line_endings() {
+        let md = "# Title\r\n\r\nLine 1\r\nLine 2\r\nLine 3\r\n";
+        let blocks = blocks(md);
+        assert_eq!(blocks.len(), 2);
+
+        assert_eq!(blocks[0].line_start, 1);
+        assert_eq!(blocks[0].line_end, 1);
+
+        assert_eq!(blocks[1].line_start, 3);
+        assert_eq!(blocks[1].line_end, 5);
+    }
+
     #[test]
     fn to_html_wraps_every_block_in_a_data_hash_div_matching_blocks() {
         let md = "# H\n\npara\n\n- li\n\n```\ncode\n```\n";
@@ -898,6 +984,13 @@ mod tests {
         let html = to_html("# Hello\n");
         assert!(html.contains("<h1>Hello</h1>"));
         assert!(html.contains("class=\"blk\""));
+    }
+
+    #[test]
+    fn to_html_includes_data_line_start_and_data_line_end_attributes() {
+        let html = to_html("# Title\n\nLine 1\nLine 2\nLine 3\n");
+        assert!(html.contains("data-line-start=\"1\" data-line-end=\"1\""));
+        assert!(html.contains("data-line-start=\"3\" data-line-end=\"5\""));
     }
 
     #[test]
