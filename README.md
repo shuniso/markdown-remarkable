@@ -108,8 +108,9 @@ mdview notes.md --export notes.html
 - On Linux the "open file" dialog goes through `xdg-desktop-portal` over
   D-Bus; without a portal/D-Bus session the dialog silently yields nothing
   and `mdview` (no `FILE`) just shows the empty drop-target page.
-- No `.app` bundle, file association, or installer — this is a plain CLI
-  binary that happens to open a window.
+- The `.app` bundle is macOS-only and ad-hoc signed (no Developer ID, no
+  notarization), so it's meant for your own machine. There's no installer
+  for Linux or Windows.
 
 ## Building
 
@@ -120,6 +121,23 @@ cargo build --release
 ```
 
 The binary is built at `target/release/mdview`.
+
+### macOS app bundle
+
+To get a double-clickable `mdview.app` that also shows up in Finder's
+"Open With" menu for `.md`/`.markdown` files:
+
+```sh
+scripts/bundle-macos.sh            # builds target/bundle/mdview.app
+scripts/bundle-macos.sh --install  # ...and copies it to /Applications
+```
+
+Launched from Finder with no file, the app shows an "Open" dialog (cancel
+it to get the empty drop-target page; ⌘O brings it back). Double-clicking a
+Markdown file — or dropping one on the app icon — opens it directly. The
+bundle is ad-hoc signed, which is all a locally built app needs; the icon
+comes from `packaging/macos/mdview.icns` (regenerate with
+`scripts/make-icon.py`, which needs Pillow).
 
 ### Linux dependencies
 

@@ -17,8 +17,9 @@ use std::borrow::Cow;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 use tao::dpi::LogicalSize;
-use tao::event::{Event, WindowEvent};
+use tao::event::{Event, StartCause, WindowEvent};
 use tao::event_loop::{ControlFlow, EventLoopBuilder, EventLoopProxy};
 use tao::window::{Window, WindowBuilder};
 use wry::http::header::{HeaderName, HeaderValue, CONTENT_TYPE};
@@ -52,17 +53,23 @@ const INTERNAL_URL_PREFIX: &str = "mdview://";
 #[cfg(target_os = "windows")]
 const INTERNAL_URL_PREFIX: &str = "http://mdview.localhost";
 
-/// Dispatched from the drag&drop handler (via `EventLoopProxy`, since it
-/// doesn't run inside the `tao` event loop closure) to ask the event loop to
-/// switch to a newly dropped file.
+/// How long to wait after startup for the OS to hand us a file (a Finder
+/// double-click arrives as `Event::Opened` slightly after launch) before
+/// concluding nothing is coming and showing the file picker instead.
+const OPEN_EVENT_GRACE: Duration = Duration::from_millis(400);
+
+/// Events posted to the loop from outside it: the drag&drop handler, the
+/// menu handler, and (on macOS) the OS asking us to open a document.
 enum UserEvent {
     OpenFile(PathBuf),
+    PickFile,
 }
 
 /// Opens the native window. `initial` is the file to show right away, if
-/// one was given on the command line; `None` opens a file-picker dialog
-/// first (and, if that's cancelled, shows the empty-state page instead of
-/// exiting).
+/// one was given on the command line. With `None` the window opens on the
+/// empty-state page and, unless the OS delivers a file to open within
+/// [`OPEN_EVENT_GRACE`] (Finder double-click), shows a file-picker dialog;
+/// cancelling that just leaves the empty page (drop a file, or ⌘O).
 ///
 /// This function's happy path never actually returns `Ok(())`: `tao`'s
 /// `EventLoop::run` has return type `!` (it calls `std::process::exit`
@@ -73,25 +80,22 @@ pub fn run(initial: Option<PathBuf>) -> Result<()> {
     let proxy = event_loop.create_proxy();
 
     // Keep the menu alive for the whole run: on macOS it's what makes
-    // Cmd+Q / Cmd+C / Cmd+W work at all (wry doesn't add accelerators).
-    let _menu = install_menu()?;
+    // Cmd+Q / Cmd+O / Cmd+C / Cmd+W work at all (wry doesn't add accelerators).
+    let _menu = install_menu(&proxy)?;
 
-    // The picker is shown only once the event loop (and so the NSApp /
-    // GTK context) exists, so it comes up in front as a real app dialog.
-    let initial_file = initial.or_else(pick_file_dialog);
-
-    let file_state: Arc<Mutex<Option<PathBuf>>> = Arc::new(Mutex::new(initial_file.clone()));
+    let file_state: Arc<Mutex<Option<PathBuf>>> = Arc::new(Mutex::new(initial.clone()));
     let version: Arc<AtomicU64> = Arc::new(AtomicU64::new(0));
     let debug = std::env::var_os("MDVIEW_DEBUG").is_some();
 
     let window = WindowBuilder::new()
-        .with_title(window_title(initial_file.as_deref()))
+        .with_title(window_title(initial.as_deref()))
         .with_inner_size(LogicalSize::new(WINDOW_WIDTH, WINDOW_HEIGHT))
         .build(&event_loop)
         .context("failed to create window")?;
 
     let protocol_file_state = Arc::clone(&file_state);
     let protocol_version = Arc::clone(&version);
+    let drop_proxy = proxy.clone();
     let builder = WebViewBuilder::new()
         .with_custom_protocol(PROTOCOL.into(), move |_webview_id, request| {
             protocol_response(&protocol_file_state, &protocol_version, request, debug)
@@ -102,7 +106,7 @@ pub fn run(initial: Option<PathBuf>) -> Result<()> {
             navigation_policy(url);
             NewWindowResponse::Deny
         })
-        .with_drag_drop_handler(move |event| handle_drag_drop(event, &proxy))
+        .with_drag_drop_handler(move |event| handle_drag_drop(event, &drop_proxy))
         .with_url(INITIAL_URL);
 
     #[cfg(not(target_os = "linux"))]
@@ -120,31 +124,72 @@ pub fn run(initial: Option<PathBuf>) -> Result<()> {
         )?
     };
 
-    let mut watcher: Option<RecommendedWatcher> = initial_file
+    let mut watcher: Option<RecommendedWatcher> = initial
         .as_deref()
         .and_then(|path| start_watch(path, &version));
+    // While `Some`, we still owe the user a file picker once this deadline
+    // passes (no file yet, and the OS hasn't handed us one). Cleared by the
+    // first file that arrives by any route.
+    let mut picker_deadline = initial.is_none().then(|| Instant::now() + OPEN_EVENT_GRACE);
 
     event_loop.run(move |event, _, control_flow| {
-        *control_flow = ControlFlow::Wait;
+        let mut exit = false;
 
         match event {
+            Event::NewEvents(StartCause::ResumeTimeReached { .. })
+                if picker_deadline.is_some_and(|deadline| Instant::now() >= deadline) =>
+            {
+                picker_deadline = None;
+                if let Some(path) = pick_file_dialog() {
+                    open_file(&file_state, &version, &mut watcher, &window, &webview, path);
+                }
+            }
+            Event::Opened { urls } => {
+                // Finder double-click / "Open With" / `open -a`: the OS hands
+                // us file URLs. Take the first Markdown one.
+                let dropped = urls
+                    .iter()
+                    .filter_map(|url| url.to_file_path().ok())
+                    .find(|path| is_markdown_file(path));
+                if let Some(path) = dropped {
+                    picker_deadline = None;
+                    open_file(&file_state, &version, &mut watcher, &window, &webview, path);
+                }
+            }
             Event::WindowEvent {
                 event: WindowEvent::CloseRequested,
                 ..
-            } => *control_flow = ControlFlow::Exit,
+            } => exit = true,
             Event::UserEvent(UserEvent::OpenFile(path)) => {
+                picker_deadline = None;
                 open_file(&file_state, &version, &mut watcher, &window, &webview, path);
+            }
+            Event::UserEvent(UserEvent::PickFile) => {
+                picker_deadline = None;
+                if let Some(path) = pick_file_dialog() {
+                    open_file(&file_state, &version, &mut watcher, &window, &webview, path);
+                }
             }
             _ => {}
         }
+
+        // Decided once per event, at the end, so the pending-picker timer
+        // survives the other events tao delivers in the same iteration.
+        *control_flow = if exit {
+            ControlFlow::Exit
+        } else {
+            match picker_deadline {
+                Some(deadline) => ControlFlow::WaitUntil(deadline),
+                None => ControlFlow::Wait,
+            }
+        };
     });
 }
 
-/// Handles `UserEvent::OpenFile`: switches the served file, re-points the
-/// watcher at it, bumps `version`, updates the window title, and reloads
-/// the WebView. The reload (rather than relying on the live-reload poll
-/// alone) is what makes a drop recover a view that's stuck on an error
-/// page whose script has died.
+/// Switches the served file, re-points the watcher at it, bumps `version`,
+/// updates the window title, and reloads the WebView. The reload (rather
+/// than relying on the live-reload poll alone) is what makes opening a file
+/// recover a view that's stuck on an error page whose script has died.
 fn open_file(
     file_state: &Arc<Mutex<Option<PathBuf>>>,
     version: &Arc<AtomicU64>,
@@ -284,13 +329,24 @@ fn window_title(file: Option<&Path>) -> String {
 }
 
 /// macOS: a minimal application menu. Without one, none of the standard
-/// shortcuts (Cmd+Q, Cmd+W, Cmd+C, Cmd+A) work in the window.
+/// shortcuts (Cmd+Q, Cmd+W, Cmd+C, Cmd+A) work in the window. File ▸ Open…
+/// (Cmd+O) posts [`UserEvent::PickFile`] back to the event loop.
 #[cfg(target_os = "macos")]
-fn install_menu() -> Result<muda::Menu> {
-    use muda::{Menu, PredefinedMenuItem, Submenu};
+fn install_menu(proxy: &EventLoopProxy<UserEvent>) -> Result<muda::Menu> {
+    use muda::accelerator::{Accelerator, Code, Modifiers};
+    use muda::{Menu, MenuEvent, MenuItem, PredefinedMenuItem, Submenu};
+
+    const OPEN_ITEM_ID: &str = "open";
 
     let menu = Menu::new();
     let app = Submenu::with_items("mdview", true, &[&PredefinedMenuItem::quit(None)])?;
+    let open = MenuItem::with_id(
+        OPEN_ITEM_ID,
+        "Open…",
+        true,
+        Some(Accelerator::new(Some(Modifiers::SUPER), Code::KeyO)),
+    );
+    let file = Submenu::with_items("File", true, &[&open])?;
     let edit = Submenu::with_items(
         "Edit",
         true,
@@ -301,9 +357,20 @@ fn install_menu() -> Result<muda::Menu> {
     )?;
     let window = Submenu::with_items("Window", true, &[&PredefinedMenuItem::close_window(None)])?;
     menu.append(&app)?;
+    menu.append(&file)?;
     menu.append(&edit)?;
     menu.append(&window)?;
     menu.init_for_nsapp();
+
+    // The handler must be Send + Sync; the proxy itself is only Send.
+    let proxy = Mutex::new(proxy.clone());
+    MenuEvent::set_event_handler(Some(move |event: MenuEvent| {
+        if event.id() == OPEN_ITEM_ID {
+            if let Ok(proxy) = proxy.lock() {
+                let _ = proxy.send_event(UserEvent::PickFile);
+            }
+        }
+    }));
     Ok(menu)
 }
 
@@ -314,6 +381,6 @@ struct NoMenu;
 
 /// Other platforms get no menu bar (window chrome provides close/quit).
 #[cfg(not(target_os = "macos"))]
-fn install_menu() -> Result<NoMenu> {
+fn install_menu(_proxy: &EventLoopProxy<UserEvent>) -> Result<NoMenu> {
     Ok(NoMenu)
 }
