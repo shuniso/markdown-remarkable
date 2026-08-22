@@ -11,6 +11,16 @@
   var EXPORT_URL = "/export";
   var REQUEST_HEADERS = { "X-Mdview-Request": "1" };
 
+  // Pane resize/collapse (section 1 of the baseline UX design). Persisted
+  // separately from anything in `state` below — width/collapsed are UI
+  // chrome, not review data, and must survive independently of whether
+  // GET /review has ever succeeded.
+  var PANE_WIDTH_KEY = "mdview.review.width";
+  var PANE_COLLAPSED_KEY = "mdview.review.collapsed";
+  var PANE_DEFAULT_WIDTH = 320;
+  var PANE_MIN_WIDTH = 240;
+  var SAVE_STATUS_CLEAR_MS = 2000;
+
   var state = {
     doc: { version: 1, file: "", blocks: [] },
     unanchored: [],
@@ -23,12 +33,32 @@
     // a PUT that clobbers a sidecar this page never actually saw — see
     // saveReview() and render().
     loaded: false,
+    // True only for the specific "no file open yet" case (GET /review ->
+    // 409) — distinct from a genuine load failure: the aside shows a plain
+    // "open a file" placeholder instead of the failure banner + retry
+    // button. See renderAside() and onBodyReplaced().
+    noFileOpen: false,
     error: null,
     toast: null,
     unanchoredOpen: false,
+    // PUT /review's own status, independent of `error` (which is only ever
+    // about GET /review): null | "saving" | "saved" | "failed". Drives the
+    // header's Saving…/Saved/"Save failed — retry" indicator.
+    saveStatus: null,
+  };
+
+  var saveStatusTimer = null;
+
+  var paneState = {
+    width: PANE_DEFAULT_WIDTH,
+    collapsed: false,
+    dragging: false,
   };
 
   var asideEl = null;
+  var layoutEl = null;
+  var splitterEl = null;
+  var collapseTabEl = null;
 
   // -- DOM helpers, all textContent-based so nothing here ever builds
   //    HTML strings out of comment text/excerpts (both are user input). --
@@ -55,6 +85,296 @@
     btn.type = "button";
     btn.addEventListener("click", onClick);
     return btn;
+  }
+
+  // -- localStorage, wrapped in try/catch per the design doc: a disabled or
+  //    full localStorage must never throw its way into a broken pane —
+  //    just fall back to the defaults. --------------------------------
+
+  function safeStorageGet(key) {
+    try {
+      return window.localStorage.getItem(key);
+    } catch (err) {
+      return null;
+    }
+  }
+
+  function safeStorageSet(key, value) {
+    try {
+      window.localStorage.setItem(key, value);
+    } catch (err) {
+      // ignore — persistence is best-effort.
+    }
+  }
+
+  // -- pane resize/collapse -------------------------------------------
+
+  function maxPaneWidth() {
+    return window.innerWidth * 0.6;
+  }
+
+  // Keeps the effective minimum from ever exceeding the effective maximum
+  // (a narrow window can push `maxPaneWidth()` below PANE_MIN_WIDTH) so the
+  // clamp itself can never produce an inverted [min, max) range.
+  function clampPaneWidth(width) {
+    var max = maxPaneWidth();
+    var min = Math.min(PANE_MIN_WIDTH, max);
+    return Math.min(Math.max(width, min), max);
+  }
+
+  function applyPaneWidth(width) {
+    paneState.width = width;
+    if (asideEl) {
+      asideEl.style.width = width + "px";
+    }
+  }
+
+  function persistPaneWidth() {
+    safeStorageSet(PANE_WIDTH_KEY, String(paneState.width));
+  }
+
+  function loadStoredPaneWidth() {
+    var raw = safeStorageGet(PANE_WIDTH_KEY);
+    var parsed = raw === null ? NaN : parseFloat(raw);
+    // The default also goes through clampPaneWidth: a narrow window at
+    // first load can already put PANE_DEFAULT_WIDTH (320) above the 60%
+    // cap, same as any stored value would be.
+    return clampPaneWidth(isNaN(parsed) ? PANE_DEFAULT_WIDTH : parsed);
+  }
+
+  function loadStoredPaneCollapsed() {
+    return safeStorageGet(PANE_COLLAPSED_KEY) === "1";
+  }
+
+  function updateCollapseTabLabel() {
+    if (collapseTabEl) {
+      collapseTabEl.textContent = "Review · " + totalCommentCount();
+    }
+  }
+
+  function applyPaneCollapsed(collapsed) {
+    paneState.collapsed = collapsed;
+    if (!collapsed) {
+      // The window may well have been resized narrower while the pane sat
+      // collapsed (onPaneWindowResize() skips reclamping collapsed panes
+      // entirely — see there), so a stored width that was valid when it
+      // collapsed could now exceed the current 60% cap. Reclamp on the
+      // way back out rather than on every resize tick nothing is even
+      // showing yet.
+      applyPaneWidth(clampPaneWidth(paneState.width));
+      persistPaneWidth();
+    }
+    if (layoutEl) {
+      layoutEl.classList.toggle("review-collapsed", collapsed);
+    }
+    if (collapseTabEl) {
+      collapseTabEl.style.display = collapsed ? "flex" : "none";
+    }
+    updateCollapseTabLabel();
+    safeStorageSet(PANE_COLLAPSED_KEY, collapsed ? "1" : "0");
+  }
+
+  // Pointer Events + setPointerCapture (rather than mouse events plus
+  // document-level mousemove/mouseup listeners) so the splitter keeps
+  // receiving move/up events for the drag it started even once the cursor
+  // leaves the element — or the window entirely — instead of the drag
+  // getting stuck "on" because a mouseup landed somewhere this page never
+  // saw it.
+  function onSplitterPointerDown(event) {
+    event.preventDefault();
+    paneState.dragging = true;
+    if (splitterEl) {
+      splitterEl.classList.add("dragging");
+      if (typeof splitterEl.setPointerCapture === "function") {
+        try {
+          splitterEl.setPointerCapture(event.pointerId);
+        } catch (err) {
+          // Capture failed (or unsupported) — dragging still tracks via
+          // whatever move/up events do reach the element normally.
+        }
+      }
+    }
+    if (layoutEl) {
+      layoutEl.classList.add("no-select");
+    }
+  }
+
+  function onSplitterPointerMove(event) {
+    if (!paneState.dragging) {
+      return;
+    }
+    // Belt-and-suspenders on top of pointer capture: `buttons` reflects
+    // what's actually held *right now*, so a drag that never got its
+    // pointerup delivered (a capture that silently lapsed, a dialog
+    // stealing the event, etc.) still self-heals on the very next move
+    // instead of leaving the pane permanently "dragging".
+    if (event.buttons === 0) {
+      endSplitterDrag(event);
+      return;
+    }
+    // The review pane sits at the right edge of the layout, so its width
+    // is just the distance from the cursor to the window's right edge.
+    applyPaneWidth(clampPaneWidth(window.innerWidth - event.clientX));
+  }
+
+  function endSplitterDrag(event) {
+    if (!paneState.dragging) {
+      return;
+    }
+    paneState.dragging = false;
+    if (splitterEl) {
+      splitterEl.classList.remove("dragging");
+      if (
+        event &&
+        typeof splitterEl.releasePointerCapture === "function" &&
+        typeof splitterEl.hasPointerCapture === "function" &&
+        splitterEl.hasPointerCapture(event.pointerId)
+      ) {
+        splitterEl.releasePointerCapture(event.pointerId);
+      }
+    }
+    if (layoutEl) {
+      layoutEl.classList.remove("no-select");
+    }
+    persistPaneWidth();
+  }
+
+  function onPaneWindowResize() {
+    if (paneState.collapsed) {
+      return;
+    }
+    var clamped = clampPaneWidth(paneState.width);
+    if (clamped !== paneState.width) {
+      applyPaneWidth(clamped);
+      persistPaneWidth();
+    }
+  }
+
+  function initPane() {
+    layoutEl = document.querySelector(".layout");
+    splitterEl = document.getElementById("splitter");
+
+    collapseTabEl = button("review-collapse-tab", "", function () {
+      applyPaneCollapsed(false);
+    });
+    collapseTabEl.style.display = "none";
+    document.body.appendChild(collapseTabEl);
+
+    applyPaneWidth(loadStoredPaneWidth());
+    applyPaneCollapsed(loadStoredPaneCollapsed());
+
+    if (splitterEl) {
+      splitterEl.addEventListener("pointerdown", onSplitterPointerDown);
+      splitterEl.addEventListener("pointermove", onSplitterPointerMove);
+      splitterEl.addEventListener("pointerup", endSplitterDrag);
+      splitterEl.addEventListener("pointercancel", endSplitterDrag);
+    }
+    window.addEventListener("resize", onPaneWindowResize);
+  }
+
+  // -- block selection (shared by click, keyboard nav, and reanchor) ----
+
+  // Selects `hash`, always re-rendering. `opts.ensureVisible` scrolls the
+  // block into view if needed (keyboard nav, and re-anchoring from the
+  // unanchored list — see the design doc's section 3 — where the block
+  // clicked to trigger the action isn't necessarily the one now selected).
+  // `opts.expandIfCollapsed` re-opens a collapsed review pane (click
+  // selection only — see applyMarkers()).
+  function selectBlock(hash, opts) {
+    state.selectedHash = hash;
+    state.editingId = null;
+    render();
+    if (opts && opts.ensureVisible) {
+      scrollBlockIntoView(hash);
+    }
+    if (opts && opts.expandIfCollapsed && paneState.collapsed) {
+      applyPaneCollapsed(false);
+    }
+  }
+
+  function scrollBlockIntoView(hash) {
+    var blockEl = findBlockElement(hash);
+    if (blockEl && typeof blockEl.scrollIntoView === "function") {
+      blockEl.scrollIntoView({ block: "nearest" });
+    }
+  }
+
+  function selectAdjacentBlock(direction) {
+    var elements = blockElements();
+    if (!elements.length) {
+      return;
+    }
+    var hashes = [];
+    for (var i = 0; i < elements.length; i++) {
+      hashes.push(elements[i].getAttribute("data-hash"));
+    }
+    var currentIdx = -1;
+    for (var j = 0; j < hashes.length; j++) {
+      if (hashes[j] === state.selectedHash) {
+        currentIdx = j;
+        break;
+      }
+    }
+    var nextIdx = currentIdx === -1 ? (direction > 0 ? 0 : hashes.length - 1) : currentIdx + direction;
+    if (nextIdx < 0 || nextIdx >= hashes.length) {
+      return;
+    }
+    selectBlock(hashes[nextIdx], { ensureVisible: true });
+  }
+
+  // -- global keyboard shortcuts (section 3 of the baseline UX design) --
+
+  function handleEscape() {
+    var active = document.activeElement;
+    if (active && active.tagName === "TEXTAREA") {
+      active.blur();
+      return;
+    }
+    if (state.selectedHash) {
+      state.selectedHash = null;
+      state.editingId = null;
+      render();
+    }
+  }
+
+  function onGlobalKeydown(event) {
+    // `withModifier && !event.altKey` (rather than just `withModifier`)
+    // for every shortcut below except Alt+↑/↓ itself: on layouts where
+    // AltGr is used to type punctuation, AltGr commonly arrives as
+    // Ctrl+Alt (or Meta+Alt) together, which would otherwise misfire the
+    // collapse/reload shortcuts on an ordinary keypress that never meant
+    // to invoke either.
+    var withModifier = (event.metaKey || event.ctrlKey) && !event.altKey;
+
+    // Backslash's own key/position varies enough by layout (and is a dead
+    // key or absent outright on some) that both the produced character
+    // and the physical key code are checked; ⌘J is also accepted as a
+    // JIS-keyboard-friendly alternative (documented alongside `⌘\` in
+    // docs/qa/baseline-checklist.md).
+    if (
+      withModifier &&
+      (event.key === "\\" ||
+        event.code === "Backslash" ||
+        event.key === "j" ||
+        event.key === "J")
+    ) {
+      event.preventDefault();
+      applyPaneCollapsed(!paneState.collapsed);
+      return;
+    }
+    if (withModifier && (event.key === "r" || event.key === "R")) {
+      event.preventDefault();
+      location.reload();
+      return;
+    }
+    if (event.altKey && (event.key === "ArrowDown" || event.key === "ArrowUp")) {
+      event.preventDefault();
+      selectAdjacentBlock(event.key === "ArrowDown" ? 1 : -1);
+      return;
+    }
+    if (event.key === "Escape") {
+      handleEscape();
+    }
   }
 
   function docRoot() {
@@ -214,15 +534,26 @@
 
   function loadReview() {
     state.loading = true;
+    state.noFileOpen = false;
     render();
     fetch(REVIEW_URL, { method: "GET", cache: "no-store", headers: REQUEST_HEADERS })
       .then(function (response) {
         return response.json().then(function (payload) {
-          return { ok: response.ok, payload: payload };
+          return { status: response.status, ok: response.ok, payload: payload };
         });
       })
       .then(function (result) {
         state.loading = false;
+        if (result.status === 409) {
+          // No file open yet — not a failure, just an empty state. See the
+          // design doc's section 5: no banner, no form, just the
+          // placeholder renderAside() shows for state.noFileOpen.
+          state.loaded = false;
+          state.noFileOpen = true;
+          state.error = null;
+          render();
+          return;
+        }
         if (!result.ok) {
           state.loaded = false;
           state.error =
@@ -250,6 +581,26 @@
       });
   }
 
+  // Sets the header's save-status indicator (see renderAside()) and
+  // re-renders. "saved" auto-clears itself after SAVE_STATUS_CLEAR_MS;
+  // "saving"/"failed" persist until the next setSaveStatus() call (a new
+  // save, or a retry click on the "Save failed — retry" indicator itself).
+  function setSaveStatus(status) {
+    state.saveStatus = status;
+    if (saveStatusTimer) {
+      clearTimeout(saveStatusTimer);
+      saveStatusTimer = null;
+    }
+    if (status === "saved") {
+      saveStatusTimer = setTimeout(function () {
+        state.saveStatus = null;
+        saveStatusTimer = null;
+        render();
+      }, SAVE_STATUS_CLEAR_MS);
+    }
+    render();
+  }
+
   function saveReview() {
     // Never PUT before a successful GET /review: without one, state.doc
     // may still be the placeholder (empty `file`, no blocks), and saving
@@ -263,6 +614,7 @@
       file: state.doc.file,
       blocks: state.doc.blocks,
     };
+    setSaveStatus("saving");
     fetch(REVIEW_URL, {
       method: "PUT",
       cache: "no-store",
@@ -276,14 +628,10 @@
         if (!response.ok) {
           throw new Error("save failed: " + response.status);
         }
-        if (state.loaded) {
-          state.error = null;
-        }
-        render();
+        setSaveStatus("saved");
       })
       .catch(function () {
-        state.error = "保存に失敗しました";
-        render();
+        setSaveStatus("failed");
       });
   }
 
@@ -475,15 +823,14 @@
 
   function selectBlockHandler(hash) {
     return function () {
-      state.selectedHash = hash;
-      state.editingId = null;
-      render();
+      selectBlock(hash, { expandIfCollapsed: true });
     };
   }
 
   function render() {
     applyMarkers();
     renderAside();
+    updateCollapseTabLabel();
   }
 
   function renderAside() {
@@ -492,9 +839,39 @@
     }
     clearChildren(asideEl);
 
+    if (state.noFileOpen) {
+      // Section 5 of the design doc: only this placeholder, no header, no
+      // form. loadReview() re-fetches once a file is open (see
+      // onBodyReplaced()), which replaces this with the real pane.
+      asideEl.appendChild(
+        el(
+          "p",
+          "review-placeholder",
+          "ファイルを開くとここにレビューが表示されます"
+        )
+      );
+      return;
+    }
+
     var header = el("div", "review-header");
     header.appendChild(
       el("span", "review-count", totalCommentCount() + " comments")
+    );
+    if (state.saveStatus === "saving") {
+      header.appendChild(el("span", "review-save-status saving", "Saving…"));
+    } else if (state.saveStatus === "saved") {
+      header.appendChild(el("span", "review-save-status saved", "Saved"));
+    } else if (state.saveStatus === "failed") {
+      header.appendChild(
+        button("review-save-status failed", "Save failed — retry", function () {
+          saveReview();
+        })
+      );
+    }
+    header.appendChild(
+      button("review-collapse-btn", "⟩", function () {
+        applyPaneCollapsed(true);
+      })
     );
     header.appendChild(
       button("review-export", "Export", function (event) {
@@ -520,6 +897,11 @@
       // disk — see saveReview()'s early return for the same guard.
       body.appendChild(
         el("p", "review-placeholder", "レビュー機能は利用できません")
+      );
+      body.appendChild(
+        button("review-retry", "再読み込み", function () {
+          loadReview();
+        })
       );
     } else if (!state.selectedHash) {
       body.appendChild(el("p", "review-placeholder", "ブロックをクリック"));
@@ -680,11 +1062,13 @@
         if (!state.selectedHash) {
           return;
         }
-        var targetEl = findBlockElement(state.selectedHash);
+        var targetHash = state.selectedHash;
+        var targetEl = findBlockElement(targetHash);
         var excerpt = targetEl
           ? excerptForBlockElement(targetEl)
           : block.excerpt;
-        reanchor(block.hash, state.selectedHash, excerpt);
+        reanchor(block.hash, targetHash, excerpt);
+        scrollBlockIntoView(targetHash);
       }
     );
     reanchorBtn.disabled = !state.selectedHash;
@@ -701,6 +1085,13 @@
   // -- entry points ---------------------------------------------------
 
   function onBodyReplaced() {
+    if (state.noFileOpen) {
+      // A file may have just been opened — re-fetch to find out, rather
+      // than sitting on the stale "no file open" placeholder. See section
+      // 5 of the design doc.
+      loadReview();
+      return;
+    }
     // The DOM under <main> was just swapped out from under us (live
     // reload) — re-derive what's anchored/unanchored against the new
     // content and reapply markers/handlers/selection.
@@ -715,6 +1106,8 @@
     if (!asideEl) {
       return;
     }
+    initPane();
+    document.addEventListener("keydown", onGlobalKeydown);
     render();
     loadReview();
   }

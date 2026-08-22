@@ -12,6 +12,11 @@ use std::ops::Range;
 /// binary needs no external assets at runtime.
 const STYLE_CSS: &str = include_str!("../assets/style.css");
 
+/// The bundled viewer client script (zoom + `window.__mdviewViewer`),
+/// embedded at compile time. Injected right before [`LIVE_JS`] whenever
+/// live-reload is requested — see [`page`].
+const VIEWER_JS: &str = include_str!("../assets/viewer.js");
+
 /// The bundled live-reload client script, embedded at compile time. Only
 /// injected into the page when live-reload is requested (see [`page`]).
 const LIVE_JS: &str = include_str!("../assets/live.js");
@@ -497,9 +502,11 @@ pub fn page(title: &str, body_html: &str, live: Option<u64>) -> String {
              <main class=\"markdown-body doc\">\n\
              {body_html}\n\
              </main>\n\
+             <div class=\"splitter\" id=\"splitter\"></div>\n\
              <aside class=\"review\" id=\"review\"></aside>\n\
              </div>\n\
              <script>window.__mdviewVersion=\"{version}\";</script>\n\
+             <script>\n{VIEWER_JS}\n</script>\n\
              <script>\n{LIVE_JS}\n</script>\n\
              <script>\n{REVIEW_JS}\n</script>"
         ),
@@ -767,11 +774,40 @@ mod tests {
     }
 
     #[test]
-    fn page_without_live_has_no_layout_aside_or_review_script() {
+    fn page_with_live_includes_the_pane_splitter() {
+        let html = page("Doc", "<p>hi</p>", Some(1));
+        assert!(html.contains(r#"class="splitter" id="splitter""#));
+        // The splitter must sit between the doc pane and the review aside.
+        let splitter_idx = html.find("id=\"splitter\"").expect("splitter present");
+        let doc_idx = html.find("markdown-body doc").expect("doc pane present");
+        let aside_idx = html.find("<aside").expect("review aside present");
+        assert!(doc_idx < splitter_idx && splitter_idx < aside_idx);
+    }
+
+    #[test]
+    fn page_with_live_embeds_the_viewer_script_before_live_js() {
+        let html = page("Doc", "<p>hi</p>", Some(1));
+        // viewer.js content (a distinctive, stable identifier from it).
+        assert!(html.contains("__mdviewViewer"));
+        let viewer_idx = html.find("__mdviewViewer").expect("viewer script present");
+        let live_idx = html.find("AbortController").expect("live.js present");
+        assert!(
+            viewer_idx < live_idx,
+            "viewer.js must be embedded before live.js"
+        );
+    }
+
+    #[test]
+    fn page_without_live_has_no_layout_aside_splitter_or_scripts() {
         let html = page("Doc", "<p>hi</p>", None);
         assert!(!html.contains("class=\"layout\""));
         assert!(!html.contains("<aside"));
+        // Not a bare `!html.contains("splitter")`: the embedded stylesheet
+        // (assets/style.css) always defines `.splitter`'s CSS rules
+        // regardless of `live`, so only the *element* itself is telling.
+        assert!(!html.contains("id=\"splitter\""));
         assert!(!html.contains("__mdviewReview"));
+        assert!(!html.contains("__mdviewViewer"));
     }
 
     #[test]

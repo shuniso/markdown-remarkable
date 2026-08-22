@@ -108,7 +108,10 @@ mdview notes.md --export notes.html
   to clipboard** button then appears so you can put the same text on your
   clipboard in a separate click — handy for pasting a review into an AI
   agent or a PR description. The document itself is never edited by any of
-  this.
+  this. The pane can be resized (drag the divider) or collapsed to a
+  slim tab with `⌘\` (Windows/Linux: `Ctrl+\`); `⌘J`/`Ctrl+J` does the same
+  thing as an alternative for keyboards where typing a backslash is
+  awkward (JIS layouts, notably).
 
 ## Limitations
 
