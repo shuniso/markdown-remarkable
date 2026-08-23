@@ -1,11 +1,14 @@
 (function () {
   "use strict";
 
-  // Block-level review comments: a right-hand pane that lets you attach
-  // comments to top-level Markdown blocks (identified by the `data-hash`
-  // the server stamps on each `.blk` div — see render.rs), persist them via
-  // GET/PUT /review, and export them as a Markdown review summary via
-  // POST /export. See docs/superpowers/specs/2026-08-22-inline-review-comments-design.md.
+  // Block-level (and, for lists/tables, nested item/row-level) review
+  // comments: a right-hand pane that lets you attach comments to Markdown
+  // blocks, list items, and table rows (identified by the `data-hash` the
+  // server stamps on each `.blk`/`.anchor` element — see render.rs),
+  // persist them via GET/PUT /review, and export them as a Markdown review
+  // summary via POST /export. See
+  // docs/superpowers/specs/2026-08-22-inline-review-comments-design.md and
+  // docs/superpowers/specs/2026-08-23-nested-anchors-design.md.
 
   var REVIEW_URL = "/review";
   var EXPORT_URL = "/export";
@@ -293,28 +296,46 @@
   }
 
   function scrollBlockIntoView(hash) {
-    var blockEl = findBlockElement(hash);
+    var blockEl = findAnchorElement(hash);
     if (blockEl && typeof blockEl.scrollIntoView === "function") {
       blockEl.scrollIntoView({ block: "nearest" });
     }
   }
 
-  function selectAdjacentBlock(direction) {
-    var elements = blockElements();
-    if (!elements.length) {
+  // The elements considered "siblings" of `el` for Alt+↑/↓ navigation: the
+  // other `.blk`/`.anchor` elements sharing `el`'s immediate DOM parent.
+  // For a top-level `.blk` div that's every other block (parent is
+  // `main.doc`); for a list item, the other `<li>` in the *same* `<ul>`/
+  // `<ol>` (a nested item's own parent is the inner list, not the outer
+  // item, so this naturally excludes items at a different nesting depth —
+  // see the nested-anchors design doc); for a table row, the other `<tr>`
+  // in the same `<thead>`/`<tbody>`.
+  function siblingAnchors(el) {
+    if (!el || !el.parentElement) {
+      return [];
+    }
+    var result = [];
+    var children = el.parentElement.children;
+    for (var i = 0; i < children.length; i++) {
+      var child = children[i];
+      if (child.classList && (child.classList.contains("anchor") || child.classList.contains("blk"))) {
+        result.push(child);
+      }
+    }
+    return result;
+  }
+
+  function selectAdjacentAnchor(direction) {
+    var current = state.selectedHash ? findAnchorElement(state.selectedHash) : null;
+    var siblings = current ? siblingAnchors(current) : blockElements();
+    if (!siblings.length) {
       return;
     }
     var hashes = [];
-    for (var i = 0; i < elements.length; i++) {
-      hashes.push(elements[i].getAttribute("data-hash"));
+    for (var i = 0; i < siblings.length; i++) {
+      hashes.push(siblings[i].getAttribute("data-hash"));
     }
-    var currentIdx = -1;
-    for (var j = 0; j < hashes.length; j++) {
-      if (hashes[j] === state.selectedHash) {
-        currentIdx = j;
-        break;
-      }
-    }
+    var currentIdx = current ? hashes.indexOf(state.selectedHash) : -1;
     var nextIdx = currentIdx === -1 ? (direction > 0 ? 0 : hashes.length - 1) : currentIdx + direction;
     if (nextIdx < 0 || nextIdx >= hashes.length) {
       return;
@@ -322,7 +343,42 @@
     selectBlock(hashes[nextIdx], { ensureVisible: true });
   }
 
+  // Alt+← selects the currently-selected anchor's nearest enclosing
+  // anchor (an item's parent item, or a top-level item/row's parent
+  // block). Alt+→ selects its first nested anchor, if it has one (an
+  // item's first sub-item; a block's first item/row).
+  function selectParentAnchor() {
+    if (!state.selectedHash) {
+      return;
+    }
+    var current = findAnchorElement(state.selectedHash);
+    var ancestor = current && current.parentElement ? current.parentElement.closest(".anchor, .blk") : null;
+    if (!ancestor) {
+      return;
+    }
+    selectBlock(ancestor.getAttribute("data-hash"), { ensureVisible: true, expandIfCollapsed: true });
+  }
+
+  function selectFirstChildAnchor() {
+    if (!state.selectedHash) {
+      return;
+    }
+    var current = findAnchorElement(state.selectedHash);
+    var child = current ? current.querySelector(".anchor") : null;
+    if (!child) {
+      return;
+    }
+    selectBlock(child.getAttribute("data-hash"), { ensureVisible: true, expandIfCollapsed: true });
+  }
+
   // -- global keyboard shortcuts (section 3 of the baseline UX design) --
+
+  // True while a TEXTAREA or INPUT holds focus — see the Alt+←/→ handling
+  // in onGlobalKeydown().
+  function isTextInputFocused() {
+    var active = document.activeElement;
+    return !!active && (active.tagName === "TEXTAREA" || active.tagName === "INPUT");
+  }
 
   function handleEscape() {
     var active = document.activeElement;
@@ -369,7 +425,29 @@
     }
     if (event.altKey && (event.key === "ArrowDown" || event.key === "ArrowUp")) {
       event.preventDefault();
-      selectAdjacentBlock(event.key === "ArrowDown" ? 1 : -1);
+      selectAdjacentAnchor(event.key === "ArrowDown" ? 1 : -1);
+      return;
+    }
+    // Alt+←/→ are left to pass through untouched while a TEXTAREA/INPUT is
+    // focused (no preventDefault, no anchor navigation) — unlike Alt+↑/↓
+    // above, which always navigate regardless of focus. A focused text
+    // field is where a user is actively typing a comment, and Alt+←/→ has
+    // the potential to be a text-editing shortcut there depending on
+    // platform/layout; stealing it away would fight that instead.
+    if (event.altKey && event.key === "ArrowLeft") {
+      if (isTextInputFocused()) {
+        return;
+      }
+      event.preventDefault();
+      selectParentAnchor();
+      return;
+    }
+    if (event.altKey && event.key === "ArrowRight") {
+      if (isTextInputFocused()) {
+        return;
+      }
+      event.preventDefault();
+      selectFirstChildAnchor();
       return;
     }
     if (event.key === "Escape") {
@@ -381,13 +459,26 @@
     return document.querySelector("main.doc") || document.querySelector("main");
   }
 
+  // Top-level blocks only (`.blk`) — used where "nothing nested" is the
+  // right default: the Alt+↑/↓ fallback sibling set when nothing is
+  // selected, and the inner-count badge's own exclusion of rows (which
+  // never have anchor descendants).
   function blockElements() {
     var root = docRoot();
     return root ? root.querySelectorAll(".blk") : [];
   }
 
-  function findBlockElement(hash) {
-    var elements = blockElements();
+  // Every anchor in the document, at any granularity: top-level blocks
+  // *and* nested list items/table rows. Used everywhere selection,
+  // marking, and unanchored-detection need to consider every anchor kind,
+  // not just blocks — see the nested-anchors design doc.
+  function anchorElements() {
+    var root = docRoot();
+    return root ? root.querySelectorAll(".blk, .anchor") : [];
+  }
+
+  function findAnchorElement(hash) {
+    var elements = anchorElements();
     for (var i = 0; i < elements.length; i++) {
       if (elements[i].getAttribute("data-hash") === hash) {
         return elements[i];
@@ -396,14 +487,15 @@
     return null;
   }
 
-  // The excerpt for a block that isn't in state.doc yet (e.g. re-anchoring
-  // onto a block that has never been commented on, or writing a first
-  // comment on one). Prefers the server-computed `data-excerpt` attribute
-  // (render.rs stamps every `.blk` with one, built from the block's own
-  // sanitized content) and only falls back to a rough client-side
-  // derivation if that's missing for some reason. Not required to match
-  // render.rs's excerpt byte-for-byte in the fallback case — it's purely a
-  // display aid (see the design doc: "excerpt と index は補助情報").
+  // The excerpt for an anchor that isn't in state.doc yet (e.g.
+  // re-anchoring onto a block/item/row that has never been commented on,
+  // or writing a first comment on one). Prefers the server-computed
+  // `data-excerpt` attribute (render.rs stamps every `.blk`/`.anchor` with
+  // one, built from the anchor's own sanitized content) and only falls
+  // back to a rough client-side derivation if that's missing for some
+  // reason. Not required to match render.rs's excerpt byte-for-byte in the
+  // fallback case — it's purely a display aid (see the design doc:
+  // "excerpt と index は補助情報").
   function excerptForBlockElement(blockEl) {
     var fromServer = blockEl.dataset
       ? blockEl.dataset.excerpt
@@ -420,11 +512,11 @@
     return firstLine.length > 80 ? firstLine.slice(0, 80) : firstLine;
   }
 
-  // "L12-L18" (multi-line block) or "L40" (single-line block), sourced from
-  // the `data-line-start`/`data-line-end` render.rs stamps on every `.blk`
-  // div. Returns null (badge omitted) if either attribute is missing —
-  // e.g. `blockEl` is null because the selected block is no longer present
-  // in the live DOM.
+  // "L12-L18" (multi-line span) or "L40" (single-line span), sourced from
+  // the `data-line-start`/`data-line-end` render.rs stamps on every
+  // `.blk`/`.anchor` element. Returns null (badge omitted) if either
+  // attribute is missing — e.g. `blockEl` is null because the selected
+  // anchor is no longer present in the live DOM.
   function lineRangeLabel(blockEl) {
     if (!blockEl) {
       return null;
@@ -452,12 +544,12 @@
     return null;
   }
 
-  function ensureBlock(hash, excerpt) {
+  function ensureBlock(hash, excerpt, kind) {
     var found = findBlock(hash);
     if (found) {
       return found;
     }
-    var created = { hash: hash, excerpt: excerpt || "", comments: [] };
+    var created = { hash: hash, excerpt: excerpt || "", kind: kind || "block", comments: [] };
     state.doc.blocks.push(created);
     return created;
   }
@@ -471,9 +563,31 @@
     }
   }
 
+  // hash -> comment count, rebuilt once per render() (see render()) rather
+  // than walking state.doc.blocks on every commentCount() call — applyMarkers()
+  // and countCommentedDescendants() together call commentCount() once per
+  // anchor element (and, for descendants, again per anchor below it), so a
+  // linear findBlock() scan per call made marker application quadratic in
+  // the number of commented blocks on a large document.
+  var commentCountMap = null;
+
+  function buildCommentCountMap() {
+    var map = new Map();
+    for (var i = 0; i < state.doc.blocks.length; i++) {
+      var block = state.doc.blocks[i];
+      map.set(block.hash, block.comments.length);
+    }
+    return map;
+  }
+
   function commentCount(hash) {
-    var block = findBlock(hash);
-    return block ? block.comments.length : 0;
+    if (!commentCountMap) {
+      // Defensive fallback for any call site outside the normal render()
+      // flow (none exist today, but this must never silently read stale
+      // counts if one's added later).
+      commentCountMap = buildCommentCountMap();
+    }
+    return commentCountMap.get(hash) || 0;
   }
 
   function totalCommentCount() {
@@ -510,12 +624,15 @@
   }
 
   // Recomputes which of the currently-known review blocks have no matching
-  // `.blk[data-hash]` in the live document. Run after every DOM swap
-  // (initial load, and every live-reload body replacement) rather than
-  // trusting the server's `unanchored` field past the very first load,
-  // since the file can change underneath us at any time.
+  // `.blk`/`.anchor[data-hash]` in the live document — every anchor kind,
+  // not just top-level blocks, or a comment on a list item/table row would
+  // always show up as unanchored (its hash never matches any `.blk`). Run
+  // after every DOM swap (initial load, and every live-reload body
+  // replacement) rather than trusting the server's `unanchored` field past
+  // the very first load, since the file can change underneath us at any
+  // time.
   function recomputeUnanchored() {
-    var elements = blockElements();
+    var elements = anchorElements();
     var present = {};
     for (var i = 0; i < elements.length; i++) {
       present[elements[i].getAttribute("data-hash")] = true;
@@ -727,8 +844,8 @@
 
   // -- mutations (always followed by a save + re-render) -----------------
 
-  function addComment(hash, excerpt, text) {
-    var block = ensureBlock(hash, excerpt);
+  function addComment(hash, excerpt, text, kind) {
+    var block = ensureBlock(hash, excerpt, kind);
     var now = nowIso();
     block.comments.push({
       id: newLocalCommentId(),
@@ -770,7 +887,7 @@
     render();
   }
 
-  function reanchor(oldHash, newHash, newExcerpt) {
+  function reanchor(oldHash, newHash, newExcerpt, newKind) {
     var block = findBlock(oldHash);
     if (!block || oldHash === newHash) {
       return;
@@ -786,6 +903,7 @@
     } else {
       block.hash = newHash;
       block.excerpt = newExcerpt;
+      block.kind = newKind || "block";
     }
     recomputeUnanchored();
     saveReview();
@@ -803,31 +921,95 @@
 
   // -- rendering ----------------------------------------------------------
 
+  // Sum of comment counts on every anchor nested (at any depth) inside
+  // `el` — an item's own sub-items, or a block's items/rows. Rows never
+  // have anchor descendants (a table cell can't contain a nested anchor),
+  // so this is always 0 for a `tr.anchor`. Descendant hashes are
+  // deduplicated (two identical-text items/rows share a hash, and so share
+  // comments — counting the same hash twice would overstate the badge), and
+  // a descendant sharing `el`'s own hash is excluded (its comments are
+  // already `el`'s own comment count, not an "inner" count).
+  function countCommentedDescendants(el) {
+    var descendants = el.querySelectorAll(".anchor");
+    var selfHash = el.getAttribute("data-hash");
+    var seen = new Set();
+    var total = 0;
+    for (var i = 0; i < descendants.length; i++) {
+      var hash = descendants[i].getAttribute("data-hash");
+      if (hash === selfHash || seen.has(hash)) {
+        continue;
+      }
+      seen.add(hash);
+      total += commentCount(hash);
+    }
+    return total;
+  }
+
+  // Marks every `.blk`/`.anchor` element with its current has-comments/
+  // selected/inner-count state. Click *selection* itself is handled by a
+  // single delegated `document` listener (see `onDocumentClick`) rather
+  // than a per-element `onclick` here, so a click inside a nested anchor
+  // (e.g. an `<li>` inside its enclosing `.blk`) resolves to the innermost
+  // match via `closest(".anchor, .blk")` instead of always hitting the
+  // outer block.
   function applyMarkers() {
-    var elements = blockElements();
+    var elements = anchorElements();
     for (var i = 0; i < elements.length; i++) {
-      var blockEl = elements[i];
-      var hash = blockEl.getAttribute("data-hash");
+      var anchorEl = elements[i];
+      var hash = anchorEl.getAttribute("data-hash");
       var count = commentCount(hash);
       if (count > 0) {
-        blockEl.classList.add("has-comments");
-        blockEl.setAttribute("data-count", String(count));
+        anchorEl.classList.add("has-comments");
+        anchorEl.setAttribute("data-count", String(count));
       } else {
-        blockEl.classList.remove("has-comments");
-        blockEl.removeAttribute("data-count");
+        anchorEl.classList.remove("has-comments");
+        anchorEl.removeAttribute("data-count");
       }
-      blockEl.classList.toggle("selected", hash === state.selectedHash);
-      blockEl.onclick = selectBlockHandler(hash);
+      // `::after`/`::before` generated content isn't rendered on `<tr>`
+      // in any major browser (a table-row-specific quirk), so a row's
+      // own count badge is instead rendered from its *last cell's*
+      // `data-count` — see style.css's `tr.anchor.has-comments > :last-child`.
+      if (anchorEl.tagName === "TR") {
+        var lastCell = anchorEl.lastElementChild;
+        if (lastCell) {
+          if (count > 0) {
+            lastCell.setAttribute("data-count", String(count));
+          } else {
+            lastCell.removeAttribute("data-count");
+          }
+        }
+      }
+      anchorEl.classList.toggle("selected", hash === state.selectedHash);
+
+      var innerCount = countCommentedDescendants(anchorEl);
+      if (innerCount > 0) {
+        anchorEl.setAttribute("data-inner-count", String(innerCount));
+      } else {
+        anchorEl.removeAttribute("data-inner-count");
+      }
     }
   }
 
-  function selectBlockHandler(hash) {
-    return function () {
-      selectBlock(hash, { expandIfCollapsed: true });
-    };
+  // The single delegated click handler for the whole document pane
+  // (registered once in init(), not per-element): `closest(".anchor,
+  // .blk")` from the actual click target always resolves to the innermost
+  // anchor under the cursor (an `<li>`/`<tr>` before its enclosing
+  // `.blk`), so nested items/rows are directly clickable without any
+  // `stopPropagation` bookkeeping.
+  function onDocumentClick(event) {
+    var root = docRoot();
+    if (!root) {
+      return;
+    }
+    var target = event.target.closest(".anchor, .blk");
+    if (!target || !root.contains(target)) {
+      return;
+    }
+    selectBlock(target.getAttribute("data-hash"), { expandIfCollapsed: true });
   }
 
   function render() {
+    commentCountMap = buildCommentCountMap();
     applyMarkers();
     renderAside();
     updateCollapseTabLabel();
@@ -915,15 +1097,116 @@
     }
   }
 
+  // The anchor kind an element identifies itself as (`data-kind`,
+  // `"block"`/`"item"`/`"row"`) — falls back to `"block"` if the attribute
+  // is somehow absent, matching `ensureBlock`'s own default.
+  function anchorKindOf(anchorEl) {
+    var kind = anchorEl.dataset ? anchorEl.dataset.kind : anchorEl.getAttribute("data-kind");
+    return kind || "block";
+  }
+
+  function anchorKindLabel(anchorEl) {
+    var kind = anchorKindOf(anchorEl);
+    if (kind === "item") {
+      return "項目";
+    }
+    if (kind === "row") {
+      return "行";
+    }
+    return "ブロック";
+  }
+
+  // `el`'s own chain of enclosing anchors, top (a top-level block) to
+  // bottom (`el` itself) — derived purely from the live DOM via
+  // `closest(".anchor, .blk")`, since that's the only place the
+  // block/item/row nesting relationship is actually recorded client-side
+  // (GET /review's sidecar payload is a flat list of commented anchors,
+  // not a tree).
+  function ancestorChain(anchorEl) {
+    var chain = [anchorEl];
+    var current = anchorEl;
+    while (current && current.parentElement) {
+      var next = current.parentElement.closest(".anchor, .blk");
+      if (!next) {
+        break;
+      }
+      chain.unshift(next);
+      current = next;
+    }
+    return chain;
+  }
+
+  // "ブロック L10-L20 › 項目 L13": one clickable segment per level of
+  // `chain` (the currently-selected level rendered as plain, non-clickable
+  // text instead of a button).
+  function buildBreadcrumb(chain) {
+    var nav = el("div", "review-breadcrumb");
+    for (var i = 0; i < chain.length; i++) {
+      if (i > 0) {
+        nav.appendChild(el("span", "review-breadcrumb-sep", "›"));
+      }
+      var node = chain[i];
+      var nodeHash = node.getAttribute("data-hash");
+      var label = anchorKindLabel(node) + " " + (lineRangeLabel(node) || "");
+      if (nodeHash === state.selectedHash) {
+        nav.appendChild(el("span", "review-breadcrumb-current", label));
+      } else {
+        nav.appendChild(
+          button(
+            "review-breadcrumb-link",
+            label,
+            (function (targetHash) {
+              return function () {
+                selectBlock(targetHash, { ensureVisible: true });
+              };
+            })(nodeHash)
+          )
+        );
+      }
+    }
+    return nav;
+  }
+
+  // While an item/row is selected: "↑ リスト全体にコメント"/"↑ 表全体に
+  // コメント", jumping to the enclosing block. While a block containing at
+  // least one item/row is selected: a plain (non-actionable) hint that
+  // there's finer-grained anchors to click into.
+  function buildHint(anchorEl) {
+    var kind = anchorKindOf(anchorEl);
+    if (kind === "item" || kind === "row") {
+      var blockEl = anchorEl.closest(".blk");
+      if (!blockEl) {
+        return null;
+      }
+      var whole = kind === "item" ? "リスト" : "表";
+      return button("review-hint-up", "↑ " + whole + "全体にコメント", function () {
+        selectBlock(blockEl.getAttribute("data-hash"), { ensureVisible: true });
+      });
+    }
+    if (anchorEl.querySelector(".anchor")) {
+      return el("p", "review-hint", "項目を選ぶにはクリック");
+    }
+    return null;
+  }
+
   function buildSelectedBlockView() {
     var wrap = el("div", "review-selected");
     var hash = state.selectedHash;
     var block = findBlock(hash);
-    var blockEl = findBlockElement(hash);
-    var excerpt = block ? block.excerpt : blockEl ? excerptForBlockElement(blockEl) : "";
+    var anchorEl = findAnchorElement(hash);
+    var excerpt = block ? block.excerpt : anchorEl ? excerptForBlockElement(anchorEl) : "";
+    var kind = anchorEl ? anchorKindOf(anchorEl) : block && block.kind ? block.kind : "block";
+
+    if (anchorEl) {
+      wrap.appendChild(buildBreadcrumb(ancestorChain(anchorEl)));
+      var hint = buildHint(anchorEl);
+      if (hint) {
+        wrap.appendChild(hint);
+      }
+    }
 
     var quoteWrap = el("div", "review-quote-wrap");
-    var lineLabel = lineRangeLabel(blockEl);
+    var lineLabel = lineRangeLabel(anchorEl);
     if (lineLabel) {
       quoteWrap.appendChild(el("span", "review-line-badge", lineLabel));
     }
@@ -937,7 +1220,7 @@
     }
     wrap.appendChild(list);
 
-    wrap.appendChild(buildCommentForm(hash, excerpt));
+    wrap.appendChild(buildCommentForm(hash, excerpt, kind));
     return wrap;
   }
 
@@ -991,7 +1274,7 @@
     return item;
   }
 
-  function buildCommentForm(hash, excerpt) {
+  function buildCommentForm(hash, excerpt, kind) {
     var form = el("div", "review-form");
     var textarea = el("textarea", "review-textarea");
     textarea.placeholder = "コメントを入力… (Cmd/Ctrl+Enter で保存)";
@@ -1003,7 +1286,7 @@
         return;
       }
       textarea.value = "";
-      addComment(hash, excerpt, value);
+      addComment(hash, excerpt, value, kind);
     };
     form.appendChild(button("review-save", "保存", submit));
 
@@ -1063,11 +1346,12 @@
           return;
         }
         var targetHash = state.selectedHash;
-        var targetEl = findBlockElement(targetHash);
+        var targetEl = findAnchorElement(targetHash);
         var excerpt = targetEl
           ? excerptForBlockElement(targetEl)
           : block.excerpt;
-        reanchor(block.hash, targetHash, excerpt);
+        var kind = targetEl ? anchorKindOf(targetEl) : "block";
+        reanchor(block.hash, targetHash, excerpt, kind);
         scrollBlockIntoView(targetHash);
       }
     );
@@ -1108,6 +1392,7 @@
     }
     initPane();
     document.addEventListener("keydown", onGlobalKeydown);
+    document.addEventListener("click", onDocumentClick);
     render();
     loadReview();
   }

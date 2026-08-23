@@ -211,8 +211,9 @@ fn handle_body(file: Option<&Path>) -> Reply {
 }
 
 /// `GET /review`: the sidecar document (or an empty one, if none exists
-/// yet) plus a computed `"unanchored"` array — the block hashes in it that
-/// no longer appear anywhere in the current document.
+/// yet) plus a computed `"unanchored"` array — the hashes in it (block,
+/// list item, or table row) that no longer appear anywhere in the current
+/// document.
 fn handle_get_review(file: Option<&Path>) -> Reply {
     let Some(path) = file else {
         return no_file_open();
@@ -231,8 +232,8 @@ fn handle_get_review(file: Option<&Path>) -> Reply {
             return error_json(500, "failed to read document");
         }
     };
-    let live_blocks = render::blocks(&markdown);
-    let unanchored: Vec<&str> = review::unanchored(&doc, &live_blocks);
+    let live_anchors = render::anchors(&markdown);
+    let unanchored: Vec<&str> = review::unanchored(&doc, &live_anchors);
 
     let mut value = serde_json::to_value(&doc).unwrap_or_else(|_| serde_json::json!({}));
     value["unanchored"] = serde_json::json!(unanchored);
@@ -613,6 +614,50 @@ mod tests {
         assert_eq!(value["file"], "notes.md");
         assert_eq!(value["blocks"], serde_json::json!([]));
         assert_eq!(value["unanchored"], serde_json::json!([]));
+    }
+
+    #[test]
+    fn get_review_recognizes_a_commented_list_item_as_anchored() {
+        // A comment on an item/row hash must not show up in "unanchored"
+        // just because it's absent from render::blocks (block-level
+        // only) — GET /review's computation has to use render::anchors,
+        // which includes nested item/row anchors too.
+        let dir = tempfile::tempdir().expect("create tempdir");
+        let file_path = dir.path().join("notes.md");
+        let markdown = "- one\n- two\n";
+        std::fs::write(&file_path, markdown).expect("write markdown file");
+        let version = AtomicU64::new(0);
+
+        let item_hash = render::anchors(markdown)
+            .into_iter()
+            .find(|a| a.kind == render::AnchorKind::Item)
+            .expect("an item anchor exists")
+            .hash;
+
+        let headers = with_request_header();
+        let doc_json = serde_json::json!({
+            "version": 1,
+            "file": "notes.md",
+            "blocks": [{
+                "hash": item_hash,
+                "excerpt": "one",
+                "kind": "item",
+                "comments": [{
+                    "id": "c_0123456789abcdef",
+                    "text": "looks good",
+                    "created": "2026-08-22T07:00:00Z",
+                    "updated": "2026-08-22T07:00:00Z",
+                }]
+            }]
+        });
+        let body = serde_json::to_vec(&doc_json).unwrap();
+        let put_reply = handle(&put_review(&body, &headers), Some(&file_path), &version);
+        assert_eq!(put_reply.status, 200);
+
+        let get_reply = handle(&get("/review"), Some(&file_path), &version);
+        let value: serde_json::Value = serde_json::from_slice(&get_reply.body).unwrap();
+        assert_eq!(value["unanchored"], serde_json::json!([]));
+        assert_eq!(value["blocks"][0]["kind"], "item");
     }
 
     #[test]

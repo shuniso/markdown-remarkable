@@ -5,7 +5,7 @@
 //! Everything here is pure/file-I/O only — no HTTP, no UI. `routes.rs`
 //! wires this up to `GET/PUT /review` and `POST /export`.
 
-use crate::render::{self, Block};
+use crate::render::{self, Anchor, AnchorKind};
 use crate::util::file_title;
 use anyhow::{anyhow, Context, Result};
 use serde::{Deserialize, Serialize};
@@ -41,15 +41,42 @@ pub struct ReviewDoc {
     pub blocks: Vec<ReviewBlock>,
 }
 
-/// One commented block: the block identity it was last anchored to (`hash`,
-/// `excerpt` — see `render::Block`) and the comments attached to it. A
-/// block with no comments left is dropped from `blocks` entirely rather
-/// than kept around empty.
+/// One commented anchor: the anchor identity it was last attached to
+/// (`hash`, `excerpt`, `kind` — see `render::Anchor`) and the comments
+/// attached to it. An anchor with no comments left is dropped from
+/// `blocks` entirely rather than kept around empty. The field is still
+/// named `blocks` (not `anchors`) for sidecar-format/API backward
+/// compatibility — a `ReviewBlock` now anchors to any [`render::Anchor`]
+/// (block, list item, or table row), not just a top-level block.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ReviewBlock {
     pub hash: String,
     pub excerpt: String,
+    /// Which kind of source range `hash` identifies — `"block"`, `"item"`,
+    /// or `"row"`. Defaults to `"block"` when absent, so a sidecar written
+    /// before nested item/row anchors existed still loads (every comment
+    /// in it was necessarily on a top-level block).
+    #[serde(default)]
+    pub kind: AnchorKindDto,
     pub comments: Vec<Comment>,
+}
+
+/// The wire form of [`render::AnchorKind`] — a separate type (rather than
+/// reusing `render::AnchorKind` directly) so the sidecar's serde
+/// representation (`"block"`/`"item"`/`"row"`, with a `Default` for
+/// backward compatibility) stays a concern of the sidecar format, not of
+/// `render`'s own in-memory model. Purely descriptive on the server side:
+/// nothing here is validated *against* it, since a `ReviewBlock` is matched
+/// to the live document by `hash` alone (see [`unanchored`]) — `kind` only
+/// ever needs to already be a valid enum variant, which `serde`
+/// deserialization guarantees on its own for any well-formed request body.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum AnchorKindDto {
+    #[default]
+    Block,
+    Item,
+    Row,
 }
 
 /// A single comment. `id` is generated client-side (`assets/review.js`) in
@@ -237,13 +264,17 @@ fn normalize_excerpt(excerpt: &mut String) {
     *excerpt = normalized;
 }
 
-/// The hashes in `doc` that have no matching entry in `blocks` — i.e.
+/// The hashes in `doc` that have no matching entry in `anchors` — i.e.
 /// review blocks whose original source is no longer found anywhere in the
-/// current document (edited or deleted). Order follows `doc.blocks`.
-pub fn unanchored<'a>(doc: &'a ReviewDoc, blocks: &[Block]) -> Vec<&'a str> {
+/// current document (edited or deleted). `anchors` is `render::anchors`'
+/// full result (blocks *and* nested items/rows — see the nested-anchors
+/// design doc), so a comment on a list item or table row is correctly
+/// recognized as anchored even though it never appears in `render::blocks`.
+/// Order follows `doc.blocks`.
+pub fn unanchored<'a>(doc: &'a ReviewDoc, anchors: &[Anchor]) -> Vec<&'a str> {
     doc.blocks
         .iter()
-        .filter(|review_block| !blocks.iter().any(|b| b.hash == review_block.hash))
+        .filter(|review_block| !anchors.iter().any(|a| a.hash == review_block.hash))
         .map(|review_block| review_block.hash.as_str())
         .collect()
 }
@@ -261,44 +292,65 @@ fn now_rfc3339() -> String {
 /// Renders the review as a standalone Markdown document: a heading, an
 /// "Exported: <timestamp> · N comments on M blocks" summary line (with an
 /// "(+K unanchored)" suffix appended whenever there are unanchored
-/// comments), then one section per commented, anchored block (in document
-/// order): a single quoted line giving the block's source line range and
-/// excerpt (`> L12-L18: <excerpt>`, or `> L40: <excerpt>` for a one-line
-/// block), followed by its comments as a bullet list, where a comment's
-/// second and later lines are indented two spaces as continuation lines
-/// rather than starting new top-level bullets. The block's full source is
-/// deliberately *not* quoted — for handing this off to an AI agent, the
-/// line range plus a short excerpt is enough to locate the block, and
-/// quoting the whole thing again would just be noise. An `## Unanchored`
-/// section follows for comments whose block no longer exists in `markdown`
-/// (only emitted when there is at least one), using the same one-line
-/// quote format but with `(not found)` in place of a line range, since
-/// there's no live block to report one for.
+/// comments), then one section per commented, anchored anchor — block,
+/// list item, or table row — in document order (a block immediately
+/// followed by its own nested items/rows, before moving on to the next
+/// block — see `render::anchors`): a single quoted line giving the
+/// anchor's own source line range and excerpt (`> L12-L18: <excerpt>`, or
+/// `> L40: <excerpt>` for a one-line span), followed by its comments as a
+/// bullet list, where a comment's second and later lines are indented two
+/// spaces as continuation lines rather than starting new top-level
+/// bullets. A list item or table row's line additionally carries a
+/// `（in list Lstart-Lend）`/`（in table Lstart-Lend）` suffix naming its
+/// enclosing block's line range (see [`nested_suffix`]) — a plain block's
+/// line does not. The anchor's full source is deliberately *not* quoted —
+/// for handing this off to an AI agent, the line range plus a short
+/// excerpt is enough to locate it, and quoting the whole thing again would
+/// just be noise. An `## Unanchored` section follows for comments whose
+/// anchor no longer exists in `markdown` (only emitted when there is at
+/// least one), using the same one-line quote format but with `(not found)`
+/// in place of a line range, since there's no live anchor to report one
+/// for.
 ///
-/// If the same block hash occurs more than once in the live document (an
-/// exact-duplicate block), only its first occurrence gets a section — so
-/// `M blocks` in the summary always equals the number of sections actually
-/// shown, never double-counting a duplicate.
+/// If the same hash occurs more than once in the live document (an
+/// exact-duplicate block/item/row), only its first occurrence gets a
+/// section — so `M blocks` in the summary always equals the number of
+/// sections actually shown, never double-counting a duplicate.
 ///
 /// `now` is the RFC3339 export timestamp; passed in (rather than computed
 /// here) so this stays a pure, deterministically-testable function — see
 /// [`export`] for the impure wrapper that supplies it.
 pub fn export_markdown(md_name: &str, markdown: &str, doc: &ReviewDoc, now: &str) -> String {
-    let live_blocks = render::blocks(markdown);
-    let unanchored_hashes = unanchored(doc, &live_blocks);
+    let live_anchors = render::anchors(markdown);
+    // Filtered to entries that actually have a comment to show: `unanchored`
+    // itself only checks hash membership, so a `ReviewBlock` with an empty
+    // `comments` list (shouldn't normally happen — the client drops a block
+    // the moment its last comment is deleted, see review.js's
+    // `dropIfEmpty` — but nothing here enforces that server-side) would
+    // otherwise still open an `## Unanchored` section for a quote line with
+    // no comments under it.
+    let unanchored_hashes: Vec<&str> = unanchored(doc, &live_anchors)
+        .into_iter()
+        .filter(|hash| {
+            doc.blocks
+                .iter()
+                .find(|rb| rb.hash == *hash)
+                .is_some_and(|rb| !rb.comments.is_empty())
+        })
+        .collect();
 
     // One entry per *distinct* hash that's both anchored (present in the
     // live document) and commented, in document order — the first
     // occurrence wins whenever the same hash repeats.
     let mut seen_hashes: HashSet<&str> = HashSet::new();
-    let mut sections: Vec<(&Block, &ReviewBlock)> = Vec::new();
-    for block in &live_blocks {
-        if !seen_hashes.insert(block.hash.as_str()) {
+    let mut sections: Vec<(&Anchor, &ReviewBlock)> = Vec::new();
+    for anchor in &live_anchors {
+        if !seen_hashes.insert(anchor.hash.as_str()) {
             continue;
         }
-        if let Some(review_block) = doc.blocks.iter().find(|rb| rb.hash == block.hash) {
+        if let Some(review_block) = doc.blocks.iter().find(|rb| rb.hash == anchor.hash) {
             if !review_block.comments.is_empty() {
-                sections.push((block, review_block));
+                sections.push((anchor, review_block));
             }
         }
     }
@@ -321,11 +373,15 @@ pub fn export_markdown(md_name: &str, markdown: &str, doc: &ReviewDoc, now: &str
     }
     out.push_str("\n\n");
 
-    for (block, review_block) in &sections {
+    for (anchor, review_block) in &sections {
         out.push_str("> ");
-        out.push_str(&line_label(block.line_start, block.line_end));
+        out.push_str(&line_label(anchor.line_start, anchor.line_end));
         out.push_str(": ");
-        out.push_str(&single_line(&block.excerpt));
+        out.push_str(&single_line(&anchor.excerpt));
+        if let Some(suffix) = nested_suffix(&live_anchors, anchor) {
+            out.push(' ');
+            out.push_str(&suffix);
+        }
         out.push_str("\n\n");
         for comment in &review_block.comments {
             push_comment_bullet(&mut out, "- ", &comment.text);
@@ -353,6 +409,61 @@ pub fn export_markdown(md_name: &str, markdown: &str, doc: &ReviewDoc, now: &str
     out.truncate(trimmed_len);
     out.push('\n');
     out
+}
+
+/// For an item/row anchor, the `（in list Lstart-Lend）`/`（in table
+/// Lstart-Lend）`/`（in block Lstart-Lend）` suffix naming its enclosing
+/// block's line range — `None` for a block-kind anchor, which gets no
+/// suffix (unchanged format). Walks `anchor.parent` up through `anchors`
+/// until it reaches the block-kind ancestor: for a nested list item this is
+/// *not* its immediately enclosing item, but the top-level block (the whole
+/// list) — deliberate, per the nested-anchors design doc: a nested item's
+/// own position is already pinpointed by its own line range in the quote
+/// line itself, so the suffix's job is just to say which block to look in,
+/// and "the whole list" locates that reliably regardless of nesting depth.
+///
+/// The label word itself is decided by the *ancestor block's own source*
+/// (see [`block_kind_label`]), not by `anchor.kind` — an item nested inside
+/// a blockquote (`> - quoted item`) has `anchor.kind == Item`, but its
+/// enclosing top-level block is a blockquote, not literally a list, so its
+/// suffix reads `（in block …）` rather than the misleading `（in list …）`.
+fn nested_suffix(anchors: &[Anchor], anchor: &Anchor) -> Option<String> {
+    if anchor.kind == AnchorKind::Block {
+        return None;
+    }
+    let mut ancestor = anchor;
+    while ancestor.kind != AnchorKind::Block {
+        ancestor = anchors.get(ancestor.parent?)?;
+    }
+    let label = block_kind_label(&ancestor.source);
+    Some(format!(
+        "（in {label} {}）",
+        line_label(ancestor.line_start, ancestor.line_end)
+    ))
+}
+
+/// The `nested_suffix` label word for a top-level block, decided by its own
+/// (trimmed) `source`'s first characters: `"table"` if it starts with `|`,
+/// `"list"` if it starts with a bullet (`- `/`* `/`+ `) or an ordered marker
+/// (digits followed by `. `/`) `), `"block"` otherwise — e.g. a blockquote
+/// that happens to wrap a list or table, where the item/row's *own* kind
+/// doesn't reflect what the enclosing top-level block literally is.
+fn block_kind_label(source: &str) -> &'static str {
+    let trimmed = source.trim_start();
+    if trimmed.starts_with('|') {
+        return "table";
+    }
+    if ["- ", "* ", "+ "].iter().any(|m| trimmed.starts_with(m)) {
+        return "list";
+    }
+    let digit_count = trimmed.chars().take_while(char::is_ascii_digit).count();
+    if digit_count > 0 {
+        let after_digits = &trimmed[digit_count..];
+        if after_digits.starts_with(". ") || after_digits.starts_with(") ") {
+            return "list";
+        }
+    }
+    "block"
 }
 
 /// The `Lstart-Lend`/`Lstart` label used in an exported block's quote line:
@@ -460,6 +571,7 @@ mod tests {
             blocks: vec![ReviewBlock {
                 hash: "3f9a1c00deadbeef".to_string(),
                 excerpt: "# Hi".to_string(),
+                kind: AnchorKindDto::Block,
                 comments: vec![comment("c_1", "looks good")],
             }],
         };
@@ -555,6 +667,26 @@ mod tests {
     }
 
     #[test]
+    fn loading_a_sidecar_written_before_kind_existed_defaults_to_block() {
+        // A sidecar written by an older version of mdview (before nested
+        // item/row anchors existed) has no "kind" field on its blocks at
+        // all — `#[serde(default)]` on `ReviewBlock::kind` must fill that
+        // in as `AnchorKindDto::Block`, not fail to parse.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let md = dir.path().join("notes.md");
+        std::fs::write(&md, "# Hi\n").expect("write md");
+        std::fs::write(
+            sidecar_path(&md),
+            r#"{"version":1,"file":"notes.md","blocks":[{"hash":"0123456789abcdef","excerpt":"x","comments":[]}]}"#,
+        )
+        .expect("write sidecar");
+
+        let doc = load(&md).expect("load");
+        assert_eq!(doc.blocks.len(), 1);
+        assert_eq!(doc.blocks[0].kind, AnchorKindDto::Block);
+    }
+
+    #[test]
     fn loading_malformed_json_is_an_error() {
         let dir = tempfile::tempdir().expect("tempdir");
         let md = dir.path().join("notes.md");
@@ -575,6 +707,7 @@ mod tests {
             blocks: vec![ReviewBlock {
                 hash: "0123456789abcdef".to_string(),
                 excerpt: "x".to_string(),
+                kind: AnchorKindDto::Block,
                 comments: vec![comment("c_0123456789abcdef", "ok")],
             }],
         };
@@ -599,6 +732,7 @@ mod tests {
             blocks: vec![ReviewBlock {
                 hash: "not-hex".to_string(),
                 excerpt: "x".to_string(),
+                kind: AnchorKindDto::Block,
                 comments: vec![],
             }],
         };
@@ -613,6 +747,7 @@ mod tests {
             blocks: vec![ReviewBlock {
                 hash: "0123456789abcdef".to_string(),
                 excerpt: "x".to_string(),
+                kind: AnchorKindDto::Block,
                 comments: vec![comment("", "ok")],
             }],
         };
@@ -627,6 +762,7 @@ mod tests {
             blocks: vec![ReviewBlock {
                 hash: "0123456789abcdef".to_string(),
                 excerpt: "x".to_string(),
+                kind: AnchorKindDto::Block,
                 comments: vec![comment("not-the-right-format", "ok")],
             }],
         };
@@ -641,6 +777,7 @@ mod tests {
             blocks: vec![ReviewBlock {
                 hash: "0123456789abcdef".to_string(),
                 excerpt: "x".to_string(),
+                kind: AnchorKindDto::Block,
                 comments: vec![comment("c_0123456789ABCDEF", "ok")],
             }],
         };
@@ -655,6 +792,7 @@ mod tests {
             blocks: vec![ReviewBlock {
                 hash: "0123456789abcdef".to_string(),
                 excerpt: "x".to_string(),
+                kind: AnchorKindDto::Block,
                 comments: vec![comment("c_0123456789abcdef", "ok")],
             }],
         };
@@ -669,6 +807,7 @@ mod tests {
             blocks: vec![ReviewBlock {
                 hash: "0123456789abcdef".to_string(),
                 excerpt: "x".to_string(),
+                kind: AnchorKindDto::Block,
                 comments: vec![comment("c_0123456789abcdef", &"x".repeat(64 * 1024 + 1))],
             }],
         };
@@ -683,6 +822,7 @@ mod tests {
             blocks: vec![ReviewBlock {
                 hash: "0123456789abcdef".to_string(),
                 excerpt: "x".to_string(),
+                kind: AnchorKindDto::Block,
                 comments: vec![comment("c_0123456789abcdef", &"x".repeat(64 * 1024))],
             }],
         };
@@ -698,6 +838,7 @@ mod tests {
             blocks: vec![ReviewBlock {
                 hash: "0123456789abcdef".to_string(),
                 excerpt: long_excerpt,
+                kind: AnchorKindDto::Block,
                 comments: vec![],
             }],
         };
@@ -722,16 +863,18 @@ mod tests {
                 ReviewBlock {
                     hash: "aaaaaaaaaaaaaaaa".to_string(),
                     excerpt: "a".to_string(),
+                    kind: AnchorKindDto::Block,
                     comments: vec![comment("c_1", "x")],
                 },
                 ReviewBlock {
                     hash: "bbbbbbbbbbbbbbbb".to_string(),
                     excerpt: "b".to_string(),
+                    kind: AnchorKindDto::Block,
                     comments: vec![comment("c_2", "y")],
                 },
             ],
         };
-        let live = render::blocks("some text that hashes to something else\n");
+        let live = render::anchors("some text that hashes to something else\n");
         let result = unanchored(&doc, &live);
         assert_eq!(result.len(), 2);
         assert!(result.contains(&"aaaaaaaaaaaaaaaa"));
@@ -740,7 +883,7 @@ mod tests {
 
     #[test]
     fn unanchored_is_empty_when_every_hash_matches() {
-        let live = render::blocks("# Title\n\nbody text\n");
+        let live = render::anchors("# Title\n\nbody text\n");
         let doc = ReviewDoc {
             version: 1,
             file: "notes.md".to_string(),
@@ -749,6 +892,7 @@ mod tests {
                 .map(|b| ReviewBlock {
                     hash: b.hash.clone(),
                     excerpt: b.excerpt.clone(),
+                    kind: AnchorKindDto::Block,
                     comments: vec![comment("c_1", "ok")],
                 })
                 .collect(),
@@ -786,6 +930,7 @@ mod tests {
                 ReviewBlock {
                     hash: heading_hash,
                     excerpt: "## 設計方針".to_string(),
+                    kind: AnchorKindDto::Block,
                     comments: vec![
                         comment("c_1", "ここは根拠が弱い"),
                         comment("c_2", "代替案も書く"),
@@ -794,6 +939,7 @@ mod tests {
                 ReviewBlock {
                     hash: para_hash,
                     excerpt: live[1].excerpt.clone(),
+                    kind: AnchorKindDto::Block,
                     comments: vec![comment("c_3", "…")],
                 },
             ],
@@ -826,6 +972,7 @@ mod tests {
             blocks: vec![ReviewBlock {
                 hash: live[0].hash.clone(),
                 excerpt: live[0].excerpt.clone(),
+                kind: AnchorKindDto::Block,
                 comments: vec![comment("c_1", "check this")],
             }],
         };
@@ -848,6 +995,7 @@ mod tests {
             blocks: vec![ReviewBlock {
                 hash: live[0].hash.clone(),
                 excerpt: live[0].excerpt.clone(),
+                kind: AnchorKindDto::Block,
                 comments: vec![comment("c_1", "ok")],
             }],
         };
@@ -867,6 +1015,7 @@ mod tests {
             blocks: vec![ReviewBlock {
                 hash: live[0].hash.clone(),
                 excerpt: live[0].excerpt.clone(),
+                kind: AnchorKindDto::Block,
                 comments: vec![comment("c_1", "first line\nsecond line\nthird line")],
             }],
         };
@@ -883,6 +1032,7 @@ mod tests {
             blocks: vec![ReviewBlock {
                 hash: "0000000000000000".to_string(),
                 excerpt: "旧 excerpt".to_string(),
+                kind: AnchorKindDto::Block,
                 comments: vec![comment("c_1", "コメント本文")],
             }],
         };
@@ -906,6 +1056,7 @@ mod tests {
             blocks: vec![ReviewBlock {
                 hash: live[0].hash.clone(),
                 excerpt: live[0].excerpt.clone(),
+                kind: AnchorKindDto::Block,
                 comments: vec![comment("c_1", "ok")],
             }],
         };
@@ -924,6 +1075,7 @@ mod tests {
             blocks: vec![ReviewBlock {
                 hash: live[0].hash.clone(),
                 excerpt: live[0].excerpt.clone(),
+                kind: AnchorKindDto::Block,
                 comments: vec![comment("c_1", "noted")],
             }],
         };
@@ -945,11 +1097,13 @@ mod tests {
                 ReviewBlock {
                     hash: live[1].hash.clone(),
                     excerpt: live[1].excerpt.clone(),
+                    kind: AnchorKindDto::Block,
                     comments: vec![comment("c_2", "second")],
                 },
                 ReviewBlock {
                     hash: live[0].hash.clone(),
                     excerpt: live[0].excerpt.clone(),
+                    kind: AnchorKindDto::Block,
                     comments: vec![comment("c_1", "first")],
                 },
             ],
@@ -975,12 +1129,235 @@ mod tests {
             blocks: vec![ReviewBlock {
                 hash: live[0].hash.clone(),
                 excerpt: live[0].excerpt.clone(),
+                kind: AnchorKindDto::Block,
                 comments: vec![comment("c_1", "noted")],
             }],
         };
         let out = export_markdown("notes.md", markdown, &doc, "2026-08-22T07:10:00Z");
         assert_eq!(out.matches("> L").count(), 1);
         assert!(out.contains("1 comments on 1 blocks"));
+    }
+
+    // -- export_markdown: item/row anchors --------------------------------
+
+    #[test]
+    fn export_markdown_labels_a_list_item_with_an_in_list_suffix() {
+        let markdown = "- first item\n- second item\n- 三番目の項目\n";
+        let live = render::anchors(markdown);
+        let block = &live[0];
+        assert_eq!(block.kind, render::AnchorKind::Block);
+        let third_item = live
+            .iter()
+            .find(|a| a.kind == render::AnchorKind::Item && a.excerpt == "三番目の項目")
+            .expect("third item anchor");
+
+        let doc = ReviewDoc {
+            version: 1,
+            file: "notes.md".to_string(),
+            blocks: vec![ReviewBlock {
+                hash: third_item.hash.clone(),
+                excerpt: third_item.excerpt.clone(),
+                kind: AnchorKindDto::Item,
+                comments: vec![comment("c_1", "コメント")],
+            }],
+        };
+        let out = export_markdown("notes.md", markdown, &doc, "2026-08-22T07:10:00Z");
+
+        let expected_quote = format!(
+            "> {}: 三番目の項目 （in list {}）\n\n- コメント\n",
+            line_label(third_item.line_start, third_item.line_end),
+            line_label(block.line_start, block.line_end),
+        );
+        assert!(
+            out.contains(&expected_quote),
+            "expected {expected_quote:?} in {out:?}"
+        );
+    }
+
+    #[test]
+    fn export_markdown_labels_a_table_row_with_an_in_table_suffix() {
+        let markdown = "| 値1 | 値2 | 値3 |\n|---|---|---|\n| a | b | c |\n| d | e | f |\n";
+        let live = render::anchors(markdown);
+        let block = &live[0];
+        assert_eq!(block.kind, render::AnchorKind::Block);
+        let second_row = live
+            .iter()
+            .find(|a| a.kind == render::AnchorKind::Row && a.excerpt == "d | e | f")
+            .expect("second data row anchor");
+
+        let doc = ReviewDoc {
+            version: 1,
+            file: "notes.md".to_string(),
+            blocks: vec![ReviewBlock {
+                hash: second_row.hash.clone(),
+                excerpt: second_row.excerpt.clone(),
+                kind: AnchorKindDto::Row,
+                comments: vec![comment("c_1", "確認")],
+            }],
+        };
+        let out = export_markdown("notes.md", markdown, &doc, "2026-08-22T07:10:00Z");
+
+        let expected_quote = format!(
+            "> {}: d | e | f （in table {}）\n\n- 確認\n",
+            line_label(second_row.line_start, second_row.line_end),
+            line_label(block.line_start, block.line_end),
+        );
+        assert!(
+            out.contains(&expected_quote),
+            "expected {expected_quote:?} in {out:?}"
+        );
+    }
+
+    #[test]
+    fn export_markdown_block_anchors_get_no_in_list_or_in_table_suffix() {
+        // Regression guard: a plain block-kind anchor's quote line must
+        // stay exactly as before nested anchors existed — no suffix at all.
+        let markdown = "# Heading\n";
+        let live = render::blocks(markdown);
+        let doc = ReviewDoc {
+            version: 1,
+            file: "notes.md".to_string(),
+            blocks: vec![ReviewBlock {
+                hash: live[0].hash.clone(),
+                excerpt: live[0].excerpt.clone(),
+                kind: AnchorKindDto::Block,
+                comments: vec![comment("c_1", "ok")],
+            }],
+        };
+        let out = export_markdown("notes.md", markdown, &doc, "2026-08-22T07:10:00Z");
+        assert!(out.contains("> L1: # Heading\n\n"));
+        assert!(!out.contains("in list"));
+        assert!(!out.contains("in table"));
+    }
+
+    #[test]
+    fn export_markdown_nested_item_suffix_names_the_whole_list_not_the_immediate_parent_item() {
+        // A doubly-nested item's "in list" suffix must point at the
+        // top-level block's line range (the whole list), not its
+        // immediately enclosing item's — per the nested-anchors design
+        // doc: nesting is transparent for export purposes.
+        let markdown = "- outer\n  - inner comment target\n";
+        let live = render::anchors(markdown);
+        let block = &live[0];
+        let inner = live
+            .iter()
+            .find(|a| a.kind == render::AnchorKind::Item && a.excerpt == "inner comment target")
+            .expect("inner item anchor");
+        // Sanity check the fixture: the inner item's own line range must
+        // differ from the block's, or this test wouldn't distinguish the
+        // two possible (correct vs. incorrect) suffixes.
+        assert_ne!(inner.line_start, block.line_start);
+
+        let doc = ReviewDoc {
+            version: 1,
+            file: "notes.md".to_string(),
+            blocks: vec![ReviewBlock {
+                hash: inner.hash.clone(),
+                excerpt: inner.excerpt.clone(),
+                kind: AnchorKindDto::Item,
+                comments: vec![comment("c_1", "note")],
+            }],
+        };
+        let out = export_markdown("notes.md", markdown, &doc, "2026-08-22T07:10:00Z");
+        let expected_suffix = format!(
+            "（in list {}）",
+            line_label(block.line_start, block.line_end)
+        );
+        assert!(
+            out.contains(&expected_suffix),
+            "expected {expected_suffix:?} in {out:?}"
+        );
+    }
+
+    #[test]
+    fn export_markdown_labels_an_item_inside_a_blockquote_with_an_in_block_suffix() {
+        // A list item's *own* kind is Item, but when its enclosing
+        // top-level block is a blockquote (not literally a list), the
+        // suffix must say "in block", not "in list" — the label is decided
+        // by what the ancestor block's own source actually is.
+        let markdown = "> - quoted item one\n> - quoted item two\n";
+        let live = render::anchors(markdown);
+        let block = &live[0];
+        assert_eq!(block.kind, render::AnchorKind::Block);
+        let item = live
+            .iter()
+            .find(|a| a.kind == render::AnchorKind::Item && a.excerpt == "quoted item one")
+            .expect("quoted item anchor");
+
+        let doc = ReviewDoc {
+            version: 1,
+            file: "notes.md".to_string(),
+            blocks: vec![ReviewBlock {
+                hash: item.hash.clone(),
+                excerpt: item.excerpt.clone(),
+                kind: AnchorKindDto::Item,
+                comments: vec![comment("c_1", "確認")],
+            }],
+        };
+        let out = export_markdown("notes.md", markdown, &doc, "2026-08-22T07:10:00Z");
+
+        let expected_suffix = format!(
+            "（in block {}）",
+            line_label(block.line_start, block.line_end)
+        );
+        assert!(
+            out.contains(&expected_suffix),
+            "expected {expected_suffix:?} in {out:?}"
+        );
+        assert!(!out.contains("in list"));
+    }
+
+    #[test]
+    fn export_markdown_omits_the_unanchored_section_when_the_only_entry_has_no_comments() {
+        // Defensive: `ReviewBlock`s with an empty `comments` list shouldn't
+        // normally exist (the client drops a block the moment its last
+        // comment is deleted), but nothing in review::validate rejects one
+        // server-side. A block like that must not open an empty `##
+        // Unanchored` section.
+        let markdown = "# Current heading\n";
+        let doc = ReviewDoc {
+            version: 1,
+            file: "notes.md".to_string(),
+            blocks: vec![ReviewBlock {
+                hash: "0000000000000000".to_string(),
+                excerpt: "旧 excerpt".to_string(),
+                kind: AnchorKindDto::Block,
+                comments: vec![],
+            }],
+        };
+        let out = export_markdown("notes.md", markdown, &doc, "2026-08-22T07:10:00Z");
+        assert!(!out.contains("Unanchored"));
+        assert!(!out.contains("unanchored"));
+    }
+
+    #[test]
+    fn export_markdown_orders_a_block_immediately_followed_by_its_own_items() {
+        let markdown = "- one\n- two\n\nUnrelated paragraph.\n";
+        let live = render::anchors(markdown);
+        let doc = ReviewDoc {
+            version: 1,
+            file: "notes.md".to_string(),
+            blocks: live
+                .iter()
+                .map(|a| ReviewBlock {
+                    hash: a.hash.clone(),
+                    excerpt: a.excerpt.clone(),
+                    kind: match a.kind {
+                        render::AnchorKind::Block => AnchorKindDto::Block,
+                        render::AnchorKind::Item => AnchorKindDto::Item,
+                        render::AnchorKind::Row => AnchorKindDto::Row,
+                    },
+                    comments: vec![comment("c_1", "x")],
+                })
+                .collect(),
+        };
+        let out = export_markdown("notes.md", markdown, &doc, "2026-08-22T07:10:00Z");
+        let list_idx = out.find("- one").expect("list block quoted");
+        let one_idx = out.find("in list").expect("first item's suffix present");
+        let unrelated_idx = out
+            .find("Unrelated paragraph")
+            .expect("unrelated paragraph quoted");
+        assert!(list_idx < one_idx && one_idx < unrelated_idx);
     }
 
     // -- export (I/O) -----------------------------------------------------------

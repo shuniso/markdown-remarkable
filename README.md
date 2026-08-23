@@ -112,6 +112,22 @@ mdview notes.md --export notes.html
   slim tab with `⌘\` (Windows/Linux: `Ctrl+\`); `⌘J`/`Ctrl+J` does the same
   thing as an alternative for keyboards where typing a backslash is
   awkward (JIS layouts, notably).
+- **List items and table rows** (including the header row) can be
+  commented on individually, not just the list/table as a whole — click a
+  specific `<li>` or `<tr>` (nesting is respected: clicking a deeply nested
+  item selects that item, not its enclosing list or block) to select just
+  that item/row instead of the whole block. Selecting an item/row shows a
+  breadcrumb above its quote (e.g. `ブロック L10-L20 › 項目 L13`, each
+  segment clickable) and a "↑ リスト/表全体にコメント" shortcut back to the
+  enclosing block; selecting a block that contains items/rows shows a hint
+  that finer-grained comments are available. A block/item with commented
+  descendants gets a small "内側に N 件" badge. `Alt+←`/`Alt+→` move to the
+  selected anchor's enclosing anchor/first nested anchor; `Alt+↑`/`Alt+↓`
+  now move within the same nesting level (sibling items, sibling rows, or
+  sibling top-level blocks) rather than always cycling through top-level
+  blocks. Exporting a comment on an item/row adds a `（in list L10-L20）`/
+  `（in table L40-L48）` suffix to its quote line, naming the enclosing
+  list/table's line range.
 
 ## Limitations
 
@@ -140,14 +156,26 @@ mdview notes.md --export notes.html
 - The `.app` bundle is macOS-only and ad-hoc signed (no Developer ID, no
   notarization), so it's meant for your own machine. There's no installer
   for Linux or Windows.
-- Review comments are per-block, not per-line or per-selection, and there's
-  no reply thread or resolved/unresolved status — just a flat list of
-  comments per block. Two blocks with identical (trimmed) source hash the
-  same and so share comments; this only matters for exact duplicate
-  content. `--export`ed static HTML has no review pane at all (there's no
-  server for it to talk to). The `.review.json` sidecar isn't watched for
-  external changes — edit it by hand at your own risk, since the running
-  view won't notice until you interact with the pane again.
+- Review comments are per-block/per-item/per-row, not per-cell, per-line, or
+  per-selection, and there's no reply thread or resolved/unresolved status —
+  just a flat list of comments per anchor. Two anchors with identical
+  (trimmed) source hash the same and so share comments; this only matters
+  for exact duplicate content — for example, a list item and a table row
+  with identical text share a marker/badge state with each other, and a
+  single-item list's block-level anchor and its sole item anchor hash
+  identically too (they cover the same trimmed source string). `--export`ed
+  static HTML has no review pane at all (there's no server for it to talk
+  to). The `.review.json` sidecar isn't watched for external changes — edit
+  it by hand at your own risk, since the running view won't notice until you
+  interact with the pane again.
+- Footnote reference numbers reset per block (and, within a list/table
+  block, per list item/table row), instead of counting up sequentially
+  across the whole document. This is because `to_html` renders each block's
+  content through several separate `pulldown-cmark::html::push_html` calls
+  rather than one call over the whole document (needed so hand-written
+  `<li>`/`<tr>` anchor tags can be interleaved with pulldown-cmark's own
+  output) — each such call starts pulldown-cmark's internal footnote
+  counter fresh, at 1.
 
 ## Building
 
