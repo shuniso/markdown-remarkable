@@ -172,9 +172,21 @@ scripts/bundle-macos.sh --install  # ...and copies it to /Applications
 Launched from Finder with no file, the app shows an "Open" dialog (cancel
 it to get the empty drop-target page; ⌘O brings it back). Double-clicking a
 Markdown file — or dropping one on the app icon — opens it directly. The
-bundle is ad-hoc signed, which is all a locally built app needs; the icon
-comes from `packaging/macos/mdview.icns` (regenerate with
+icon comes from `packaging/macos/mdview.icns` (regenerate with
 `scripts/make-icon.py`, which needs Pillow).
+
+The bundle is built for the machine's native architecture (on Apple Silicon
+with a Rosetta-installed rustup, run `rustup target add aarch64-apple-darwin`
+first) and ad-hoc signed by default, which is enough to run it. macOS 15+
+will not let an ad-hoc signed app become the *default* handler for `.md`
+though (Finder's "Change All…" silently reverts), so to make mdview the
+default, sign with a real identity:
+
+```sh
+security find-identity -v -p codesigning   # list available identities
+MDVIEW_SIGN_IDENTITY="Apple Development: you@example.com (TEAMID)" \
+  scripts/bundle-macos.sh --install
+```
 
 ### Linux dependencies
 
