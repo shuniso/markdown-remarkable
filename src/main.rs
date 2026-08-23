@@ -14,20 +14,24 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::AtomicU64;
 use std::sync::Arc;
 
-/// A tiny Markdown viewer: opens a native window (by default) or serves the
-/// file to a browser tab (`--browser`), reloading in place whenever the
-/// file is saved.
+/// A tiny Markdown viewer: opens a native window per file (by default) or
+/// serves a single file to a browser tab (`--browser`), reloading in place
+/// whenever a file is saved.
 #[derive(Parser, Debug)]
 #[command(name = "mdview", version, about)]
 struct Cli {
-    /// Markdown file to view. If omitted, the native window opens a
-    /// file-picker dialog on startup — cancelling it shows an empty "drop a
-    /// file here" page instead of exiting.
-    file: Option<PathBuf>,
+    /// Markdown file(s) to view — each gets its own native window. If
+    /// omitted entirely, one native window opens a file-picker dialog on
+    /// startup — cancelling it shows an empty "drop a file here" page
+    /// instead of exiting.
+    #[arg(num_args = 0..)]
+    file: Vec<PathBuf>,
 
-    /// Show the file in your default browser instead of opening a native
-    /// window (the original CLI's behavior, unchanged). Requires FILE.
-    #[arg(long, requires = "file")]
+    /// Show a file in your default browser instead of opening a native
+    /// window (the original CLI's behavior, unchanged). Requires exactly
+    /// one FILE — the browser server has no equivalent of the native app's
+    /// multiple windows.
+    #[arg(long)]
     browser: bool,
 
     /// Port to listen on. 0 lets the OS pick a free port. Only applies to
@@ -40,14 +44,13 @@ struct Cli {
     #[arg(long, requires = "browser")]
     no_open: bool,
 
-    /// Render the file to a standalone HTML file and exit, instead of
-    /// showing it live. Requires FILE, and is mutually exclusive with
-    /// `--browser`/`--port`/`--no-open` (which only apply to the live
-    /// view).
+    /// Render a file to a standalone HTML file and exit, instead of
+    /// showing it live. Requires exactly one FILE, and is mutually
+    /// exclusive with `--browser`/`--port`/`--no-open` (which only apply to
+    /// the live view).
     #[arg(
         long,
         value_name = "OUT.html",
-        requires = "file",
         conflicts_with_all = ["browser", "port", "no_open"]
     )]
     export: Option<PathBuf>,
@@ -56,36 +59,69 @@ struct Cli {
 fn main() -> Result<()> {
     let cli = Cli::parse();
 
-    // If FILE was given, confirm up front that it's readable — this turns
-    // "doesn't exist"/"unreadable" into a clean exit-1 error before doing
-    // anything else (opening a server, a window, etc.) in every mode, the
-    // same as the original CLI did.
-    let markdown = cli
-        .file
-        .as_deref()
-        .map(|file| {
-            fs::read_to_string(file).with_context(|| format!("failed to read {}", file.display()))
-        })
-        .transpose()?;
+    // `--browser`/`--export` each show/render a single file — neither has
+    // any equivalent of the native app's multiple windows — so more than
+    // one FILE alongside either is a usage error, checked up front before
+    // touching the filesystem at all.
+    if (cli.browser || cli.export.is_some()) && cli.file.len() != 1 {
+        anyhow::bail!("--browser/--export take exactly one FILE");
+    }
 
     if let Some(export_path) = cli.export.as_deref() {
-        // clap guarantees `file`/`markdown` are `Some` here (`--export`
-        // `requires = "file"`).
-        let file = cli.file.as_deref().expect("--export requires FILE");
-        let markdown = markdown.expect("--export requires FILE");
+        // The length check above guarantees exactly one FILE here.
+        // `--export` is the one mode that actually needs the file's
+        // *contents* right away (to render it once and exit) — every other
+        // mode below only ever needs to know a file is readable right now;
+        // the native window and the browser server each read a file live,
+        // per request, via `routes::handle`.
+        let file = &cli.file[0];
+        let markdown = fs::read_to_string(file)
+            .with_context(|| format!("failed to read {}", file.display()))?;
         return export(file, &markdown, export_path);
     }
 
     if cli.browser {
-        // clap guarantees `file` is `Some` here (`--browser` `requires =
-        // "file"`): the browser server has no equivalent of the native
-        // app's file-picker dialog / drag&drop, so there's nothing sensible
-        // to serve without one.
-        let file = cli.file.as_deref().expect("--browser requires FILE");
+        // The length check above guarantees exactly one FILE here. A
+        // single bad file is fatal in this mode (there's no second window
+        // to fall back to showing), so this propagates as a hard error.
+        let file = &cli.file[0];
+        confirm_readable(file)?;
         return run_browser(file, cli.port, cli.no_open);
     }
 
-    app::run(cli.file)
+    // Native mode: open a window for every FILE that's readable right now.
+    // An unreadable one (typo, deleted, permissions) gets a warning and is
+    // skipped rather than failing the whole launch — the other files (and
+    // their windows) are still worth showing regardless. Only if every
+    // given FILE failed is that a hard error (there would be nothing left
+    // to open a window for).
+    let had_files = !cli.file.is_empty();
+    let readable: Vec<PathBuf> = cli
+        .file
+        .into_iter()
+        .filter(|file| match confirm_readable(file) {
+            Ok(()) => true,
+            Err(err) => {
+                eprintln!("warning: {err:#}");
+                false
+            }
+        })
+        .collect();
+    if had_files && readable.is_empty() {
+        anyhow::bail!("none of the given files could be read");
+    }
+    app::run(readable)
+}
+
+/// Confirms `file` can be opened for reading right now, without actually
+/// reading its contents — this turns "doesn't exist"/"unreadable" into a
+/// clean error before the native window or browser server (each of which
+/// reads a file live, per request, rather than once up front) ever tries
+/// to serve it.
+fn confirm_readable(file: &Path) -> Result<()> {
+    fs::File::open(file)
+        .map(|_file| ())
+        .with_context(|| format!("failed to read {}", file.display()))
 }
 
 /// The original `--browser` flow: bind a local HTTP server, watch the file,

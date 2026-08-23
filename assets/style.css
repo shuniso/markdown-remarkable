@@ -561,6 +561,28 @@ button.review-save-status.failed {
   padding: 0.1em 0.4em;
 }
 
+/* "ファイル" — the breadcrumb's permanent root segment (assets/review.js's
+   buildFileBreadcrumbSegment()) and the file-mode comment list heading. */
+.review-breadcrumb-badge {
+  display: inline-block;
+  margin-left: 0.3em;
+  min-width: 1.2em;
+  padding: 0 0.35em;
+  border-radius: 999px;
+  background-color: var(--md-accent);
+  color: var(--md-accent-fg);
+  font-size: 0.7rem;
+  font-weight: 600;
+  line-height: 1.4em;
+  text-align: center;
+}
+
+.review-file-heading {
+  margin: 0 0 0.5rem;
+  font-size: 0.85em;
+  font-weight: 600;
+}
+
 .review-hint {
   margin: 0 0 0.6rem;
   font-size: 0.8em;
@@ -683,4 +705,12 @@ button.review-save-status.failed {
   margin: 0 0 0.3em;
   white-space: pre-wrap;
   word-wrap: break-word;
+}
+
+/* -- File mode (assets/review.js's buildFileCommentsView()) -----------
+   `.review-hint.review-file-hint` (rather than relying on source order
+   against the plain `.review-hint` rule above) so this margin-top override
+   wins regardless of where either rule happens to sit in the file. */
+.review-hint.review-file-hint {
+  margin-top: 0.6rem;
 }

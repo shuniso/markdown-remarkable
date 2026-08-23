@@ -22,14 +22,30 @@ shows a "failed to read" message instead of the old content, then updates
 again on its own once the file exists (and is readable) again.
 
 ```sh
+mdview a.md b.md c.md
+```
+
+Each `FILE` gets its own native window, so you can see several files side
+by side. Windows are independent: each has its own watcher, title, and
+zoom level, and closing one (⌘W or its close button) only closes that
+window — the app itself only quits once every window is closed (or on
+⌘Q, which closes all of them at once). New windows cascade slightly down
+and to the right of the last one so they don't stack exactly on top of
+each other.
+
+```sh
 mdview
 ```
 
 With no `FILE`, a native "open file" dialog appears; pick a `.md`/
 `.markdown` file, or cancel to see an empty "drop a Markdown file here"
-window. You can also drag & drop a `.md`/`.markdown` file onto the window
-at any time (before or after one is already open) to switch to it — the
-watcher and window title switch along with it.
+window. You can also drag & drop a `.md`/`.markdown` file onto a window at
+any time — if that window is still empty it switches to the dropped file
+(watcher and title along with it), otherwise the file opens in a new
+window. ⌘O behaves the same way, applied to whichever window is currently
+frontmost. Opening a file that's already open in another window (from
+Finder, "Open With", or `open -a`) brings that window to the front instead
+of opening a duplicate.
 
 ```sh
 mdview README.md --browser
@@ -42,10 +58,10 @@ browser instead of a native window — the original CLI's behavior, unchanged.
 
 | Flag | Default | Description |
 |---|---|---|
-| `--browser` | off | Show the file in your default browser instead of opening a native window. Requires `FILE`. |
+| `--browser` | off | Show the file in your default browser instead of opening a native window. Requires exactly one `FILE`. |
 | `--port <PORT>` | `0` | Port to listen on. `0` lets the OS pick a free port. Only applies to `--browser`. |
 | `--no-open` | off | Don't open the browser automatically. Only applies to `--browser`. |
-| `--export <OUT.html>` | — | Render to a standalone HTML file and exit, instead of showing it live. Requires `FILE`, and is mutually exclusive with `--browser`/`--port`/`--no-open`. Refuses to write over the input file itself. |
+| `--export <OUT.html>` | — | Render to a standalone HTML file and exit, instead of showing it live. Requires exactly one `FILE`, and is mutually exclusive with `--browser`/`--port`/`--no-open`. Refuses to write over the input file itself. |
 
 Set the environment variable `MDVIEW_DEBUG=1` to log every request the
 native window's WebView makes (`[mdview] GET /version -> 200` and so on) to
@@ -112,6 +128,13 @@ mdview notes.md --export notes.html
   slim tab with `⌘\` (Windows/Linux: `Ctrl+\`); `⌘J`/`Ctrl+J` does the same
   thing as an alternative for keyboards where typing a backslash is
   awkward (JIS layouts, notably).
+- **File-wide comments**: the pane's breadcrumb has a permanent root
+  segment, **ファイル** (with a comment-count badge), for comments on the
+  document as a whole rather than any specific block — click it (or press
+  Esc, or just don't select anything) to write/edit/delete them the same
+  way as block comments. They're saved in the same `.review.json` sidecar
+  and counted in the header's total, and Export adds a leading
+  `> (file): <name>` section for them ahead of any block sections.
 - **List items and table rows** (including the header row) can be
   commented on individually, not just the list/table as a whole — click a
   specific `<li>` or `<tr>` (nesting is respected: clicking a deeply nested
@@ -141,14 +164,20 @@ mdview notes.md --export notes.html
   (`img-src data: http: https:`) doesn't include `file:` or `'self'`, so
   even a `--export`ed HTML file opened directly in a browser won't display
   a local/relative-path image — only `http(s)` image URLs work there too.
-- The native window supports one file at a time — opening or dropping a new
-  one replaces the current one, it doesn't open a second window.
-- Links in the native window never navigate the window itself: `http(s)`
+- Each native window still shows one file at a time — dropping, picking, or
+  Finder-opening a file while a window that already has one is frontmost
+  opens a *new* window for it rather than replacing that window's content;
+  only an empty window (nothing open in it yet) gets filled in place.
+  There's no tabs, no window list menu, and no combined export across
+  windows.
+- Links in a native window never navigate the window itself: `http(s)`
   and `mailto:` links open in your default browser, and relative links to
   other files are ignored (there's no back button to return from them).
-- The native window has a minimal menu bar on macOS only (Quit, Copy,
-  Select All, Close Window, with the usual Cmd shortcuts). On Linux and
-  Windows there's no menu bar; use the window's close button, and
+- The native windows share a single minimal menu bar on macOS only (Quit,
+  Copy, Select All, Close Window, with the usual Cmd shortcuts) — menu
+  actions like Zoom/Reload/Open… apply to whichever window is currently
+  frontmost. On Linux and Windows there's no menu bar; use each window's
+  close button, and
   `--browser` if you need clipboard shortcuts.
 - On Linux the "open file" dialog goes through `xdg-desktop-portal` over
   D-Bus; without a portal/D-Bus session the dialog silently yields nothing
@@ -168,6 +197,14 @@ mdview notes.md --export notes.html
   to). The `.review.json` sidecar isn't watched for external changes — edit
   it by hand at your own risk, since the running view won't notice until you
   interact with the pane again.
+- The pane header's comment count includes unanchored comments, but the
+  Export summary's headline count only covers anchored ones — unanchored
+  comments are called out separately there as `(+U unanchored)` — so the
+  two numbers can legitimately differ.
+- Saving a review from a version of mdview that predates file-wide comments
+  discards any existing `file_comments`: `PUT /review` replaces the whole
+  sidecar in one request, and an older client's payload simply has no such
+  field to send back.
 - Footnote reference numbers reset per block (and, within a list/table
   block, per list item/table row), instead of counting up sequentially
   across the whole document. This is because `to_html` renders each block's

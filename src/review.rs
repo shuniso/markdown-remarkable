@@ -31,6 +31,19 @@ const MAX_COMMENT_TEXT_BYTES: usize = 64 * 1024;
 /// string into what's meant to be a one-line preview.
 const MAX_EXCERPT_CHARS: usize = 200;
 
+/// Maximum total number of comments a document may hold —
+/// [`ReviewDoc::file_comments`] plus every block's comments, combined.
+/// [`MAX_COMMENT_TEXT_BYTES`] alone only bounds a single comment's size,
+/// not how many of them a client can pile up in one `PUT /review`.
+const MAX_TOTAL_COMMENTS: usize = 10_000;
+
+/// Maximum serialized size, in bytes, of the whole document — the same
+/// `serde_json::to_vec` encoding [`save`] and `PUT /review`'s body use. A
+/// coarser backstop alongside [`MAX_TOTAL_COMMENTS`]/[`MAX_COMMENT_TEXT_BYTES`]:
+/// even within both of those per-field limits, enough blocks and excerpts
+/// together could still add up to an unreasonably large sidecar.
+const MAX_TOTAL_SIDECAR_BYTES: usize = 8 * 1024 * 1024;
+
 /// The full review sidecar document: every block that has ever had a
 /// comment, and those comments. Serialized as-is to `<file>.review.json`
 /// (see [`sidecar_path`]).
@@ -39,6 +52,13 @@ pub struct ReviewDoc {
     pub version: u32,
     pub file: String,
     pub blocks: Vec<ReviewBlock>,
+    /// Comments on the document as a whole, not anchored to any block/item/
+    /// row — a total-evaluation note rather than feedback on a specific
+    /// span. `#[serde(default)]` so a sidecar written before this field
+    /// existed still loads (with an empty `Vec`). Always considered
+    /// "anchored" — see [`unanchored`], which never looks at this field.
+    #[serde(default)]
+    pub file_comments: Vec<Comment>,
 }
 
 /// One commented anchor: the anchor identity it was last attached to
@@ -142,6 +162,7 @@ fn empty_doc(md: &Path) -> ReviewDoc {
         version: SCHEMA_VERSION,
         file: file_title(md),
         blocks: Vec::new(),
+        file_comments: Vec::new(),
     }
 }
 
@@ -208,7 +229,11 @@ pub fn save(md: &Path, doc: &ReviewDoc) -> Result<()> {
 /// is forced to a single line (`\n`/`\r` become spaces) and capped at
 /// [`MAX_EXCERPT_CHARS`] characters, since a client could otherwise submit
 /// something `render::blocks` would never itself produce (arbitrary
-/// multi-line or oversized text). Doesn't touch the filesystem or
+/// multi-line or oversized text). Also enforces two whole-document bounds —
+/// [`MAX_TOTAL_COMMENTS`] (across `file_comments` and every block combined)
+/// and [`MAX_TOTAL_SIDECAR_BYTES`] (the document's own serialized size) —
+/// since the per-field limits above don't by themselves bound how large the
+/// document as a whole can grow. Doesn't touch the filesystem or
 /// `render::blocks` — this is pure structural validation/normalization of
 /// the document as submitted.
 pub fn validate(doc: &mut ReviewDoc) -> Result<()> {
@@ -223,15 +248,46 @@ pub fn validate(doc: &mut ReviewDoc) -> Result<()> {
             return Err(anyhow!("invalid block hash: {:?}", block.hash));
         }
         normalize_excerpt(&mut block.excerpt);
-        for comment in &block.comments {
-            if !is_valid_comment_id(&comment.id) {
-                return Err(anyhow!("invalid comment id: {:?}", comment.id));
-            }
-            if comment.text.len() > MAX_COMMENT_TEXT_BYTES {
-                return Err(anyhow!(
-                    "comment text exceeds {MAX_COMMENT_TEXT_BYTES} bytes"
-                ));
-            }
+        validate_comments(&block.comments)?;
+    }
+    validate_comments(&doc.file_comments)?;
+
+    let total_comments: usize = doc.file_comments.len()
+        + doc
+            .blocks
+            .iter()
+            .map(|block| block.comments.len())
+            .sum::<usize>();
+    if total_comments > MAX_TOTAL_COMMENTS {
+        return Err(anyhow!(
+            "review document has {total_comments} comments, exceeding the {MAX_TOTAL_COMMENTS} limit"
+        ));
+    }
+
+    let serialized_len = serde_json::to_vec(doc)
+        .context("failed to serialize review document for size validation")?
+        .len();
+    if serialized_len > MAX_TOTAL_SIDECAR_BYTES {
+        return Err(anyhow!(
+            "review document is {serialized_len} bytes, exceeding the {MAX_TOTAL_SIDECAR_BYTES} byte limit"
+        ));
+    }
+
+    Ok(())
+}
+
+/// Shared by [`validate`] for both a block's comments and
+/// [`ReviewDoc::file_comments`]: every comment's `id` matches the expected
+/// shape and its `text` stays within [`MAX_COMMENT_TEXT_BYTES`].
+fn validate_comments(comments: &[Comment]) -> Result<()> {
+    for comment in comments {
+        if !is_valid_comment_id(&comment.id) {
+            return Err(anyhow!("invalid comment id: {:?}", comment.id));
+        }
+        if comment.text.len() > MAX_COMMENT_TEXT_BYTES {
+            return Err(anyhow!(
+                "comment text exceeds {MAX_COMMENT_TEXT_BYTES} bytes"
+            ));
         }
     }
     Ok(())
@@ -290,9 +346,14 @@ fn now_rfc3339() -> String {
 }
 
 /// Renders the review as a standalone Markdown document: a heading, an
-/// "Exported: <timestamp> · N comments on M blocks" summary line (with an
-/// "(+K unanchored)" suffix appended whenever there are unanchored
-/// comments), then one section per commented, anchored anchor — block,
+/// "Exported: <timestamp> · N comments on M blocks" summary line — or,
+/// whenever [`ReviewDoc::file_comments`] is non-empty, "N comments (K on
+/// the file, M on B blocks)" instead, where `N = K + M` (with an "(+U
+/// unanchored)" suffix appended in either case whenever there are
+/// unanchored comments) — followed by a `> (file): <md_name>` section for
+/// `file_comments` (only emitted when there is at least one; always first,
+/// since it isn't anchored to any position in the document), then one
+/// section per commented, anchored anchor — block,
 /// list item, or table row — in document order (a block immediately
 /// followed by its own nested items/rows, before moving on to the next
 /// block — see `render::anchors`): a single quoted line giving the
@@ -362,16 +423,35 @@ pub fn export_markdown(md_name: &str, markdown: &str, doc: &ReviewDoc, now: &str
         .filter_map(|hash| doc.blocks.iter().find(|rb| rb.hash == *hash))
         .map(|rb| rb.comments.len())
         .sum();
+    let file_comment_count = doc.file_comments.len();
 
     let mut out = String::new();
     out.push_str(&format!("# Review: {md_name}\n\n"));
-    out.push_str(&format!(
-        "Exported: {now} · {anchored_comments} comments on {anchored_blocks} blocks"
-    ));
+    if file_comment_count > 0 {
+        let total_comments = file_comment_count + anchored_comments;
+        out.push_str(&format!(
+            "Exported: {now} · {total_comments} comments \
+             ({file_comment_count} on the file, {anchored_comments} on {anchored_blocks} blocks)"
+        ));
+    } else {
+        out.push_str(&format!(
+            "Exported: {now} · {anchored_comments} comments on {anchored_blocks} blocks"
+        ));
+    }
     if unanchored_comments > 0 {
         out.push_str(&format!(" (+{unanchored_comments} unanchored)"));
     }
     out.push_str("\n\n");
+
+    if file_comment_count > 0 {
+        out.push_str("> (file): ");
+        out.push_str(&single_line(md_name));
+        out.push_str("\n\n");
+        for comment in &doc.file_comments {
+            push_comment_bullet(&mut out, "- ", &comment.text);
+        }
+        out.push('\n');
+    }
 
     for (anchor, review_block) in &sections {
         out.push_str("> ");
@@ -574,6 +654,25 @@ mod tests {
                 kind: AnchorKindDto::Block,
                 comments: vec![comment("c_1", "looks good")],
             }],
+            file_comments: Vec::new(),
+        };
+
+        save(&md, &doc).expect("save");
+        let loaded = load(&md).expect("load");
+        assert_eq!(loaded, doc);
+    }
+
+    #[test]
+    fn save_then_load_round_trips_file_comments() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let md = dir.path().join("notes.md");
+        std::fs::write(&md, "# Hi\n").expect("write md");
+
+        let doc = ReviewDoc {
+            version: 1,
+            file: "notes.md".to_string(),
+            blocks: vec![],
+            file_comments: vec![comment("c_1", "全体として章立てが前後している")],
         };
 
         save(&md, &doc).expect("save");
@@ -687,6 +786,25 @@ mod tests {
     }
 
     #[test]
+    fn loading_a_sidecar_written_before_file_comments_existed_defaults_to_empty() {
+        // A sidecar written before file-wide comments existed has no
+        // "file_comments" field at all — `#[serde(default)]` on
+        // `ReviewDoc::file_comments` must fill that in as an empty `Vec`,
+        // not fail to parse.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let md = dir.path().join("notes.md");
+        std::fs::write(&md, "# Hi\n").expect("write md");
+        std::fs::write(
+            sidecar_path(&md),
+            r#"{"version":1,"file":"notes.md","blocks":[]}"#,
+        )
+        .expect("write sidecar");
+
+        let doc = load(&md).expect("load");
+        assert!(doc.file_comments.is_empty());
+    }
+
+    #[test]
     fn loading_malformed_json_is_an_error() {
         let dir = tempfile::tempdir().expect("tempdir");
         let md = dir.path().join("notes.md");
@@ -710,6 +828,7 @@ mod tests {
                 kind: AnchorKindDto::Block,
                 comments: vec![comment("c_0123456789abcdef", "ok")],
             }],
+            file_comments: Vec::new(),
         };
         assert!(validate(&mut doc).is_ok());
     }
@@ -720,6 +839,7 @@ mod tests {
             version: 2,
             file: "notes.md".to_string(),
             blocks: vec![],
+            file_comments: Vec::new(),
         };
         assert!(validate(&mut doc).is_err());
     }
@@ -735,6 +855,7 @@ mod tests {
                 kind: AnchorKindDto::Block,
                 comments: vec![],
             }],
+            file_comments: Vec::new(),
         };
         assert!(validate(&mut doc).is_err());
     }
@@ -750,6 +871,7 @@ mod tests {
                 kind: AnchorKindDto::Block,
                 comments: vec![comment("", "ok")],
             }],
+            file_comments: Vec::new(),
         };
         assert!(validate(&mut doc).is_err());
     }
@@ -765,6 +887,7 @@ mod tests {
                 kind: AnchorKindDto::Block,
                 comments: vec![comment("not-the-right-format", "ok")],
             }],
+            file_comments: Vec::new(),
         };
         assert!(validate(&mut doc).is_err());
     }
@@ -780,6 +903,7 @@ mod tests {
                 kind: AnchorKindDto::Block,
                 comments: vec![comment("c_0123456789ABCDEF", "ok")],
             }],
+            file_comments: Vec::new(),
         };
         assert!(validate(&mut doc).is_err());
     }
@@ -795,6 +919,7 @@ mod tests {
                 kind: AnchorKindDto::Block,
                 comments: vec![comment("c_0123456789abcdef", "ok")],
             }],
+            file_comments: Vec::new(),
         };
         assert!(validate(&mut doc).is_ok());
     }
@@ -810,6 +935,7 @@ mod tests {
                 kind: AnchorKindDto::Block,
                 comments: vec![comment("c_0123456789abcdef", &"x".repeat(64 * 1024 + 1))],
             }],
+            file_comments: Vec::new(),
         };
         assert!(validate(&mut doc).is_err());
     }
@@ -825,6 +951,7 @@ mod tests {
                 kind: AnchorKindDto::Block,
                 comments: vec![comment("c_0123456789abcdef", &"x".repeat(64 * 1024))],
             }],
+            file_comments: Vec::new(),
         };
         assert!(validate(&mut doc).is_ok());
     }
@@ -841,6 +968,7 @@ mod tests {
                 kind: AnchorKindDto::Block,
                 comments: vec![],
             }],
+            file_comments: Vec::new(),
         };
         validate(&mut doc).expect("validate");
         let excerpt = &doc.blocks[0].excerpt;
@@ -850,6 +978,96 @@ mod tests {
         // Each `\r` and `\n` becomes its own space, so the `\r\n` between
         // "second" and "third" becomes two spaces, not one.
         assert!(excerpt.starts_with("first second  third "));
+    }
+
+    #[test]
+    fn validate_accepts_well_formed_file_comments() {
+        let mut doc = ReviewDoc {
+            version: 1,
+            file: "notes.md".to_string(),
+            blocks: vec![],
+            file_comments: vec![comment("c_0123456789abcdef", "ok")],
+        };
+        assert!(validate(&mut doc).is_ok());
+    }
+
+    #[test]
+    fn validate_rejects_a_malformed_file_comment_id() {
+        let mut doc = ReviewDoc {
+            version: 1,
+            file: "notes.md".to_string(),
+            blocks: vec![],
+            file_comments: vec![comment("not-the-right-format", "ok")],
+        };
+        assert!(validate(&mut doc).is_err());
+    }
+
+    #[test]
+    fn validate_rejects_file_comment_text_over_64_kib() {
+        let mut doc = ReviewDoc {
+            version: 1,
+            file: "notes.md".to_string(),
+            blocks: vec![],
+            file_comments: vec![comment("c_0123456789abcdef", &"x".repeat(64 * 1024 + 1))],
+        };
+        assert!(validate(&mut doc).is_err());
+    }
+
+    #[test]
+    fn validate_rejects_more_than_10_000_comments_combined_across_file_and_blocks() {
+        // The 10,000 cap counts file_comments and every block's comments
+        // together, not either pool on its own — half the comments live on
+        // a block here, half on the file, and the combined total is what
+        // must be rejected.
+        let file_comments: Vec<Comment> = (0..5001)
+            .map(|i| comment(&format!("c_{i:016x}"), "x"))
+            .collect();
+        let block_comments: Vec<Comment> = (5001..10002)
+            .map(|i| comment(&format!("c_{i:016x}"), "x"))
+            .collect();
+        let mut doc = ReviewDoc {
+            version: 1,
+            file: "notes.md".to_string(),
+            blocks: vec![ReviewBlock {
+                hash: "0123456789abcdef".to_string(),
+                excerpt: "x".to_string(),
+                kind: AnchorKindDto::Block,
+                comments: block_comments,
+            }],
+            file_comments,
+        };
+        assert!(validate(&mut doc).is_err());
+    }
+
+    #[test]
+    fn validate_accepts_exactly_10_000_total_comments() {
+        let file_comments: Vec<Comment> = (0..10_000)
+            .map(|i| comment(&format!("c_{i:016x}"), "x"))
+            .collect();
+        let mut doc = ReviewDoc {
+            version: 1,
+            file: "notes.md".to_string(),
+            blocks: vec![],
+            file_comments,
+        };
+        assert!(validate(&mut doc).is_ok());
+    }
+
+    #[test]
+    fn validate_rejects_a_document_whose_serialized_size_exceeds_8_mib() {
+        // Each comment stays within the per-comment 64 KiB text cap, and
+        // the total comment count (200) stays well under the 10,000 cap —
+        // only the whole-document byte size is what pushes this over.
+        let file_comments: Vec<Comment> = (0..200)
+            .map(|i| comment(&format!("c_{i:016x}"), &"x".repeat(64 * 1024)))
+            .collect();
+        let mut doc = ReviewDoc {
+            version: 1,
+            file: "notes.md".to_string(),
+            blocks: vec![],
+            file_comments,
+        };
+        assert!(validate(&mut doc).is_err());
     }
 
     // -- unanchored -----------------------------------------------------------
@@ -873,6 +1091,7 @@ mod tests {
                     comments: vec![comment("c_2", "y")],
                 },
             ],
+            file_comments: Vec::new(),
         };
         let live = render::anchors("some text that hashes to something else\n");
         let result = unanchored(&doc, &live);
@@ -896,6 +1115,7 @@ mod tests {
                     comments: vec![comment("c_1", "ok")],
                 })
                 .collect(),
+            file_comments: Vec::new(),
         };
         assert!(unanchored(&doc, &live).is_empty());
     }
@@ -908,6 +1128,7 @@ mod tests {
             version: 1,
             file: "notes.md".to_string(),
             blocks: vec![],
+            file_comments: Vec::new(),
         };
         let out = export_markdown("notes.md", "# Hi\n", &doc, "2026-08-22T07:10:00Z");
         assert_eq!(
@@ -943,6 +1164,7 @@ mod tests {
                     comments: vec![comment("c_3", "…")],
                 },
             ],
+            file_comments: Vec::new(),
         };
 
         let out = export_markdown("notes.md", markdown, &doc, "2026-08-22T07:10:00Z");
@@ -961,6 +1183,82 @@ mod tests {
     }
 
     #[test]
+    fn export_markdown_puts_file_comments_first_with_a_file_section_and_combined_count() {
+        let markdown = "## 設計方針\n\nBody paragraph.\n";
+        let live = render::blocks(markdown);
+        let doc = ReviewDoc {
+            version: 1,
+            file: "notes.md".to_string(),
+            blocks: vec![ReviewBlock {
+                hash: live[0].hash.clone(),
+                excerpt: live[0].excerpt.clone(),
+                kind: AnchorKindDto::Block,
+                comments: vec![comment("c_1", "設計方針の根拠")],
+            }],
+            file_comments: vec![comment("c_2", "全体として章立てが前後している")],
+        };
+
+        let out = export_markdown("notes.md", markdown, &doc, "2026-08-24T01:00:00Z");
+        let expected = "# Review: notes.md\n\n\
+             Exported: 2026-08-24T01:00:00Z · 2 comments (1 on the file, 1 on 1 blocks)\n\n\
+             > (file): notes.md\n\n\
+             - 全体として章立てが前後している\n\n\
+             > L1: ## 設計方針\n\n\
+             - 設計方針の根拠\n";
+        assert_eq!(out, expected);
+        // The file section comes before any block section.
+        let file_idx = out.find("(file)").expect("file section present");
+        let block_idx = out.find("L1: ## 設計方針").expect("block section present");
+        assert!(file_idx < block_idx);
+    }
+
+    #[test]
+    fn export_markdown_omits_the_file_section_when_there_are_no_file_comments() {
+        let doc = ReviewDoc {
+            version: 1,
+            file: "notes.md".to_string(),
+            blocks: vec![],
+            file_comments: Vec::new(),
+        };
+        let out = export_markdown("notes.md", "# Hi\n", &doc, "2026-08-22T07:10:00Z");
+        assert!(!out.contains("(file)"));
+        // Count format stays the original "M comments on B blocks" — no
+        // parenthesized breakdown — when there are no file comments.
+        assert!(out.contains("0 comments on 0 blocks"));
+        assert!(!out.contains("on the file"));
+    }
+
+    #[test]
+    fn export_markdown_file_comments_only_has_no_block_sections() {
+        let doc = ReviewDoc {
+            version: 1,
+            file: "notes.md".to_string(),
+            blocks: vec![],
+            file_comments: vec![comment("c_1", "全体コメント")],
+        };
+        let out = export_markdown("notes.md", "# Hi\n", &doc, "2026-08-22T07:10:00Z");
+        assert_eq!(
+            out,
+            "# Review: notes.md\n\n\
+             Exported: 2026-08-22T07:10:00Z · 1 comments (1 on the file, 0 on 0 blocks)\n\n\
+             > (file): notes.md\n\n\
+             - 全体コメント\n"
+        );
+    }
+
+    #[test]
+    fn export_markdown_indents_multiline_file_comment_continuation_lines() {
+        let doc = ReviewDoc {
+            version: 1,
+            file: "notes.md".to_string(),
+            blocks: vec![],
+            file_comments: vec![comment("c_1", "first line\nsecond line")],
+        };
+        let out = export_markdown("notes.md", "# Hi\n", &doc, "2026-08-22T07:10:00Z");
+        assert!(out.contains("- first line\n  second line\n"));
+    }
+
+    #[test]
     fn export_markdown_labels_a_multiline_block_with_a_line_range() {
         let markdown = "> line one\n> line two\n";
         let live = render::blocks(markdown);
@@ -975,6 +1273,7 @@ mod tests {
                 kind: AnchorKindDto::Block,
                 comments: vec![comment("c_1", "check this")],
             }],
+            file_comments: Vec::new(),
         };
 
         let out = export_markdown("notes.md", markdown, &doc, "2026-08-22T07:10:00Z");
@@ -998,6 +1297,7 @@ mod tests {
                 kind: AnchorKindDto::Block,
                 comments: vec![comment("c_1", "ok")],
             }],
+            file_comments: Vec::new(),
         };
 
         let out = export_markdown("notes.md", markdown, &doc, "2026-08-22T07:10:00Z");
@@ -1018,6 +1318,7 @@ mod tests {
                 kind: AnchorKindDto::Block,
                 comments: vec![comment("c_1", "first line\nsecond line\nthird line")],
             }],
+            file_comments: Vec::new(),
         };
         let out = export_markdown("notes.md", markdown, &doc, "2026-08-22T07:10:00Z");
         assert!(out.contains("- first line\n  second line\n  third line\n"));
@@ -1035,6 +1336,7 @@ mod tests {
                 kind: AnchorKindDto::Block,
                 comments: vec![comment("c_1", "コメント本文")],
             }],
+            file_comments: Vec::new(),
         };
 
         let out = export_markdown("notes.md", markdown, &doc, "2026-08-22T07:10:00Z");
@@ -1059,6 +1361,7 @@ mod tests {
                 kind: AnchorKindDto::Block,
                 comments: vec![comment("c_1", "ok")],
             }],
+            file_comments: Vec::new(),
         };
         let out = export_markdown("notes.md", markdown, &doc, "2026-08-22T07:10:00Z");
         assert!(!out.contains("Unanchored"));
@@ -1078,6 +1381,7 @@ mod tests {
                 kind: AnchorKindDto::Block,
                 comments: vec![comment("c_1", "noted")],
             }],
+            file_comments: Vec::new(),
         };
         let out = export_markdown("notes.md", markdown, &doc, "2026-08-22T07:10:00Z");
         assert!(!out.contains("Uncommented paragraph"));
@@ -1107,6 +1411,7 @@ mod tests {
                     comments: vec![comment("c_1", "first")],
                 },
             ],
+            file_comments: Vec::new(),
         };
         let out = export_markdown("notes.md", markdown, &doc, "2026-08-22T07:10:00Z");
         let first_idx = out.find("First heading").expect("first heading present");
@@ -1132,6 +1437,7 @@ mod tests {
                 kind: AnchorKindDto::Block,
                 comments: vec![comment("c_1", "noted")],
             }],
+            file_comments: Vec::new(),
         };
         let out = export_markdown("notes.md", markdown, &doc, "2026-08-22T07:10:00Z");
         assert_eq!(out.matches("> L").count(), 1);
@@ -1160,6 +1466,7 @@ mod tests {
                 kind: AnchorKindDto::Item,
                 comments: vec![comment("c_1", "コメント")],
             }],
+            file_comments: Vec::new(),
         };
         let out = export_markdown("notes.md", markdown, &doc, "2026-08-22T07:10:00Z");
 
@@ -1194,6 +1501,7 @@ mod tests {
                 kind: AnchorKindDto::Row,
                 comments: vec![comment("c_1", "確認")],
             }],
+            file_comments: Vec::new(),
         };
         let out = export_markdown("notes.md", markdown, &doc, "2026-08-22T07:10:00Z");
 
@@ -1223,6 +1531,7 @@ mod tests {
                 kind: AnchorKindDto::Block,
                 comments: vec![comment("c_1", "ok")],
             }],
+            file_comments: Vec::new(),
         };
         let out = export_markdown("notes.md", markdown, &doc, "2026-08-22T07:10:00Z");
         assert!(out.contains("> L1: # Heading\n\n"));
@@ -1257,6 +1566,7 @@ mod tests {
                 kind: AnchorKindDto::Item,
                 comments: vec![comment("c_1", "note")],
             }],
+            file_comments: Vec::new(),
         };
         let out = export_markdown("notes.md", markdown, &doc, "2026-08-22T07:10:00Z");
         let expected_suffix = format!(
@@ -1293,6 +1603,7 @@ mod tests {
                 kind: AnchorKindDto::Item,
                 comments: vec![comment("c_1", "確認")],
             }],
+            file_comments: Vec::new(),
         };
         let out = export_markdown("notes.md", markdown, &doc, "2026-08-22T07:10:00Z");
 
@@ -1324,6 +1635,7 @@ mod tests {
                 kind: AnchorKindDto::Block,
                 comments: vec![],
             }],
+            file_comments: Vec::new(),
         };
         let out = export_markdown("notes.md", markdown, &doc, "2026-08-22T07:10:00Z");
         assert!(!out.contains("Unanchored"));
@@ -1350,6 +1662,7 @@ mod tests {
                     comments: vec![comment("c_1", "x")],
                 })
                 .collect(),
+            file_comments: Vec::new(),
         };
         let out = export_markdown("notes.md", markdown, &doc, "2026-08-22T07:10:00Z");
         let list_idx = out.find("- one").expect("list block quoted");

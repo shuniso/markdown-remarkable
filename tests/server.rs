@@ -63,6 +63,14 @@ fn start_test_server_named(markdown: &str, file_name: &str) -> TestServer {
 /// version, and (optional) `Host` header, and returns the full raw response
 /// (status line, headers, and body) as a string. `host: None` omits the
 /// `Host` header entirely, which is only legal pre-HTTP/1.1.
+///
+/// The response is read as raw bytes and, when the server chose
+/// `Transfer-Encoding: chunked` (tiny_http does this for HTTP/1.1 once the
+/// body grows past its internal threshold), the chunked framing is decoded
+/// before the UTF-8 conversion. Reading the wire bytes straight into a
+/// `String` used to work only by luck: a chunk boundary can land in the
+/// middle of a multi-byte character, making the *framed* stream invalid
+/// UTF-8 even though the body itself is fine.
 fn raw_request(
     addr: SocketAddr,
     method: &str,
@@ -81,11 +89,48 @@ fn raw_request(
         .write_all(request.as_bytes())
         .expect("write raw HTTP request");
 
-    let mut response = String::new();
+    let mut raw = Vec::new();
     stream
-        .read_to_string(&mut response)
+        .read_to_end(&mut raw)
         .expect("read raw HTTP response");
-    response
+
+    let header_end = raw
+        .windows(4)
+        .position(|w| w == b"\r\n\r\n")
+        .map(|i| i + 4)
+        .unwrap_or(raw.len());
+    let head = String::from_utf8(raw[..header_end].to_vec()).expect("headers are valid UTF-8");
+    let body_bytes = if head.to_lowercase().contains("transfer-encoding: chunked") {
+        decode_chunked(&raw[header_end..])
+    } else {
+        raw[header_end..].to_vec()
+    };
+    let body = String::from_utf8(body_bytes).expect("response body is valid UTF-8");
+    format!("{head}{body}")
+}
+
+/// Decodes an HTTP/1.1 chunked-encoded body: `<hex size>\r\n<data>\r\n`
+/// repeated, terminated by a zero-size chunk (any trailers are ignored).
+fn decode_chunked(mut rest: &[u8]) -> Vec<u8> {
+    let mut body = Vec::new();
+    loop {
+        let Some(line_end) = rest.windows(2).position(|w| w == b"\r\n") else {
+            break;
+        };
+        let size_line = std::str::from_utf8(&rest[..line_end]).expect("chunk size line is ASCII");
+        let size = usize::from_str_radix(size_line.trim().split(';').next().unwrap_or("0"), 16)
+            .expect("chunk size is hex");
+        rest = &rest[line_end + 2..];
+        if size == 0 {
+            break;
+        }
+        assert!(rest.len() >= size, "chunk data truncated");
+        body.extend_from_slice(&rest[..size]);
+        rest = &rest[size..];
+        // Skip the CRLF that terminates the chunk data.
+        rest = rest.strip_prefix(b"\r\n").unwrap_or(rest);
+    }
+    body
 }
 
 /// HTTP/1.1 `GET` with a well-formed loopback `Host` header (what every

@@ -25,7 +25,7 @@
   var SAVE_STATUS_CLEAR_MS = 2000;
 
   var state = {
-    doc: { version: 1, file: "", blocks: [] },
+    doc: { version: 1, file: "", blocks: [], file_comments: [] },
     unanchored: [],
     selectedHash: null,
     editingId: null,
@@ -386,7 +386,7 @@
       active.blur();
       return;
     }
-    if (state.selectedHash) {
+    if (state.selectedHash || state.editingId) {
       state.selectedHash = null;
       state.editingId = null;
       render();
@@ -591,7 +591,7 @@
   }
 
   function totalCommentCount() {
-    var total = 0;
+    var total = state.doc.file_comments.length;
     for (var i = 0; i < state.doc.blocks.length; i++) {
       total += state.doc.blocks[i].comments.length;
     }
@@ -683,6 +683,7 @@
           version: result.payload.version,
           file: result.payload.file,
           blocks: result.payload.blocks || [],
+          file_comments: result.payload.file_comments || [],
         };
         state.loaded = true;
         state.error = null;
@@ -730,6 +731,7 @@
       version: state.doc.version,
       file: state.doc.file,
       blocks: state.doc.blocks,
+      file_comments: state.doc.file_comments,
     };
     setSaveStatus("saving");
     fetch(REVIEW_URL, {
@@ -919,6 +921,42 @@
     render();
   }
 
+  // -- file-wide comments (not anchored to any block/item/row — "file
+  //    mode", entered whenever nothing is selected; see buildFileCommentsView()
+  //    and buildFileBreadcrumbSegment()) ----------------------------------
+
+  function addFileComment(text) {
+    var now = nowIso();
+    state.doc.file_comments.push({
+      id: newLocalCommentId(),
+      text: text,
+      created: now,
+      updated: now,
+    });
+    saveReview();
+    render();
+  }
+
+  function editFileComment(id, text) {
+    for (var i = 0; i < state.doc.file_comments.length; i++) {
+      if (state.doc.file_comments[i].id === id) {
+        state.doc.file_comments[i].text = text;
+        state.doc.file_comments[i].updated = nowIso();
+        break;
+      }
+    }
+    saveReview();
+    render();
+  }
+
+  function deleteFileComment(id) {
+    state.doc.file_comments = state.doc.file_comments.filter(function (c) {
+      return c.id !== id;
+    });
+    saveReview();
+    render();
+  }
+
   // -- rendering ----------------------------------------------------------
 
   // Sum of comment counts on every anchor nested (at any depth) inside
@@ -1086,7 +1124,10 @@
         })
       );
     } else if (!state.selectedHash) {
-      body.appendChild(el("p", "review-placeholder", "ブロックをクリック"));
+      // Nothing selected — "file mode" (also entered by clicking the
+      // breadcrumb's root "ファイル" segment, or pressing Esc): comments on
+      // the document as a whole rather than any particular block/item/row.
+      body.appendChild(buildFileCommentsView());
     } else {
       body.appendChild(buildSelectedBlockView());
     }
@@ -1136,15 +1177,17 @@
     return chain;
   }
 
-  // "ブロック L10-L20 › 項目 L13": one clickable segment per level of
-  // `chain` (the currently-selected level rendered as plain, non-clickable
-  // text instead of a button).
+  // "ファイル › ブロック L10-L20 › 項目 L13": the root "ファイル" segment
+  // (see buildFileBreadcrumbSegment()) is always present — clicking it
+  // enters file mode (no selected anchor) — followed by one clickable
+  // segment per level of `chain` (the currently-selected level rendered as
+  // plain, non-clickable text instead of a button). `chain` is empty in
+  // file mode, so the breadcrumb is then just the root segment alone.
   function buildBreadcrumb(chain) {
     var nav = el("div", "review-breadcrumb");
+    nav.appendChild(buildFileBreadcrumbSegment());
     for (var i = 0; i < chain.length; i++) {
-      if (i > 0) {
-        nav.appendChild(el("span", "review-breadcrumb-sep", "›"));
-      }
+      nav.appendChild(el("span", "review-breadcrumb-sep", "›"));
       var node = chain[i];
       var nodeHash = node.getAttribute("data-hash");
       var label = anchorKindLabel(node) + " " + (lineRangeLabel(node) || "");
@@ -1165,6 +1208,23 @@
       }
     }
     return nav;
+  }
+
+  // The breadcrumb's permanent root segment: "ファイル", with a count badge
+  // when there's at least one file-wide comment. Plain (non-clickable) text
+  // while already in file mode (nothing selected); a clickable link back to
+  // file mode otherwise.
+  function buildFileBreadcrumbSegment() {
+    var count = state.doc.file_comments.length;
+    var node = state.selectedHash
+      ? button("review-breadcrumb-link", "ファイル", function () {
+          selectBlock(null);
+        })
+      : el("span", "review-breadcrumb-current", "ファイル");
+    if (count > 0) {
+      node.appendChild(el("span", "review-breadcrumb-badge", String(count)));
+    }
+    return node;
   }
 
   // While an item/row is selected: "↑ リスト全体にコメント"/"↑ 表全体に
@@ -1197,8 +1257,14 @@
     var excerpt = block ? block.excerpt : anchorEl ? excerptForBlockElement(anchorEl) : "";
     var kind = anchorEl ? anchorKindOf(anchorEl) : block && block.kind ? block.kind : "block";
 
+    // The breadcrumb (root "ファイル" segment plus the selected anchor's own
+    // chain) is shown even if `anchorEl` no longer exists live — e.g. the
+    // selected anchor was removed by a live-reload — so there's always a
+    // way back to file mode. `ancestorChain` itself needs a live element,
+    // so it's only called when one exists; the chain is just empty (root
+    // segment only) otherwise.
+    wrap.appendChild(buildBreadcrumb(anchorEl ? ancestorChain(anchorEl) : []));
     if (anchorEl) {
-      wrap.appendChild(buildBreadcrumb(ancestorChain(anchorEl)));
       var hint = buildHint(anchorEl);
       if (hint) {
         wrap.appendChild(hint);
@@ -1224,7 +1290,11 @@
     return wrap;
   }
 
-  function buildCommentItem(hash, comment) {
+  // Shared by buildCommentItem() (block/item/row comments) and
+  // buildFileCommentItem() (file-wide comments): the two differ only in
+  // where a saved edit/delete actually lands, which the caller supplies as
+  // `onSave(id, text)`/`onDelete(id)`.
+  function buildCommentItemView(comment, onSave, onDelete) {
     var item = el("div", "review-comment");
 
     if (state.editingId === comment.id) {
@@ -1237,7 +1307,7 @@
         var value = textarea.value.trim();
         if (value) {
           state.editingId = null;
-          editComment(hash, comment.id, value);
+          onSave(comment.id, value);
         }
       };
       actions.appendChild(button("review-save", "保存", save));
@@ -1267,14 +1337,34 @@
     );
     actions2.appendChild(
       button("review-comment-delete", "削除", function () {
-        deleteComment(hash, comment.id);
+        onDelete(comment.id);
       })
     );
     item.appendChild(actions2);
     return item;
   }
 
-  function buildCommentForm(hash, excerpt, kind) {
+  function buildCommentItem(hash, comment) {
+    return buildCommentItemView(
+      comment,
+      function (id, text) {
+        editComment(hash, id, text);
+      },
+      function (id) {
+        deleteComment(hash, id);
+      }
+    );
+  }
+
+  function buildFileCommentItem(comment) {
+    return buildCommentItemView(comment, editFileComment, deleteFileComment);
+  }
+
+  // Shared by buildCommentForm() (block/item/row comments) and
+  // buildFileCommentForm() (file-wide comments): the two differ only in
+  // where a new comment actually gets added, which the caller supplies as
+  // `onSubmit(text)`.
+  function buildCommentFormView(onSubmit) {
     var form = el("div", "review-form");
     var textarea = el("textarea", "review-textarea");
     textarea.placeholder = "コメントを入力… (Cmd/Ctrl+Enter で保存)";
@@ -1286,7 +1376,7 @@
         return;
       }
       textarea.value = "";
-      addComment(hash, excerpt, value, kind);
+      onSubmit(value);
     };
     form.appendChild(button("review-save", "保存", submit));
 
@@ -1296,6 +1386,43 @@
       }
     });
     return form;
+  }
+
+  function buildCommentForm(hash, excerpt, kind) {
+    return buildCommentFormView(function (text) {
+      addComment(hash, excerpt, text, kind);
+    });
+  }
+
+  function buildFileCommentForm() {
+    return buildCommentFormView(function (text) {
+      addFileComment(text);
+    });
+  }
+
+  // "File mode": entered whenever nothing is selected (initial state, Esc,
+  // or clicking the breadcrumb's root "ファイル" segment). Comments on the
+  // document as a whole rather than any particular block/item/row — no
+  // excerpt/quote to show, since there's no anchor. The "ブロックをクリック"
+  // hint that used to be the entire placeholder here now sits below the
+  // input as a small reminder that per-block comments are also available.
+  function buildFileCommentsView() {
+    var wrap = el("div", "review-selected");
+    wrap.appendChild(buildBreadcrumb([]));
+    wrap.appendChild(
+      el("h3", "review-file-heading", "ファイル全体へのコメント")
+    );
+
+    var list = el("div", "review-comments");
+    var comments = state.doc.file_comments;
+    for (var i = 0; i < comments.length; i++) {
+      list.appendChild(buildFileCommentItem(comments[i]));
+    }
+    wrap.appendChild(list);
+
+    wrap.appendChild(buildFileCommentForm());
+    wrap.appendChild(el("p", "review-hint review-file-hint", "ブロックをクリック"));
+    return wrap;
   }
 
   function buildUnanchoredSection() {

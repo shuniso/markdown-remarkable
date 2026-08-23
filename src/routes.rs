@@ -613,6 +613,7 @@ mod tests {
         assert_eq!(value["version"], 1);
         assert_eq!(value["file"], "notes.md");
         assert_eq!(value["blocks"], serde_json::json!([]));
+        assert_eq!(value["file_comments"], serde_json::json!([]));
         assert_eq!(value["unanchored"], serde_json::json!([]));
     }
 
@@ -808,6 +809,40 @@ mod tests {
         assert_eq!(get_value["blocks"][0]["hash"], hash.as_str());
         assert_eq!(get_value["blocks"][0]["comments"][0]["text"], "looks good");
         assert_eq!(get_value["unanchored"], serde_json::json!([]));
+    }
+
+    #[test]
+    fn put_review_then_get_review_round_trips_file_comments() {
+        let dir = tempfile::tempdir().expect("create tempdir");
+        let file_path = dir.path().join("notes.md");
+        std::fs::write(&file_path, "# Hi\n").expect("write markdown file");
+        let version = AtomicU64::new(0);
+        let headers = with_request_header();
+
+        let doc_json = serde_json::json!({
+            "version": 1,
+            "file": "notes.md",
+            "blocks": [],
+            "file_comments": [{
+                "id": "c_0123456789abcdef",
+                "text": "全体として章立てが前後している",
+                "created": "2026-08-22T07:00:00Z",
+                "updated": "2026-08-22T07:00:00Z",
+            }]
+        });
+        let body = serde_json::to_vec(&doc_json).unwrap();
+
+        let put_reply = handle(&put_review(&body, &headers), Some(&file_path), &version);
+        assert_eq!(put_reply.status, 200);
+
+        let get_reply = handle(&get("/review"), Some(&file_path), &version);
+        assert_eq!(get_reply.status, 200);
+        let get_value: serde_json::Value = serde_json::from_slice(&get_reply.body).unwrap();
+        assert_eq!(
+            get_value["file_comments"][0]["text"],
+            "全体として章立てが前後している"
+        );
+        assert_eq!(get_value["file_comments"][0]["id"], "c_0123456789abcdef");
     }
 
     #[test]

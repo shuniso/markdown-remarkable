@@ -118,6 +118,23 @@ pub fn clamp_size(width: f64, height: f64) -> (f64, f64) {
     (width.max(MIN_WIDTH), height.max(MIN_HEIGHT))
 }
 
+/// How far (in both axes, logical pixels) each successively-opened window
+/// is shifted from the saved position — see [`cascade_position`].
+pub const CASCADE_OFFSET: f64 = 24.0;
+
+/// The saved position `(x, y)`, shifted by `existing_window_count *
+/// [`CASCADE_OFFSET`]` in both axes — so the first new window created after
+/// the one at the saved position peeks out 24px down and to the right of
+/// it, the next one 48px, and so on, rather than every new window stacking
+/// exactly on top of the last. `existing_window_count` is the number of
+/// windows already open at the moment the new one is being placed (0 for
+/// the very first window in a run, which is therefore never offset at
+/// all).
+pub fn cascade_position(x: f64, y: f64, existing_window_count: usize) -> (f64, f64) {
+    let offset = existing_window_count as f64 * CASCADE_OFFSET;
+    (x + offset, y + offset)
+}
+
 /// True if `(x, y)` — a saved window's top-left corner — falls inside at
 /// least one of `monitors`. Used to decide whether a saved position is
 /// still meaningful (the monitor it was on might have been unplugged, or
@@ -136,7 +153,7 @@ pub fn position_is_visible(x: f64, y: f64, monitors: &[MonitorRect]) -> bool {
 /// to infinity — see `load_rejects_a_non_finite_field`'s doc comment), so
 /// this is defense-in-depth against any other way a non-finite value could
 /// reach [`load`], rather than something the current JSON path can
-/// actually trigger: `resolve_initial_geometry`/`position_is_visible` in
+/// actually trigger: `resolve_window_geometry`/`position_is_visible` in
 /// app.rs do arithmetic on these fields and aren't written to cope with
 /// NaN/∞.
 fn all_finite(state: &WindowState) -> bool {
@@ -300,6 +317,19 @@ mod tests {
     fn clamp_size_only_raises_the_dimension_that_needs_it() {
         assert_eq!(clamp_size(100.0, 900.0), (MIN_WIDTH, 900.0));
         assert_eq!(clamp_size(900.0, 100.0), (900.0, MIN_HEIGHT));
+    }
+
+    // -- cascade_position --------------------------------------------------
+
+    #[test]
+    fn cascade_position_of_the_first_window_is_unshifted() {
+        assert_eq!(cascade_position(100.0, 200.0, 0), (100.0, 200.0));
+    }
+
+    #[test]
+    fn cascade_position_shifts_by_a_multiple_of_the_offset() {
+        assert_eq!(cascade_position(100.0, 200.0, 1), (124.0, 224.0));
+        assert_eq!(cascade_position(100.0, 200.0, 3), (172.0, 272.0));
     }
 
     // -- position_is_visible ---------------------------------------------
