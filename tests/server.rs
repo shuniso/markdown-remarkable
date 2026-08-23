@@ -113,10 +113,7 @@ fn raw_request(
 /// repeated, terminated by a zero-size chunk (any trailers are ignored).
 fn decode_chunked(mut rest: &[u8]) -> Vec<u8> {
     let mut body = Vec::new();
-    loop {
-        let Some(line_end) = rest.windows(2).position(|w| w == b"\r\n") else {
-            break;
-        };
+    while let Some(line_end) = rest.windows(2).position(|w| w == b"\r\n") {
         let size_line = std::str::from_utf8(&rest[..line_end]).expect("chunk size line is ASCII");
         let size = usize::from_str_radix(size_line.trim().split(';').next().unwrap_or("0"), 16)
             .expect("chunk size is hex");
