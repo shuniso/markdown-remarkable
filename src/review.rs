@@ -37,8 +37,10 @@ const MAX_EXCERPT_CHARS: usize = 200;
 /// not how many of them a client can pile up in one `PUT /review`.
 const MAX_TOTAL_COMMENTS: usize = 10_000;
 
-/// Maximum serialized size, in bytes, of the whole document — the same
-/// `serde_json::to_vec` encoding [`save`] and `PUT /review`'s body use. A
+/// Maximum serialized size, in bytes, of the whole document — checked using
+/// the same `serde_json::to_vec_pretty` encoding [`save`] actually writes to
+/// disk (not the more compact `to_vec`), so this bound reflects the exact
+/// byte count the sidecar file will have, not an underestimate of it. A
 /// coarser backstop alongside [`MAX_TOTAL_COMMENTS`]/[`MAX_COMMENT_TEXT_BYTES`]:
 /// even within both of those per-field limits, enough blocks and excerpts
 /// together could still add up to an unreasonably large sidecar.
@@ -264,7 +266,7 @@ pub fn validate(doc: &mut ReviewDoc) -> Result<()> {
         ));
     }
 
-    let serialized_len = serde_json::to_vec(doc)
+    let serialized_len = serde_json::to_vec_pretty(doc)
         .context("failed to serialize review document for size validation")?
         .len();
     if serialized_len > MAX_TOTAL_SIDECAR_BYTES {

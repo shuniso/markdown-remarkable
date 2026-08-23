@@ -416,10 +416,16 @@ pub fn run(initial: Vec<PathBuf>) -> Result<()> {
                 }
             }
             Event::UserEvent(UserEvent::OpenFile(path, window_id)) => {
+                // A drop always carries an already-resolved file path (see
+                // `handle_drag_drop`), so — same as `Event::Opened` — the
+                // picker deadline is no longer owed once this arrives,
+                // regardless of whether OPEN_EVENT_GRACE has elapsed yet.
+                picker_deadline = None;
                 open_in_window_or_new(&mut windows, Some(window_id), path, &factory);
             }
             Event::UserEvent(UserEvent::PickFile) => {
                 if let Some(path) = pick_file_dialog() {
+                    picker_deadline = None;
                     let target = focused_window_id(&windows);
                     open_in_window_or_new(&mut windows, target, path, &factory);
                 }
@@ -508,6 +514,22 @@ fn create_window(
     let file_state: Arc<Mutex<Option<PathBuf>>> = Arc::new(Mutex::new(file.clone()));
     let version: Arc<AtomicU64> = Arc::new(AtomicU64::new(0));
 
+    // Published *before* the WebView is even built, not after — on some
+    // platforms (notably Windows' WebView2) the underlying view can start
+    // delivering requests for this `webview_id` while `build`/`build_gtk`
+    // below is still running, and those must find this state rather than
+    // race the insert and get a spurious 404 (see `protocol_response`). If
+    // construction then fails, the entry is removed again in the error
+    // branches below rather than leaked — nothing else would ever clean it
+    // up, since no `WindowCtx`/`CloseRequested` for it ever comes to exist.
+    registry
+        .lock()
+        .expect("webview registry mutex poisoned")
+        .insert(
+            webview_id.clone(),
+            (Arc::clone(&file_state), Arc::clone(&version)),
+        );
+
     let window_id = window.id();
     let drop_proxy = proxy.clone();
     let protocol_registry = Arc::clone(registry);
@@ -538,30 +560,39 @@ fn create_window(
         .with_url(INITIAL_URL);
 
     #[cfg(not(target_os = "linux"))]
-    let webview = builder.build(&window).context(
-        "failed to create the WebView (try `mdview --browser` to use the browser version instead)",
-    )?;
+    let webview = builder
+        .build(&window)
+        .inspect_err(|_| {
+            registry
+                .lock()
+                .expect("webview registry mutex poisoned")
+                .remove(&webview_id);
+        })
+        .context(
+            "failed to create the WebView (try `mdview --browser` to use the browser version instead)",
+        )?;
     #[cfg(target_os = "linux")]
     let webview = {
-        let vbox = window
-            .default_vbox()
-            .context("failed to access the window's GTK container")?;
-        builder.build_gtk(vbox).context(
-            "failed to create the WebView — is webkit2gtk installed? \
-             try `mdview --browser` to use the browser version instead",
-        )?
+        let vbox = window.default_vbox().ok_or_else(|| {
+            registry
+                .lock()
+                .expect("webview registry mutex poisoned")
+                .remove(&webview_id);
+            anyhow::anyhow!("failed to access the window's GTK container")
+        })?;
+        builder
+            .build_gtk(vbox)
+            .inspect_err(|_| {
+                registry
+                    .lock()
+                    .expect("webview registry mutex poisoned")
+                    .remove(&webview_id);
+            })
+            .context(
+                "failed to create the WebView — is webkit2gtk installed? \
+                 try `mdview --browser` to use the browser version instead",
+            )?
     };
-
-    // Only now that the WebView exists (so requests for this id could
-    // actually start arriving) is this window's state published for the
-    // shared protocol handler to find.
-    registry
-        .lock()
-        .expect("webview registry mutex poisoned")
-        .insert(
-            webview_id.clone(),
-            (Arc::clone(&file_state), Arc::clone(&version)),
-        );
 
     let canonical_file = file.as_deref().map(canonical_or_given);
     let watcher = file.as_deref().and_then(|path| start_watch(path, &version));
@@ -937,12 +968,18 @@ fn navigation_policy(url: String) -> bool {
     false
 }
 
-/// Only files dropped with a `.md`/`.markdown` extension (case-insensitive)
-/// are accepted; anything else is left to whatever the OS/WebView would
-/// otherwise do with a drop (returning `false` here means "don't block the
-/// default behavior"). `window_id` is the window that received the drop —
-/// each window's drag&drop handler closes over its own, so this is always
-/// known precisely, never resolved after the fact.
+/// Every file dropped with a `.md`/`.markdown` extension (case-insensitive)
+/// is accepted — dropping several files at once opens all of them, not just
+/// the first — while anything else in the drop is silently skipped.
+/// Returns `true` if at least one file was accepted, `false` if none were
+/// (in which case the drop is left to whatever the OS/WebView would
+/// otherwise do with it, same as before this handled any of it). `window_id`
+/// is the window that received the drop — each window's drag&drop handler
+/// closes over its own, so this is always known precisely, never resolved
+/// after the fact. Each accepted file is posted as its own separate
+/// `UserEvent::OpenFile`; `run`'s handler for that event then decides
+/// per-file whether it lands in this window (if it's still empty) or opens
+/// a new one — see [`open_in_window_or_new`].
 fn handle_drag_drop(
     event: DragDropEvent,
     proxy: &EventLoopProxy<UserEvent>,
@@ -951,15 +988,14 @@ fn handle_drag_drop(
     let DragDropEvent::Drop { paths, .. } = event else {
         return false;
     };
-    match paths.into_iter().find(|path| is_markdown_file(path)) {
-        Some(path) => {
-            // If the event loop has already shut down, there's nothing
-            // useful to do with the error — the process is exiting anyway.
-            let _ = proxy.send_event(UserEvent::OpenFile(path, window_id));
-            true
-        }
-        None => false,
+    let mut accepted_any = false;
+    for path in paths.into_iter().filter(|path| is_markdown_file(path)) {
+        // If the event loop has already shut down, there's nothing
+        // useful to do with the error — the process is exiting anyway.
+        let _ = proxy.send_event(UserEvent::OpenFile(path, window_id));
+        accepted_any = true;
     }
+    accepted_any
 }
 
 fn is_markdown_file(path: &Path) -> bool {

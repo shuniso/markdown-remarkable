@@ -39,13 +39,14 @@ mdview
 
 With no `FILE`, a native "open file" dialog appears; pick a `.md`/
 `.markdown` file, or cancel to see an empty "drop a Markdown file here"
-window. You can also drag & drop a `.md`/`.markdown` file onto a window at
-any time — if that window is still empty it switches to the dropped file
-(watcher and title along with it), otherwise the file opens in a new
-window. ⌘O behaves the same way, applied to whichever window is currently
-frontmost. Opening a file that's already open in another window (from
-Finder, "Open With", or `open -a`) brings that window to the front instead
-of opening a duplicate.
+window. You can also drag & drop one or more `.md`/`.markdown` files onto a
+window at any time — the first one switches that window to the dropped file
+(watcher and title along with it) if it's still empty, and every other
+dropped file opens in its own new window. ⌘O behaves the same way, applied
+to whichever window is currently frontmost. Opening a file that's already
+open in another window — whether via a drop, ⌘O, a repeated `FILE` on the
+command line, or Finder/"Open With"/`open -a` — brings that window to the
+front instead of opening a duplicate, across every one of these routes.
 
 ```sh
 mdview README.md --browser
@@ -167,9 +168,13 @@ mdview notes.md --export notes.html
 - Each native window still shows one file at a time — dropping, picking, or
   Finder-opening a file while a window that already has one is frontmost
   opens a *new* window for it rather than replacing that window's content;
-  only an empty window (nothing open in it yet) gets filled in place.
-  There's no tabs, no window list menu, and no combined export across
-  windows.
+  only an empty window (nothing open in it yet) gets filled in place. The one
+  exception: if the file is already open in some *other* window, that window
+  is brought to the front instead of a new one opening on the same file —
+  true across every route that can open a file (a drop, ⌘O, a repeated
+  `FILE` on the command line, Finder/"Open With"/`open -a`, and startup
+  itself). There's no tabs, no window list menu, and no combined export
+  across windows.
 - Links in a native window never navigate the window itself: `http(s)`
   and `mailto:` links open in your default browser, and relative links to
   other files are ignored (there's no back button to return from them).

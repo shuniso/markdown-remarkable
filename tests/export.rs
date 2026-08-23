@@ -148,6 +148,73 @@ fn exports_a_standalone_non_live_html_file() {
 }
 
 #[test]
+fn export_rejects_more_than_one_file() {
+    let dir = tempfile::tempdir().expect("create tempdir");
+    let file_a = dir.path().join("a.md");
+    let file_b = dir.path().join("b.md");
+    std::fs::write(&file_a, "# A\n").expect("write a.md");
+    std::fs::write(&file_b, "# B\n").expect("write b.md");
+    let output_path = dir.path().join("out.html");
+
+    let output = Command::new(env!("CARGO_BIN_EXE_mdview"))
+        .arg(&file_a)
+        .arg(&file_b)
+        .arg("--export")
+        .arg(&output_path)
+        .output()
+        .expect("run mdview");
+
+    assert!(
+        !output.status.success(),
+        "expected a non-zero exit when --export is given more than one FILE, got: {:?}",
+        output.status
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("exactly one FILE"),
+        "expected stderr to mention \"exactly one FILE\", got: {stderr:?}"
+    );
+}
+
+#[test]
+fn export_rejects_zero_files() {
+    let dir = tempfile::tempdir().expect("create tempdir");
+    let output_path = dir.path().join("out.html");
+
+    let output = Command::new(env!("CARGO_BIN_EXE_mdview"))
+        .arg("--export")
+        .arg(&output_path)
+        .output()
+        .expect("run mdview");
+
+    assert!(
+        !output.status.success(),
+        "expected a non-zero exit when --export is given zero FILE args, got: {:?}",
+        output.status
+    );
+}
+
+#[test]
+fn export_of_a_nonexistent_file_is_a_non_zero_exit() {
+    let dir = tempfile::tempdir().expect("create tempdir");
+    let missing_path = dir.path().join("does-not-exist.md");
+    let output_path = dir.path().join("out.html");
+
+    let output = Command::new(env!("CARGO_BIN_EXE_mdview"))
+        .arg(&missing_path)
+        .arg("--export")
+        .arg(&output_path)
+        .output()
+        .expect("run mdview");
+
+    assert!(
+        !output.status.success(),
+        "expected a non-zero exit when --export targets a nonexistent input file, got: {:?}",
+        output.status
+    );
+}
+
+#[test]
 fn export_conflicts_with_port_and_no_open() {
     let dir = tempfile::tempdir().expect("create tempdir");
     let input_path = dir.path().join("doc.md");
