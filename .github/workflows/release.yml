@@ -26,8 +26,21 @@ jobs:
       # configured on this repo, so a fork PR (which never has secrets) or
       # this repo before the secrets are set up both silently skip straight
       # to the unsigned Package step below, unchanged from before.
+      #
+      # The `secrets` context is not allowed inside `if:` expressions (the
+      # workflow would be rejected as invalid), so the secrets are mapped
+      # into step env vars and the condition tests those via a guard step.
+      - name: Check signing secrets
+        id: signing
+        shell: pwsh
+        env:
+          WINDOWS_CERT_PFX_BASE64: ${{ secrets.WINDOWS_CERT_PFX_BASE64 }}
+          WINDOWS_CERT_PASSWORD: ${{ secrets.WINDOWS_CERT_PASSWORD }}
+        run: |
+          $enabled = ($env:WINDOWS_CERT_PFX_BASE64 -ne '' -and $null -ne $env:WINDOWS_CERT_PFX_BASE64 -and $env:WINDOWS_CERT_PASSWORD -ne '' -and $null -ne $env:WINDOWS_CERT_PASSWORD)
+          "enabled=$($enabled.ToString().ToLower())" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
       - name: Sign mdview.exe
-        if: ${{ secrets.WINDOWS_CERT_PFX_BASE64 != '' && secrets.WINDOWS_CERT_PASSWORD != '' }}
+        if: steps.signing.outputs.enabled == 'true'
         shell: pwsh
         env:
           WINDOWS_CERT_PFX_BASE64: ${{ secrets.WINDOWS_CERT_PFX_BASE64 }}
