@@ -1,0 +1,8 @@
+# Normalize line endings: everything text is committed and checked out as LF,
+# on every platform. This keeps the compile-time embedded assets
+# (include_str! of assets/*.js / *.css) byte-identical across OSes — CRLF
+# checkouts on Windows would otherwise change the served page (and break
+# tests that parse it).
+* text=auto eol=lf
+*.png binary
+*.icns binary

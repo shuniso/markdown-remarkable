@@ -179,7 +179,13 @@ fn response_headers(response: &str) -> String {
 }
 
 fn response_body(response: &str) -> &str {
-    response.split("\r\n\r\n").nth(1).unwrap_or("")
+    // Split on the *first* blank line only: the body itself may legally
+    // contain CRLF blank lines (e.g. CRLF-embedded assets), and
+    // `split(..).nth(1)` would truncate it at the next one.
+    response
+        .split_once("\r\n\r\n")
+        .map(|(_, body)| body)
+        .unwrap_or("")
 }
 
 fn extract_baseline_version(body: &str) -> u64 {
