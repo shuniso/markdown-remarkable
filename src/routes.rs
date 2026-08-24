@@ -156,10 +156,15 @@ fn has_request_header(req: &RouteRequest) -> bool {
 /// own once the file is readable again; `/body` answers `200` with an
 /// error fragment for the same reason (the script treats a non-200 `/body`
 /// as "reload the whole page").
-pub fn handle(req: &RouteRequest, file: Option<&Path>, version: &AtomicU64) -> Reply {
+pub fn handle(
+    req: &RouteRequest,
+    file: Option<&Path>,
+    version: &AtomicU64,
+    allow_remote_images: bool,
+) -> Reply {
     let route = req.path.split('?').next().unwrap_or("/");
     let reply = match (req.method, route) {
-        ("GET", "/") | ("HEAD", "/") => handle_root(file, version),
+        ("GET", "/") | ("HEAD", "/") => handle_root(file, version, allow_remote_images),
         ("GET", "/version") | ("HEAD", "/version") => handle_version(version),
         ("GET", "/body") | ("HEAD", "/body") => handle_body(file),
         ("GET", "/review") => handle_get_review(file),
@@ -173,20 +178,39 @@ pub fn handle(req: &RouteRequest, file: Option<&Path>, version: &AtomicU64) -> R
         .with_header("Content-Security-Policy", "frame-ancestors 'none'")
 }
 
-fn handle_root(file: Option<&Path>, version: &AtomicU64) -> Reply {
+fn handle_root(file: Option<&Path>, version: &AtomicU64, allow_remote_images: bool) -> Reply {
     // Read the live-reload baseline *before* reading the file: if a save
     // lands in between, the version embedded here is guaranteed to be no
     // newer than the content about to be rendered, so the client's first
     // comparison can't spuriously miss that save. See `render::page`'s docs.
     let baseline = version.load(Ordering::SeqCst);
     match file {
-        None => Reply::html(200, page(EMPTY_TITLE, EMPTY_BODY_HTML, Some(baseline))),
+        None => Reply::html(
+            200,
+            page(
+                EMPTY_TITLE,
+                EMPTY_BODY_HTML,
+                Some(baseline),
+                allow_remote_images,
+            ),
+        ),
         Some(path) => match read_and_render(path) {
-            Ok((title, body_html)) => Reply::html(200, page(&title, &body_html, Some(baseline))),
+            Ok((title, body_html)) => Reply::html(
+                200,
+                page(&title, &body_html, Some(baseline), allow_remote_images),
+            ),
             // Still a full page (live script included) so the view can
             // recover by itself once the file is back — a bare 500 would
             // leave the native window with no way to refresh.
-            Err(title) => Reply::html(500, page(&title, &error_fragment(&title), Some(baseline))),
+            Err(title) => Reply::html(
+                500,
+                page(
+                    &title,
+                    &error_fragment(&title),
+                    Some(baseline),
+                    allow_remote_images,
+                ),
+            ),
         },
     }
 }
@@ -262,9 +286,14 @@ fn handle_put_review(req: &RouteRequest, file: Option<&Path>) -> Reply {
         }
     };
     if doc.file != file_title(path) {
+        // `doc.file` is client-supplied — never logged verbatim (it could
+        // otherwise be used to smuggle attacker-chosen text into stderr, or
+        // to leak a path/name a script running elsewhere on the machine
+        // wouldn't otherwise be able to observe). Only its length is
+        // reported.
         eprintln!(
-            "warning: PUT /review body names a different file ({:?}) than is open",
-            doc.file
+            "warning: review document file name mismatch (got {} bytes)",
+            doc.file.len()
         );
         return error_json(400, "document file name mismatch");
     }
@@ -426,7 +455,7 @@ mod tests {
         std::fs::write(&file_path, "# Hello\n").expect("write markdown file");
         let version = AtomicU64::new(3);
 
-        let reply = handle(&get("/"), Some(&file_path), &version);
+        let reply = handle(&get("/"), Some(&file_path), &version, false);
 
         assert_eq!(reply.status, 200);
         assert_eq!(reply.content_type, "text/html; charset=utf-8");
@@ -453,6 +482,7 @@ mod tests {
             },
             None,
             &version,
+            false,
         );
         assert_eq!(reply.status, 200);
     }
@@ -460,7 +490,7 @@ mod tests {
     #[test]
     fn version_returns_the_counter_as_plain_text() {
         let version = AtomicU64::new(42);
-        let reply = handle(&get("/version"), None, &version);
+        let reply = handle(&get("/version"), None, &version, false);
 
         assert_eq!(reply.status, 200);
         assert_eq!(reply.content_type, "text/plain; charset=utf-8");
@@ -475,7 +505,7 @@ mod tests {
         std::fs::write(&file_path, "# Hi\n").expect("write markdown file");
         let version = AtomicU64::new(0);
 
-        let reply = handle(&get("/body"), Some(&file_path), &version);
+        let reply = handle(&get("/body"), Some(&file_path), &version, false);
 
         assert_eq!(reply.status, 200);
         assert_eq!(reply.content_type, "text/html; charset=utf-8");
@@ -491,13 +521,13 @@ mod tests {
     fn no_file_selected_renders_empty_page_on_root_and_body() {
         let version = AtomicU64::new(0);
 
-        let root = handle(&get("/"), None, &version);
+        let root = handle(&get("/"), None, &version, false);
         assert_eq!(root.status, 200);
         assert!(String::from_utf8(root.body)
             .unwrap()
             .contains("Drop a Markdown file here"));
 
-        let body = handle(&get("/body"), None, &version);
+        let body = handle(&get("/body"), None, &version, false);
         assert_eq!(body.status, 200);
         // No file means no file name to report.
         assert_eq!(header(&body, "X-Mdview-Title"), None);
@@ -512,7 +542,7 @@ mod tests {
         let missing_path = dir.path().join("gone.md");
         let version = AtomicU64::new(7);
 
-        let root = handle(&get("/"), Some(&missing_path), &version);
+        let root = handle(&get("/"), Some(&missing_path), &version, false);
         assert_eq!(root.status, 500);
         assert_eq!(root.content_type, "text/html; charset=utf-8");
         let body = String::from_utf8(root.body).unwrap();
@@ -529,7 +559,7 @@ mod tests {
         let missing_path = dir.path().join("gone.md");
         let version = AtomicU64::new(0);
 
-        let reply = handle(&get("/body"), Some(&missing_path), &version);
+        let reply = handle(&get("/body"), Some(&missing_path), &version, false);
         assert_eq!(reply.status, 200);
         assert_eq!(header(&reply, "X-Mdview-Title"), Some("gone.md"));
         let body = String::from_utf8(reply.body).unwrap();
@@ -544,7 +574,7 @@ mod tests {
         std::fs::write(&file_path, "# Hi\n").expect("write markdown file");
         let version = AtomicU64::new(0);
 
-        let reply = handle(&get("/body"), Some(&file_path), &version);
+        let reply = handle(&get("/body"), Some(&file_path), &version, false);
         assert_eq!(reply.status, 200);
         let title = header(&reply, "X-Mdview-Title").expect("title header present");
         assert!(title.is_ascii(), "header must be ASCII-safe: {title}");
@@ -552,7 +582,7 @@ mod tests {
         assert!(title.ends_with(".md"), "{title}");
 
         std::fs::remove_file(&file_path).expect("delete file");
-        let failed = handle(&get("/body"), Some(&file_path), &version);
+        let failed = handle(&get("/body"), Some(&file_path), &version, false);
         let body = String::from_utf8(failed.body).unwrap();
         assert!(body.contains("メモ.md"), "{body}");
     }
@@ -568,12 +598,12 @@ mod tests {
         std::fs::write(&file_path, "# Hi\n").expect("write markdown file");
         let version = AtomicU64::new(0);
 
-        let reply = handle(&get("/body"), Some(&file_path), &version);
+        let reply = handle(&get("/body"), Some(&file_path), &version, false);
         let title = header(&reply, "X-Mdview-Title").expect("title header present");
         assert!(title.ends_with("<1>.md"), "{title}");
 
         std::fs::remove_file(&file_path).expect("delete file");
-        let failed = handle(&get("/body"), Some(&file_path), &version);
+        let failed = handle(&get("/body"), Some(&file_path), &version, false);
         let body = String::from_utf8(failed.body).unwrap();
         assert!(body.contains("メモ&lt;1&gt;.md"), "{body}");
     }
@@ -582,7 +612,7 @@ mod tests {
     fn every_route_carries_common_security_headers() {
         let version = AtomicU64::new(0);
         for route in ["/", "/version", "/body", "/nope"] {
-            let reply = handle(&get(route), None, &version);
+            let reply = handle(&get(route), None, &version, false);
             assert_eq!(header(&reply, "Cache-Control"), Some("no-store"), "{route}");
             assert_eq!(
                 header(&reply, "X-Content-Type-Options"),
@@ -604,17 +634,17 @@ mod tests {
         std::fs::write(&file_path, "# Hi\n").expect("write markdown file");
         let version = AtomicU64::new(0);
 
-        let reply = handle(&get("/?x=1"), Some(&file_path), &version);
+        let reply = handle(&get("/?x=1"), Some(&file_path), &version, false);
         assert_eq!(reply.status, 200);
 
-        let version_reply = handle(&get("/version?t=1"), Some(&file_path), &version);
+        let version_reply = handle(&get("/version?t=1"), Some(&file_path), &version, false);
         assert_eq!(version_reply.status, 200);
     }
 
     #[test]
     fn unknown_path_is_404() {
         let version = AtomicU64::new(0);
-        let reply = handle(&get("/nope"), None, &version);
+        let reply = handle(&get("/nope"), None, &version, false);
         assert_eq!(reply.status, 404);
     }
 
@@ -627,7 +657,7 @@ mod tests {
         std::fs::write(&file_path, "# Hi\n").expect("write markdown file");
         let version = AtomicU64::new(0);
 
-        let reply = handle(&get("/review"), Some(&file_path), &version);
+        let reply = handle(&get("/review"), Some(&file_path), &version, false);
         assert_eq!(reply.status, 200);
         assert_eq!(reply.content_type, "application/json; charset=utf-8");
         let value: serde_json::Value = serde_json::from_slice(&reply.body).unwrap();
@@ -673,10 +703,15 @@ mod tests {
             }]
         });
         let body = serde_json::to_vec(&doc_json).unwrap();
-        let put_reply = handle(&put_review(&body, &headers), Some(&file_path), &version);
+        let put_reply = handle(
+            &put_review(&body, &headers),
+            Some(&file_path),
+            &version,
+            false,
+        );
         assert_eq!(put_reply.status, 200);
 
-        let get_reply = handle(&get("/review"), Some(&file_path), &version);
+        let get_reply = handle(&get("/review"), Some(&file_path), &version, false);
         let value: serde_json::Value = serde_json::from_slice(&get_reply.body).unwrap();
         assert_eq!(value["unanchored"], serde_json::json!([]));
         assert_eq!(value["blocks"][0]["kind"], "item");
@@ -685,7 +720,7 @@ mod tests {
     #[test]
     fn get_review_with_no_file_open_is_409() {
         let version = AtomicU64::new(0);
-        let reply = handle(&get("/review"), None, &version);
+        let reply = handle(&get("/review"), None, &version, false);
         assert_eq!(reply.status, 409);
         let value: serde_json::Value = serde_json::from_slice(&reply.body).unwrap();
         assert_eq!(value["error"], "no file open");
@@ -697,7 +732,7 @@ mod tests {
         let missing_path = dir.path().join("gone.md");
         let version = AtomicU64::new(0);
 
-        let reply = handle(&get("/review"), Some(&missing_path), &version);
+        let reply = handle(&get("/review"), Some(&missing_path), &version, false);
         assert_eq!(reply.status, 500);
         let value: serde_json::Value = serde_json::from_slice(&reply.body).unwrap();
         assert_eq!(value["error"], "failed to read document");
@@ -717,6 +752,7 @@ mod tests {
             &put_review(body, &REQUEST_HEADER_PAIR),
             Some(&file_path),
             &version,
+            false,
         );
         assert_eq!(reply.status, 403);
     }
@@ -733,6 +769,7 @@ mod tests {
             &put_review(b"not json", &headers),
             Some(&file_path),
             &version,
+            false,
         );
         assert_eq!(reply.status, 400);
         let value: serde_json::Value = serde_json::from_slice(&reply.body).unwrap();
@@ -746,7 +783,7 @@ mod tests {
         let version = AtomicU64::new(0);
         let headers = with_request_header();
         let body = br#"{"version":1,"file":"notes.md","blocks":[]}"#;
-        let reply = handle(&put_review(body, &headers), None, &version);
+        let reply = handle(&put_review(body, &headers), None, &version, false);
         assert_eq!(reply.status, 409);
     }
 
@@ -759,7 +796,12 @@ mod tests {
         let headers = with_request_header();
 
         let body = br#"{"version":1,"file":"other.md","blocks":[]}"#;
-        let reply = handle(&put_review(body, &headers), Some(&file_path), &version);
+        let reply = handle(
+            &put_review(body, &headers),
+            Some(&file_path),
+            &version,
+            false,
+        );
         assert_eq!(reply.status, 400);
         let value: serde_json::Value = serde_json::from_slice(&reply.body).unwrap();
         assert_eq!(value["error"], "document file name mismatch");
@@ -774,7 +816,12 @@ mod tests {
         let headers = with_request_header();
 
         let body = br#"{"version":1,"file":"","blocks":[]}"#;
-        let reply = handle(&put_review(body, &headers), Some(&file_path), &version);
+        let reply = handle(
+            &put_review(body, &headers),
+            Some(&file_path),
+            &version,
+            false,
+        );
         assert_eq!(reply.status, 400);
         let value: serde_json::Value = serde_json::from_slice(&reply.body).unwrap();
         assert_eq!(value["error"], "document file name mismatch");
@@ -789,7 +836,12 @@ mod tests {
         let headers = with_request_header();
 
         let body = br#"{"version":1,"file":"notes.md","blocks":[]}"#;
-        let reply = handle(&put_review(body, &headers), Some(&file_path), &version);
+        let reply = handle(
+            &put_review(body, &headers),
+            Some(&file_path),
+            &version,
+            false,
+        );
         assert_eq!(reply.status, 200);
     }
 
@@ -819,12 +871,17 @@ mod tests {
         });
         let body = serde_json::to_vec(&doc_json).unwrap();
 
-        let put_reply = handle(&put_review(&body, &headers), Some(&file_path), &version);
+        let put_reply = handle(
+            &put_review(&body, &headers),
+            Some(&file_path),
+            &version,
+            false,
+        );
         assert_eq!(put_reply.status, 200);
         let put_value: serde_json::Value = serde_json::from_slice(&put_reply.body).unwrap();
         assert_eq!(put_value["ok"], true);
 
-        let get_reply = handle(&get("/review"), Some(&file_path), &version);
+        let get_reply = handle(&get("/review"), Some(&file_path), &version, false);
         assert_eq!(get_reply.status, 200);
         let get_value: serde_json::Value = serde_json::from_slice(&get_reply.body).unwrap();
         assert_eq!(get_value["blocks"][0]["hash"], hash.as_str());
@@ -853,10 +910,15 @@ mod tests {
         });
         let body = serde_json::to_vec(&doc_json).unwrap();
 
-        let put_reply = handle(&put_review(&body, &headers), Some(&file_path), &version);
+        let put_reply = handle(
+            &put_review(&body, &headers),
+            Some(&file_path),
+            &version,
+            false,
+        );
         assert_eq!(put_reply.status, 200);
 
-        let get_reply = handle(&get("/review"), Some(&file_path), &version);
+        let get_reply = handle(&get("/review"), Some(&file_path), &version, false);
         assert_eq!(get_reply.status, 200);
         let get_value: serde_json::Value = serde_json::from_slice(&get_reply.body).unwrap();
         assert_eq!(
@@ -877,6 +939,7 @@ mod tests {
             &post_export(&REQUEST_HEADER_PAIR),
             Some(&file_path),
             &version,
+            false,
         );
         assert_eq!(reply.status, 403);
     }
@@ -885,7 +948,7 @@ mod tests {
     fn export_with_no_file_open_is_409() {
         let version = AtomicU64::new(0);
         let headers = with_request_header();
-        let reply = handle(&post_export(&headers), None, &version);
+        let reply = handle(&post_export(&headers), None, &version, false);
         assert_eq!(reply.status, 409);
     }
 
@@ -897,7 +960,7 @@ mod tests {
         let version = AtomicU64::new(0);
         let headers = with_request_header();
 
-        let reply = handle(&post_export(&headers), Some(&file_path), &version);
+        let reply = handle(&post_export(&headers), Some(&file_path), &version, false);
         assert_eq!(reply.status, 200);
         let value: serde_json::Value = serde_json::from_slice(&reply.body).unwrap();
         assert_eq!(value["path"], "notes.review.md");

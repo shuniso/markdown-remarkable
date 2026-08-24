@@ -5,9 +5,13 @@
 //! Not covered by automated tests — GUI startup/event-loop code isn't
 //! practical to exercise the way `routes`, `server`, and `watch` are; see
 //! the design doc's "含まない" section. The routing logic it calls into
-//! (`routes::handle`) is fully unit-tested on its own. Set `MDVIEW_DEBUG=1`
-//! to log every request every WebView makes through the custom protocol,
-//! which is how the live-reload path gets verified by hand.
+//! (`routes::handle`) is fully unit-tested on its own. The one exception is
+//! [`is_internal_url`]/[`is_windows_internal_url`] (the navigation-policy
+//! check deciding whether a URL stays inside the app) — a pure function
+//! with no window/event-loop dependency, so it's unit-tested directly; see
+//! the `tests` module at the bottom of this file. Set `MDVIEW_DEBUG=1` to
+//! log every request every WebView makes through the custom protocol, which
+//! is how the live-reload path gets verified by hand.
 
 use crate::routes;
 use crate::util::file_title;
@@ -51,12 +55,59 @@ const INITIAL_URL: &str = "mdview://localhost/";
 #[cfg(target_os = "windows")]
 const INITIAL_URL: &str = "http://mdview.localhost/";
 
-/// Prefix every in-app navigation shares; anything else is "leaving the
-/// document" and is handed to the OS instead (see `navigation_policy`).
+/// Prefix (macOS/Linux) or exact origin (Windows) every in-app navigation
+/// shares; anything else is "leaving the document" and is handed to the OS
+/// instead (see `navigation_policy`/[`is_internal_url`]).
 #[cfg(not(target_os = "windows"))]
 const INTERNAL_URL_PREFIX: &str = "mdview://";
 #[cfg(target_os = "windows")]
 const INTERNAL_URL_PREFIX: &str = "http://mdview.localhost";
+
+/// Whether `url` counts as staying inside the app for navigation purposes —
+/// the check behind `navigation_policy`. On macOS/Linux this is a plain
+/// prefix match against [`INTERNAL_URL_PREFIX`] (`mdview://`): safe because
+/// `mdview` is a custom URL scheme this app exclusively owns, so no other
+/// origin can ever start with it.
+///
+/// On Windows, wry serves the custom protocol as an `http://` origin
+/// (`http://mdview.localhost/...`) instead of a real custom scheme, so a
+/// plain `starts_with` is *not* safe there: `http://mdview.localhost` is
+/// also a valid string prefix of `http://mdview.localhost.attacker.example/`
+/// (a different, attacker-owned host — DNS labels nest as suffixes, not
+/// prefixes), `http://mdview.localhost@evil.com/` (`mdview.localhost`
+/// parses as userinfo, `evil.com` is the actual host), and
+/// `http://mdview.localhost:8080/` — none of which is actually this app's
+/// origin. [`is_windows_internal_url`] is the exact-origin check used
+/// instead in that case.
+#[cfg(not(target_os = "windows"))]
+fn is_internal_url(url: &str) -> bool {
+    url.starts_with(INTERNAL_URL_PREFIX)
+}
+
+/// Windows counterpart of [`is_internal_url`] — see its docs for why a
+/// plain prefix match isn't safe for an `http://` origin.
+#[cfg(target_os = "windows")]
+fn is_internal_url(url: &str) -> bool {
+    is_windows_internal_url(url, INTERNAL_URL_PREFIX)
+}
+
+/// The exact-origin check backing [`is_internal_url`] on Windows, factored
+/// out to take `host_prefix` as a parameter (rather than reading
+/// [`INTERNAL_URL_PREFIX`] directly) purely so it can be exercised by
+/// `#[cfg(test)]` with a Windows-shaped prefix regardless of which OS
+/// actually built the test binary. `url` matches only if it's exactly
+/// `host_prefix`, or `host_prefix` immediately followed by `/` (a path) —
+/// nothing else, so a suffix, a userinfo `@`, or a port appended right
+/// after `host_prefix` is correctly rejected rather than accepted by a
+/// naive `starts_with`. Only ever *called* (outside tests) from the
+/// `target_os = "windows"` build of [`is_internal_url`] above, so — same as
+/// [`ZoomDir`]'s variants — a non-Windows build needs its own dead_code
+/// allowance despite this being unconditionally defined.
+#[cfg_attr(not(target_os = "windows"), allow(dead_code))]
+fn is_windows_internal_url(url: &str, host_prefix: &str) -> bool {
+    url.strip_prefix(host_prefix)
+        .is_some_and(|rest| rest.is_empty() || rest.starts_with('/'))
+}
 
 /// How long to wait after startup for the OS to hand us a file (a Finder
 /// double-click arrives as `Event::Opened` slightly after launch) before
@@ -202,6 +253,7 @@ struct WindowFactory<'a> {
     registry: &'a SharedRegistry,
     next_webview_id: &'a AtomicU64,
     debug: bool,
+    allow_remote_images: bool,
     saved_window_state: Option<WindowState>,
     monitors: &'a [MonitorRect],
 }
@@ -224,7 +276,7 @@ struct WindowFactory<'a> {
 /// `EventLoop::run` has return type `!` (it calls `std::process::exit`
 /// internally once the loop stops), so the only way out of this function is
 /// an `Err` from setup that happens *before* the event loop starts running.
-pub fn run(initial: Vec<PathBuf>) -> Result<()> {
+pub fn run(initial: Vec<PathBuf>, allow_remote_images: bool) -> Result<()> {
     let event_loop = EventLoopBuilder::<UserEvent>::with_user_event().build();
     let proxy = event_loop.create_proxy();
 
@@ -269,6 +321,7 @@ pub fn run(initial: Vec<PathBuf>) -> Result<()> {
         registry: &registry,
         next_webview_id: &next_webview_id,
         debug,
+        allow_remote_images,
         saved_window_state,
         monitors: &monitors,
     };
@@ -321,6 +374,7 @@ pub fn run(initial: Vec<PathBuf>) -> Result<()> {
             registry: &registry,
             next_webview_id: &next_webview_id,
             debug,
+            allow_remote_images,
             saved_window_state,
             monitors: &monitors,
         };
@@ -487,6 +541,7 @@ fn create_window(
     let registry = factory.registry;
     let next_webview_id = factory.next_webview_id;
     let debug = factory.debug;
+    let allow_remote_images = factory.allow_remote_images;
 
     // Position is deliberately *not* set via `WindowBuilder::with_position`
     // here: on macOS, tao's builder-time position sets the window's
@@ -536,7 +591,13 @@ fn create_window(
     let builder = WebViewBuilder::new()
         .with_id(webview_id.as_str())
         .with_custom_protocol(PROTOCOL.into(), move |webview_id, request| {
-            protocol_response(&protocol_registry, webview_id, request, debug)
+            protocol_response(
+                &protocol_registry,
+                webview_id,
+                request,
+                debug,
+                allow_remote_images,
+            )
         })
         .with_navigation_handler(navigation_policy)
         .with_new_window_req_handler(|url, _features| {
@@ -856,6 +917,7 @@ fn protocol_response(
     webview_id: WebViewId<'_>,
     request: Request<Vec<u8>>,
     debug: bool,
+    allow_remote_images: bool,
 ) -> Response<Cow<'static, [u8]>> {
     let Some((file_state, version)) = registry
         .lock()
@@ -905,7 +967,12 @@ fn protocol_response(
         .lock()
         .expect("file state mutex poisoned")
         .clone();
-    let reply = routes::handle(&route_request, file.as_deref(), &version);
+    let reply = routes::handle(
+        &route_request,
+        file.as_deref(),
+        &version,
+        allow_remote_images,
+    );
     if debug {
         // The body byte count is only interesting for state-changing
         // requests (PUT/POST) — that's how the body reaches this handler
@@ -957,12 +1024,20 @@ fn protocol_response(
 /// (no window has a back button or URL bar to get home from), and anything
 /// else is simply ignored.
 fn navigation_policy(url: String) -> bool {
-    if url.starts_with(INTERNAL_URL_PREFIX) {
+    if is_internal_url(&url) {
         return true;
     }
     if url.starts_with("http://") || url.starts_with("https://") || url.starts_with("mailto:") {
         if let Err(err) = open::that(&url) {
-            eprintln!("warning: could not open {url}: {err}");
+            // The URL is user/document-controlled and unbounded in length;
+            // truncated so one huge/crafted link can't blow up the log.
+            let truncated: String = url.chars().take(120).collect();
+            let suffix = if truncated.len() < url.len() {
+                "…"
+            } else {
+                ""
+            };
+            eprintln!("warning: could not open {truncated}{suffix}: {err}");
         }
     }
     false
@@ -1128,4 +1203,64 @@ struct NoMenu;
 #[cfg(not(target_os = "macos"))]
 fn install_menu(_proxy: &EventLoopProxy<UserEvent>) -> Result<NoMenu> {
     Ok(NoMenu)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // `is_windows_internal_url` is tested directly against a Windows-shaped
+    // prefix regardless of which OS actually built this test binary — see
+    // its doc comment for why it takes `host_prefix` as a parameter rather
+    // than reading `INTERNAL_URL_PREFIX`.
+    const WINDOWS_PREFIX: &str = "http://mdview.localhost";
+
+    #[test]
+    fn windows_internal_url_accepts_exact_origin_and_paths() {
+        assert!(is_windows_internal_url(
+            "http://mdview.localhost/",
+            WINDOWS_PREFIX
+        ));
+        assert!(is_windows_internal_url(
+            "http://mdview.localhost",
+            WINDOWS_PREFIX
+        ));
+        assert!(is_windows_internal_url(
+            "http://mdview.localhost/some/path",
+            WINDOWS_PREFIX
+        ));
+    }
+
+    #[test]
+    fn windows_internal_url_rejects_spoofed_suffix() {
+        assert!(!is_windows_internal_url(
+            "http://mdview.localhost.attacker.example/",
+            WINDOWS_PREFIX
+        ));
+    }
+
+    #[test]
+    fn windows_internal_url_rejects_userinfo_spoof() {
+        assert!(!is_windows_internal_url(
+            "http://mdview.localhost@evil.com/",
+            WINDOWS_PREFIX
+        ));
+    }
+
+    #[test]
+    fn windows_internal_url_rejects_port_spoof() {
+        assert!(!is_windows_internal_url(
+            "http://mdview.localhost:8080/",
+            WINDOWS_PREFIX
+        ));
+    }
+
+    #[test]
+    fn scheme_internal_url_prefix_match_still_works() {
+        // The macOS/Linux side stays a plain prefix match — `mdview://` is a
+        // custom scheme this app exclusively owns, so no exact-origin check
+        // is needed there.
+        assert!("mdview://localhost/body".starts_with("mdview://"));
+        assert!(!"mdview-evil://localhost/".starts_with("mdview://"));
+    }
 }

@@ -45,7 +45,7 @@ fn start_test_server_named(markdown: &str, file_name: &str) -> TestServer {
     // test finishes; the process exiting at the end of the test binary
     // reclaims them.
     thread::spawn(move || {
-        let _ = server::run(http_server, &run_path, run_version);
+        let _ = server::run(http_server, &run_path, run_version, false);
     });
 
     // Give the spawned thread a moment to start accepting connections.

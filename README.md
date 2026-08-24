@@ -63,6 +63,7 @@ browser instead of a native window — the original CLI's behavior, unchanged.
 | `--port <PORT>` | `0` | Port to listen on. `0` lets the OS pick a free port. Only applies to `--browser`. |
 | `--no-open` | off | Don't open the browser automatically. Only applies to `--browser`. |
 | `--export <OUT.html>` | — | Render to a standalone HTML file and exit, instead of showing it live. Requires exactly one `FILE`, and is mutually exclusive with `--browser`/`--port`/`--no-open`. Refuses to write over the input file itself. |
+| `--allow-remote-images` | off | Load `http(s)` images referenced by the document (in addition to inline `data:` images). Off by default, since a remote image is an outbound request to a host the document's author chose. Applies to the native window, `--browser`, and `--export` alike. |
 
 Set the environment variable `MDVIEW_DEBUG=1` to log every request the
 native window's WebView makes (`[mdview] GET /version -> 200` and so on) to
@@ -98,6 +99,10 @@ mdview notes.md --export notes.html
   clickable/loadable. This narrows the most common script-injection
   vectors in a Markdown file; it isn't a general claim that viewing any
   untrusted file is safe.
+- External images are not loaded by default — an `http(s)` `<img>` in the
+  document renders broken rather than fetching anything, so opening an
+  untrusted file never quietly leaks your IP to a remote host. Pass
+  `--allow-remote-images` to opt in and load them.
 - HTML comments (`<!-- ... -->`), block-level or inline, are discarded
   entirely rather than shown as text.
 - **Inline review comments**: in the live view (native window or
@@ -157,14 +162,20 @@ mdview notes.md --export notes.html
 
 - Only three routes/paths are served (`/`, `/body`, `/version`) — no other
   files. So a relative-path image (e.g. `![alt](./photo.png)`) renders an
-  `<img>` tag that points nowhere and won't display; only `http(s)` image
-  URLs actually show up. Relative *links* to other files render fine as
+  `<img>` tag that points nowhere and won't display, regardless of
+  `--allow-remote-images`. Relative *links* to other files render fine as
   `<a>` tags, they just won't resolve to anything either, for the same
   reason.
 - This isn't just a routing limitation: the page's Content-Security-Policy
-  (`img-src data: http: https:`) doesn't include `file:` or `'self'`, so
-  even a `--export`ed HTML file opened directly in a browser won't display
-  a local/relative-path image — only `http(s)` image URLs work there too.
+  doesn't include `file:` or `'self'` in `img-src`, so even a
+  `--export`ed HTML file opened directly in a browser won't display a
+  local/relative-path image.
+- External (`http(s)`) images are blocked by default — the CSP's `img-src`
+  is `data:` only, so a remote `<img>` renders broken rather than fetching
+  anything. Pass `--allow-remote-images` (native window, `--browser`, or
+  `--export` alike) to load them; doing so means the document can trigger
+  outbound requests to whatever hosts it references, leaking the viewer's
+  IP to those hosts.
 - Each native window still shows one file at a time — dropping, picking, or
   Finder-opening a file while a window that already has one is frontmost
   opens a *new* window for it rather than replacing that window's content;
@@ -311,6 +322,39 @@ each window's close button, and the existing keyboard shortcuts (Ctrl-based,
 not Cmd) still work. `--export`'s same-path and symlink self-overwrite
 checks apply on Windows too; the additional hard-link check is Unix-only.
 
+### Code signing
+
+Neither build is signed with a certificate that machines other than yours
+already trust, so both trigger an "unknown publisher"-style warning when
+someone else runs them.
+
+**Windows**: SmartScreen's warning is driven by *reputation*, not merely by
+the presence of a signature — a freshly-signed exe still warns until it's
+been run by enough people. Making the warning go away reliably needs either
+an OV code-signing certificate (roughly $100/year) or [Azure Trusted
+Signing](https://learn.microsoft.com/azure/trusted-signing/overview)
+(roughly $10/month). For personal use, either click "More info" -> "Run
+anyway" on the SmartScreen prompt, or run `Unblock-File mdview.exe` before
+launching it. To sign for yourself across your own machines (so the
+publisher at least reads as something other than "Unknown"), run
+`scripts/sign-windows-selfsign.ps1` from an admin PowerShell — see the
+comments at the top of that script for exactly what it does and doesn't
+achieve. In CI, setting the `WINDOWS_CERT_PFX_BASE64` and
+`WINDOWS_CERT_PASSWORD` repo secrets makes the `release.yml` workflow sign
+`mdview.exe` automatically before zipping it; leave them unset and the
+workflow builds an unsigned exe exactly as it does today.
+
+**macOS**: distributing to other people's machines cleanly needs a
+Developer ID certificate plus notarization (the [Apple Developer
+Program](https://developer.apple.com/programs/), $99/year). For a build on
+your own machine, the default ad-hoc signature (see [macOS app
+bundle](#macos-app-bundle) above) is enough. On someone else's machine,
+right-click -> Open on first launch, or run
+`xattr -dr com.apple.quarantine mdview.app` after unzipping. In CI, setting
+the `MACOS_SIGN_IDENTITY` repo secret threads a real codesign identity into
+`scripts/bundle-macos.sh` via `MDVIEW_SIGN_IDENTITY`; leave it unset and the
+workflow keeps building the ad-hoc-signed bundle as before.
+
 ### Development
 
 ```sh
@@ -318,6 +362,10 @@ cargo fmt --all -- --check
 cargo clippy --all-targets -- -D warnings
 cargo test
 ```
+
+## Security
+
+See [docs/SECURITY.md](docs/SECURITY.md) for what mdview does and doesn't send/read/write, and the known exceptions (remote images, link clicks, `--browser` mode).
 
 ## License
 

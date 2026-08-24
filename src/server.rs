@@ -47,16 +47,26 @@ pub fn bind(port: u16) -> Result<Server> {
 /// tab viewing the file down with it. This function itself only returns
 /// once the underlying `tiny_http` request iterator ends, which in practice
 /// means the server was shut down out from under it.
-pub fn run(server: Server, path: &Path, version: Arc<AtomicU64>) -> Result<()> {
+pub fn run(
+    server: Server,
+    path: &Path,
+    version: Arc<AtomicU64>,
+    allow_remote_images: bool,
+) -> Result<()> {
     for request in server.incoming_requests() {
-        if let Err(err) = handle_request(request, path, &version) {
+        if let Err(err) = handle_request(request, path, &version, allow_remote_images) {
             eprintln!("warning: failed to handle request: {err}");
         }
     }
     Err(anyhow!("server stopped unexpectedly"))
 }
 
-fn handle_request(mut request: Request, path: &Path, version: &AtomicU64) -> Result<()> {
+fn handle_request(
+    mut request: Request,
+    path: &Path,
+    version: &AtomicU64,
+    allow_remote_images: bool,
+) -> Result<()> {
     if let Some(reason) = host_rejection_reason(&request) {
         return request
             .respond(Response::from_string(reason).with_status_code(403))
@@ -86,7 +96,7 @@ fn handle_request(mut request: Request, path: &Path, version: &AtomicU64) -> Res
                 headers: &headers,
                 body: &body,
             };
-            let reply = routes::handle(&route_request, Some(path), version);
+            let reply = routes::handle(&route_request, Some(path), version, allow_remote_images);
             send_reply(request, reply)
         }
         _ => request

@@ -30,7 +30,7 @@
 use anyhow::{Context, Result};
 use clap::Parser;
 use markdown_remarkable::render::{page, to_html};
-use markdown_remarkable::{app, server, watch};
+use markdown_remarkable::{app, review, server, watch};
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::AtomicU64;
@@ -76,6 +76,17 @@ struct Cli {
         conflicts_with_all = ["browser", "port", "no_open"]
     )]
     export: Option<PathBuf>,
+
+    /// Allow the page to load images from `http(s):` URLs, in addition to
+    /// inline `data:` images. Off by default: a remote image target in the
+    /// document then renders as a broken `<img>` rather than an outbound
+    /// request, since fetching one would leak the viewer's IP (and
+    /// potentially which document they're viewing) to whatever host it
+    /// points at — the same "tracking pixel" concern email/RSS clients
+    /// guard against by default. Applies to the native window, `--browser`,
+    /// and `--export` alike.
+    #[arg(long)]
+    allow_remote_images: bool,
 }
 
 fn main() -> Result<()> {
@@ -102,7 +113,7 @@ fn main() -> Result<()> {
         let file = &cli.file[0];
         let markdown = fs::read_to_string(file)
             .with_context(|| format!("failed to read {}", file.display()))?;
-        return export(file, &markdown, export_path);
+        return export(file, &markdown, export_path, cli.allow_remote_images);
     }
 
     if cli.browser {
@@ -111,7 +122,7 @@ fn main() -> Result<()> {
         // to fall back to showing), so this propagates as a hard error.
         let file = &cli.file[0];
         confirm_readable(file)?;
-        return run_browser(file, cli.port, cli.no_open);
+        return run_browser(file, cli.port, cli.no_open, cli.allow_remote_images);
     }
 
     // Native mode: open a window for every FILE that's readable right now.
@@ -135,7 +146,7 @@ fn main() -> Result<()> {
     if had_files && readable.is_empty() {
         anyhow::bail!("none of the given files could be read");
     }
-    app::run(readable)
+    app::run(readable, cli.allow_remote_images)
 }
 
 /// Attaches this process's stdout/stderr to whatever console its parent
@@ -166,8 +177,9 @@ fn confirm_readable(file: &Path) -> Result<()> {
 
 /// The original `--browser` flow: bind a local HTTP server, watch the file,
 /// open the default browser, and serve forever. Unchanged from before this
-/// file gained a native-window default.
-fn run_browser(file: &Path, port: u16, no_open: bool) -> Result<()> {
+/// file gained a native-window default, aside from threading
+/// `allow_remote_images` through to every response `server::run` sends.
+fn run_browser(file: &Path, port: u16, no_open: bool, allow_remote_images: bool) -> Result<()> {
     let version = Arc::new(AtomicU64::new(0));
 
     let http_server = server::bind(port).context("failed to start server")?;
@@ -196,13 +208,13 @@ fn run_browser(file: &Path, port: u16, no_open: bool) -> Result<()> {
         }
     }
 
-    server::run(http_server, file, version)
+    server::run(http_server, file, version, allow_remote_images)
 }
 
 /// Renders `markdown` (already read from `file`, so `--export` doesn't pay
 /// for a second disk read) to a standalone, non-live HTML page and writes it
 /// to `out`.
-fn export(file: &Path, markdown: &str, out: &Path) -> Result<()> {
+fn export(file: &Path, markdown: &str, out: &Path, allow_remote_images: bool) -> Result<()> {
     ensure_not_same_file(file, out)?;
 
     let body_html = to_html(markdown);
@@ -210,9 +222,14 @@ fn export(file: &Path, markdown: &str, out: &Path) -> Result<()> {
         .file_name()
         .map(|name| name.to_string_lossy().into_owned())
         .unwrap_or_else(|| file.display().to_string());
-    let html = page(&title, &body_html, None);
+    let html = page(&title, &body_html, None, allow_remote_images);
 
-    fs::write(out, html).with_context(|| format!("failed to write {}", out.display()))?;
+    // Same tmp-file-plus-rename, symlink-race-safe write `review::save`/
+    // `review::export` use for the sidecar/review-export files — `out` is a
+    // user-chosen path, so a pre-existing symlink there (accidental or
+    // planted) is never followed and truncated by a plain `fs::write`.
+    review::atomic_write(out, html.as_bytes())
+        .with_context(|| format!("failed to write {}", out.display()))?;
     println!("Exported {} to {}", file.display(), out.display());
     Ok(())
 }

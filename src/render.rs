@@ -32,14 +32,29 @@ const REVIEW_JS: &str = include_str!("../assets/review.js");
 /// so this is deliberately as strict as `default-src 'none'` plus the exact
 /// exceptions the page actually needs: inline `<style>`/`<script>` (both
 /// embedded, never user-controlled), `connect-src 'self'` for the
-/// live-reload script's `fetch('/version')`, and images. `img-src` allows
-/// both `http(s):` and `data:`, but only `http(s):` image targets actually
-/// reach the page today — `is_safe_link_target` rewrites `data:` (like any
-/// other non-allowlisted scheme) to `#` before it ever becomes an `<img
-/// src>`. `data:` is included here anyway as defense-in-depth, in case a
-/// future change adds another path for `<img>` markup that doesn't go
-/// through that sanitizer.
-const CONTENT_SECURITY_POLICY: &str = "default-src 'none'; style-src 'unsafe-inline'; script-src 'unsafe-inline'; img-src data: http: https:; connect-src 'self'; form-action 'none'";
+/// live-reload script's `fetch('/version')`, and images.
+///
+/// `img-src` defaults to `data:` only — an `http(s):` image target in the
+/// document renders as a *broken* `<img>` (nothing is fetched) unless the
+/// caller explicitly opts in via `allow_remote_images`. Loading a remote
+/// image is an outbound request to a URL chosen by whoever wrote the
+/// Markdown, which leaks the viewer's IP (and, via query-string tricks,
+/// potentially which document/comment they're viewing) to that host — the
+/// same "tracking pixel" concern email/RSS clients block by default. `data:`
+/// stays allowed unconditionally: it never leaves the machine, and is
+/// included as defense-in-depth even though `is_safe_link_target` already
+/// rewrites `data:` image targets to `#` today (in case a future change adds
+/// another path for `<img>` markup that doesn't go through that sanitizer).
+fn content_security_policy(allow_remote_images: bool) -> String {
+    let img_src = if allow_remote_images {
+        "data: http: https:"
+    } else {
+        "data:"
+    };
+    format!(
+        "default-src 'none'; style-src 'unsafe-inline'; script-src 'unsafe-inline'; img-src {img_src}; connect-src 'self'; form-action 'none'"
+    )
+}
 
 /// A single top-level Markdown block (paragraph, heading, list, code block,
 /// table, blockquote, raw HTML block, thematic break, footnote definition,
@@ -1052,7 +1067,13 @@ fn is_safe_link_target(dest_url: &str) -> bool {
 /// no live-reload at all (used by `--export`): a single-column page with no
 /// scripts and no review sidebar, since there's no server to `PUT`
 /// comments to.
-pub fn page(title: &str, body_html: &str, live: Option<u64>) -> String {
+///
+/// `allow_remote_images` controls the CSP's `img-src` — see
+/// [`content_security_policy`]. Threaded through from the CLI's
+/// `--allow-remote-images` flag by every caller (the native window,
+/// `--browser`, and `--export` alike).
+pub fn page(title: &str, body_html: &str, live: Option<u64>, allow_remote_images: bool) -> String {
+    let content_security_policy = content_security_policy(allow_remote_images);
     let title = escape_html_text(title);
     let body_section = match live {
         Some(version) => format!(
@@ -1077,7 +1098,7 @@ pub fn page(title: &str, body_html: &str, live: Option<u64>) -> String {
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<meta http-equiv="Content-Security-Policy" content="{CONTENT_SECURITY_POLICY}">
+<meta http-equiv="Content-Security-Policy" content="{content_security_policy}">
 <title>{title}</title>
 <style>{STYLE_CSS}</style>
 </head>
@@ -1296,7 +1317,7 @@ mod tests {
 
     #[test]
     fn page_with_live_includes_version_baseline_and_polling() {
-        let html = page("Doc", "<p>hi</p>", Some(7));
+        let html = page("Doc", "<p>hi</p>", Some(7), false);
         assert!(html.contains(r#"__mdviewVersion="7""#));
         assert!(html.contains("/version"));
         assert!(html.contains("<script>"));
@@ -1308,14 +1329,14 @@ mod tests {
         // AbortController-based timeout rather than letting a stalled
         // fetch hold `requestInFlight` (and so the in-flight guard) open
         // forever.
-        let html = page("Doc", "<p>hi</p>", Some(1));
+        let html = page("Doc", "<p>hi</p>", Some(1), false);
         assert!(html.contains("AbortController"));
         assert!(html.contains("signal"));
     }
 
     #[test]
     fn page_without_live_excludes_version_polling() {
-        let html = page("Doc", "<p>hi</p>", None);
+        let html = page("Doc", "<p>hi</p>", None, false);
         assert!(!html.contains("__mdviewVersion"));
         assert!(!html.contains("/version"));
         assert!(!html.contains("<script>"));
@@ -1323,7 +1344,7 @@ mod tests {
 
     #[test]
     fn page_with_live_includes_a_two_pane_layout_and_review_script() {
-        let html = page("Doc", "<p>hi</p>", Some(1));
+        let html = page("Doc", "<p>hi</p>", Some(1), false);
         assert!(html.contains(r#"<div class="layout">"#));
         assert!(html.contains(r#"class="markdown-body doc""#));
         assert!(html.contains(r#"<aside class="review" id="review"></aside>"#));
@@ -1333,7 +1354,7 @@ mod tests {
 
     #[test]
     fn page_with_live_includes_the_pane_splitter() {
-        let html = page("Doc", "<p>hi</p>", Some(1));
+        let html = page("Doc", "<p>hi</p>", Some(1), false);
         assert!(html.contains(r#"class="splitter" id="splitter""#));
         // The splitter must sit between the doc pane and the review aside.
         let splitter_idx = html.find("id=\"splitter\"").expect("splitter present");
@@ -1344,7 +1365,7 @@ mod tests {
 
     #[test]
     fn page_with_live_embeds_the_viewer_script_before_live_js() {
-        let html = page("Doc", "<p>hi</p>", Some(1));
+        let html = page("Doc", "<p>hi</p>", Some(1), false);
         // viewer.js content (a distinctive, stable identifier from it).
         assert!(html.contains("__mdviewViewer"));
         let viewer_idx = html.find("__mdviewViewer").expect("viewer script present");
@@ -1357,7 +1378,7 @@ mod tests {
 
     #[test]
     fn page_without_live_has_no_layout_aside_splitter_or_scripts() {
-        let html = page("Doc", "<p>hi</p>", None);
+        let html = page("Doc", "<p>hi</p>", None, false);
         assert!(!html.contains("class=\"layout\""));
         assert!(!html.contains("<aside"));
         // Not a bare `!html.contains("splitter")`: the embedded stylesheet
@@ -1370,21 +1391,34 @@ mod tests {
 
     #[test]
     fn page_includes_content_security_policy() {
-        let html = page("Doc", "<p>hi</p>", None);
+        let html = page("Doc", "<p>hi</p>", None, false);
         assert!(html.contains("Content-Security-Policy"));
         assert!(html.contains("default-src 'none'"));
     }
 
     #[test]
+    fn page_blocks_remote_images_by_default() {
+        let html = page("Doc", "<p>hi</p>", None, false);
+        assert!(html.contains("img-src data:;"));
+        assert!(!html.contains("img-src data: http: https:"));
+    }
+
+    #[test]
+    fn page_allows_remote_images_when_opted_in() {
+        let html = page("Doc", "<p>hi</p>", None, true);
+        assert!(html.contains("img-src data: http: https:"));
+    }
+
+    #[test]
     fn page_escapes_title() {
-        let html = page("<script>alert(1)</script>", "<p>hi</p>", None);
+        let html = page("<script>alert(1)</script>", "<p>hi</p>", None, false);
         assert!(html.contains("&lt;script&gt;alert(1)&lt;/script&gt;"));
         assert!(!html.contains("<title><script>"));
     }
 
     #[test]
     fn page_embeds_body_unescaped() {
-        let html = page("Doc", "<p>hi</p>", None);
+        let html = page("Doc", "<p>hi</p>", None, false);
         assert!(html.contains("<p>hi</p>"));
     }
 

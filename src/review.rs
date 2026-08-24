@@ -185,7 +185,13 @@ static TMP_COUNTER: AtomicU64 = AtomicU64::new(0);
 /// removal, since in that case this call didn't create anything to clean
 /// up (and removing it could delete something it doesn't own, e.g. that
 /// planted symlink).
-fn atomic_write(path: &Path, contents: &[u8]) -> Result<()> {
+///
+/// `pub` (rather than private to this module) so `main.rs`'s `--export` —
+/// which, as a separate binary crate, can't reach a `pub(crate)` item in
+/// this library crate — can reuse the exact same crash-/symlink-safe write
+/// for the user-chosen `OUT.html` path, instead of a plain `fs::write` that
+/// would truncate/follow whatever's already there.
+pub fn atomic_write(path: &Path, contents: &[u8]) -> Result<()> {
     let pid = std::process::id();
     let counter = TMP_COUNTER.fetch_add(1, Ordering::SeqCst);
     let mut tmp_name = path.as_os_str().to_owned();
