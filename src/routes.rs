@@ -538,9 +538,9 @@ mod tests {
     }
 
     #[test]
-    fn non_ascii_title_is_percent_encoded_in_header_and_escaped_in_body() {
+    fn non_ascii_title_is_percent_encoded_in_header() {
         let dir = tempfile::tempdir().expect("create tempdir");
-        let file_path = dir.path().join("メモ<1>.md");
+        let file_path = dir.path().join("メモ.md");
         std::fs::write(&file_path, "# Hi\n").expect("write markdown file");
         let version = AtomicU64::new(0);
 
@@ -549,6 +549,27 @@ mod tests {
         let title = header(&reply, "X-Mdview-Title").expect("title header present");
         assert!(title.is_ascii(), "header must be ASCII-safe: {title}");
         assert!(title.starts_with("%E3%83%A1%E3%83%A2"), "{title}");
+        assert!(title.ends_with(".md"), "{title}");
+
+        std::fs::remove_file(&file_path).expect("delete file");
+        let failed = handle(&get("/body"), Some(&file_path), &version);
+        let body = String::from_utf8(failed.body).unwrap();
+        assert!(body.contains("メモ.md"), "{body}");
+    }
+
+    /// `<`/`>` are legal in Unix file names but not on Windows, so the
+    /// HTML-escaping half of the title handling can only be exercised with
+    /// a real file on Unix.
+    #[cfg(unix)]
+    #[test]
+    fn angle_brackets_in_title_are_html_escaped_in_error_body() {
+        let dir = tempfile::tempdir().expect("create tempdir");
+        let file_path = dir.path().join("メモ<1>.md");
+        std::fs::write(&file_path, "# Hi\n").expect("write markdown file");
+        let version = AtomicU64::new(0);
+
+        let reply = handle(&get("/body"), Some(&file_path), &version);
+        let title = header(&reply, "X-Mdview-Title").expect("title header present");
         assert!(title.ends_with("<1>.md"), "{title}");
 
         std::fs::remove_file(&file_path).expect("delete file");
