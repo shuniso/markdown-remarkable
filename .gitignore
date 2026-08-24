@@ -1,3 +1,7 @@
 /target
 *.review.json
 *.review.md
+
+# Local build/release artifacts must never be committed
+*.zip
+*.exe
