@@ -4,6 +4,28 @@
 //! (rendering, the native app, the HTTP server, and file watching); the
 //! actual logic lives in `markdown_remarkable::{app, render, server,
 //! watch}`.
+//!
+//! On Windows, `windows_subsystem = "windows"` below builds `mdview.exe`
+//! as a GUI subsystem binary — this suppresses the console window that
+//! would otherwise flash open when the app is launched from Explorer/a
+//! file association (there being no console to attach to in that case).
+//! The tradeoff: a GUI-subsystem binary also has no console — and
+//! therefore no stdout/stderr for `--browser`/`--export` to print to —
+//! when launched from a terminal instead. `attach_parent_console` (below)
+//! recovers that: it's the first thing `main` does on Windows, and asks
+//! the OS to attach this process to whatever console its parent process
+//! already has. Launched from Explorer, there is no parent console, the
+//! call harmlessly fails, and the app stays console-free as intended.
+//! Launched from a terminal (cmd/PowerShell/Windows Terminal), the parent
+//! shell's console is what's already visible on screen, so attaching to
+//! it makes `println!`/`eprintln!` show up there exactly as they would on
+//! a console-subsystem binary. One caveat inherent to this order: any
+//! `println!`/`eprintln!` that ran *before* `attach_parent_console` (there
+//! are none today, but a future change could add one) would be silently
+//! discarded rather than printed — with no console attached yet, Rust's
+//! std streams have nothing to write to and drop the output rather than
+//! erroring.
+#![cfg_attr(windows, windows_subsystem = "windows")]
 
 use anyhow::{Context, Result};
 use clap::Parser;
@@ -57,6 +79,9 @@ struct Cli {
 }
 
 fn main() -> Result<()> {
+    #[cfg(windows)]
+    attach_parent_console();
+
     let cli = Cli::parse();
 
     // `--browser`/`--export` each show/render a single file — neither has
@@ -111,6 +136,21 @@ fn main() -> Result<()> {
         anyhow::bail!("none of the given files could be read");
     }
     app::run(readable)
+}
+
+/// Attaches this process's stdout/stderr to whatever console its parent
+/// process already has (a no-op, harmlessly, if the parent has none — e.g.
+/// launched from Explorer/a file association). See the module doc comment
+/// above `#![windows_subsystem = "windows"]` for why this exists and why
+/// it must run first thing in `main`. The return value is intentionally
+/// ignored: failure just means "no parent console to attach to," which is
+/// the normal, expected case for a GUI launch.
+#[cfg(windows)]
+fn attach_parent_console() {
+    use windows_sys::Win32::System::Console::{AttachConsole, ATTACH_PARENT_PROCESS};
+    unsafe {
+        AttachConsole(ATTACH_PARENT_PROCESS);
+    }
 }
 
 /// Confirms `file` can be opened for reading right now, without actually

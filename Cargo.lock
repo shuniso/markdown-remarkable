@@ -1494,6 +1494,7 @@ dependencies = [
  "tempfile",
  "time",
  "tiny_http",
+ "windows-sys 0.60.2",
  "wry",
 ]
 

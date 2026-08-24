@@ -284,6 +284,33 @@ silently drop it). On an older system, the review pane's Save/Export
 actions won't work in the native window; use `--browser` instead, which
 isn't affected.
 
+### Windows
+
+No extra system dependencies are needed to *build* on Windows — `wry`
+links against WebView2 through the `windows` crate, and the WebView2 SDK
+isn't required at build time. At *runtime*, the native window needs the
+Microsoft Edge WebView2 Runtime, which ships preinstalled on Windows 11; on
+older systems that don't have it, install the [Evergreen
+Bootstrapper](https://developer.microsoft.com/microsoft-edge/webview2/).
+
+```sh
+cargo build --release
+```
+
+produces `target\release\mdview.exe`. Prebuilt zips are also published on
+the [Releases](../../releases) page.
+
+`mdview.exe` is built with the GUI subsystem, so launching it from
+Explorer or a `.md` file association opens no console window. Launched
+from a terminal (cmd/PowerShell/Windows Terminal) instead, it attaches to
+that terminal's console, so `--browser`/`--export` still print their usual
+output there.
+
+As on Linux, there's no menu bar (macOS only, per Limitations above) — use
+each window's close button, and the existing keyboard shortcuts (Ctrl-based,
+not Cmd) still work. `--export`'s same-path and symlink self-overwrite
+checks apply on Windows too; the additional hard-link check is Unix-only.
+
 ### Development
 
 ```sh
