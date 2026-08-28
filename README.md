@@ -103,6 +103,9 @@ mdview notes.md --export notes.html
   document renders broken rather than fetching anything, so opening an
   untrusted file never quietly leaks your IP to a remote host. Pass
   `--allow-remote-images` to opt in and load them.
+- Local images next to the Markdown file display in the live view (native
+  window or `--browser`) — see Limitations below for exactly what counts as
+  "local" and the size/extension limits.
 - HTML comments (`<!-- ... -->`), block-level or inline, are discarded
   entirely rather than shown as text.
 - **Inline review comments**: in the live view (native window or
@@ -160,19 +163,25 @@ mdview notes.md --export notes.html
 
 ## Limitations
 
-- Only three routes/paths are served (`/`, `/body`, `/version`) — no other
-  files. So a relative-path image (e.g. `![alt](./photo.png)`) renders an
-  `<img>` tag that points nowhere and won't display, regardless of
-  `--allow-remote-images`. Relative *links* to other files render fine as
-  `<a>` tags, they just won't resolve to anything either, for the same
-  reason.
-- This isn't just a routing limitation: the page's Content-Security-Policy
-  doesn't include `file:` or `'self'` in `img-src`, so even a
-  `--export`ed HTML file opened directly in a browser won't display a
-  local/relative-path image.
+- A local, relative-path image (e.g. `![alt](./photo.png)` or
+  `![alt](imgs/photo.png)`) displays in the live view (native window or
+  `--browser`) as long as it resolves to a file inside the open Markdown
+  file's own parent directory (subdirectories are fine; `..`, an absolute
+  path, and a symlink that escapes that directory are not) with an allowed
+  image extension (`png`/`jpg`/`jpeg`/`gif`/`webp`/`bmp`/`svg`/`avif`/`ico`)
+  and is at most 20 MiB — served through `GET /asset` on the same origin.
+  Anything outside that (parent-directory traversal, an absolute path, a
+  disallowed extension, an oversized file) renders a broken `<img>` instead.
+  Relative *links* to other files still render as plain `<a>` tags that
+  don't resolve to anything — only images are served this way.
+- `--export`'s standalone HTML file has no server behind it once written, so
+  a local/relative-path image still won't display there — the page is
+  rendered without the `/asset` rewrite in the first place, same as before
+  this feature existed.
 - External (`http(s)`) images are blocked by default — the CSP's `img-src`
-  is `data:` only, so a remote `<img>` renders broken rather than fetching
-  anything. Pass `--allow-remote-images` (native window, `--browser`, or
+  is `data: 'self'` only (`'self'` is what lets the local-image `/asset`
+  route above load at all), so a remote `<img>` renders broken rather than
+  fetching anything. Pass `--allow-remote-images` (native window, `--browser`, or
   `--export` alike) to load them; doing so means the document can trigger
   outbound requests to whatever hosts it references, leaking the viewer's
   IP to those hosts.

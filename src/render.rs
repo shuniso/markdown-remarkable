@@ -4,9 +4,25 @@
 //! keeps it trivially unit-testable and keeps `server.rs` a thin adapter
 //! that reads a file, calls into here, and writes the response.
 
+use percent_encoding::{utf8_percent_encode, AsciiSet, NON_ALPHANUMERIC};
 use pulldown_cmark::{html, Alignment, CowStr, Event, Options, Parser, Tag, TagEnd};
 use sha2::{Digest, Sha256};
 use std::ops::Range;
+
+/// Bytes left unencoded when percent-encoding a local image's relative path
+/// for the `p` query value in a `/asset?p=...` target — see
+/// [`rewrite_local_image_target`]. Starting from [`NON_ALPHANUMERIC`] (which
+/// would otherwise also encode `/`, making a subdirectory reference like
+/// `imgs/a.png` unreadable as a path once decoded) and keeping `/`, `.`,
+/// `-`, `_` unescaped is enough for a safe, round-trippable query value —
+/// `routes::handle_asset` percent-decodes it right back before ever
+/// touching the filesystem, so this doesn't need to be a path-segment-exact
+/// encoder, just an unambiguous one.
+const IMAGE_PATH_ENCODE_SET: &AsciiSet = &NON_ALPHANUMERIC
+    .remove(b'/')
+    .remove(b'.')
+    .remove(b'-')
+    .remove(b'_');
 
 /// The bundled GitHub-flavored stylesheet, embedded at compile time so the
 /// binary needs no external assets at runtime.
@@ -34,7 +50,7 @@ const REVIEW_JS: &str = include_str!("../assets/review.js");
 /// embedded, never user-controlled), `connect-src 'self'` for the
 /// live-reload script's `fetch('/version')`, and images.
 ///
-/// `img-src` defaults to `data:` only — an `http(s):` image target in the
+/// `img-src` defaults to `data: 'self'` — an `http(s):` image target in the
 /// document renders as a *broken* `<img>` (nothing is fetched) unless the
 /// caller explicitly opts in via `allow_remote_images`. Loading a remote
 /// image is an outbound request to a URL chosen by whoever wrote the
@@ -45,11 +61,14 @@ const REVIEW_JS: &str = include_str!("../assets/review.js");
 /// included as defense-in-depth even though `is_safe_link_target` already
 /// rewrites `data:` image targets to `#` today (in case a future change adds
 /// another path for `<img>` markup that doesn't go through that sanitizer).
+/// `'self'` is needed for local images rewritten to `/asset?p=...` by
+/// [`to_html`] (see `rewrite_local_images`) — those requests stay on the
+/// same origin and never leave the machine either.
 fn content_security_policy(allow_remote_images: bool) -> String {
     let img_src = if allow_remote_images {
-        "data: http: https:"
+        "data: 'self' http: https:"
     } else {
-        "data:"
+        "data: 'self'"
     };
     format!(
         "default-src 'none'; style-src 'unsafe-inline'; script-src 'unsafe-inline'; img-src {img_src}; connect-src 'self'; form-action 'none'"
@@ -144,6 +163,18 @@ pub struct Anchor {
 /// HTML embedded in the source, and `javascript:`/`data:`-style link or
 /// image targets.
 ///
+/// `rewrite_local_images` controls whether a relative (scheme-less,
+/// non-fragment, non-rooted) `<img>` target is additionally rewritten to
+/// `/asset?p=<percent-encoded relative path>` — see [`rewrite_local_image_target`]
+/// — so the live view can serve a local image next to the open document
+/// through `GET /asset` (`routes::handle_asset`). `true` for the live
+/// view (`/` and `/body`, both backed by a running server that can answer
+/// `/asset`); `false` for `--export`'s standalone HTML, which has no
+/// server behind it once written and would otherwise embed a link to a
+/// route that doesn't exist. This never touches [`blocks`]/[`anchors`]'
+/// own `source`/`excerpt` — those are computed straight from the
+/// (unrewritten) Markdown source, not from this function's HTML output.
+///
 /// Every top-level block (as split by [`blocks`]) is wrapped in
 /// `<div class="blk" data-kind="block" data-hash="..." data-line-start="..."
 /// data-line-end="..." data-excerpt="...">...</div>` so the review UI can
@@ -155,7 +186,7 @@ pub struct Anchor {
 /// the shared range/hash/excerpt logic this and `to_html` both build on,
 /// and [`render_events_html`] for how the wrapper tags are interleaved with
 /// pulldown-cmark's own rendering.
-pub fn to_html(markdown: &str) -> String {
+pub fn to_html(markdown: &str, rewrite_local_images: bool) -> String {
     let mut html_output = String::new();
     for (range, events) in parsed_blocks(markdown) {
         let (line_start, line_end) = line_range(markdown, &range);
@@ -177,7 +208,11 @@ pub fn to_html(markdown: &str) -> String {
         // `Text`/`Code` content instead, so it can only ever contain what
         // already survived sanitization.
         let raw_events: Vec<Event<'_>> = events.iter().map(|(e, _)| e.clone()).collect();
-        let sanitized_for_excerpt = sanitize_events(raw_events);
+        // `false` here regardless of `rewrite_local_images`: an image's
+        // `dest_url` never shows up in `Text`/`Code` content, so whether it
+        // gets rewritten to `/asset?p=...` can't affect this excerpt either
+        // way — passing the real flag through would be pure noise.
+        let sanitized_for_excerpt = sanitize_events(raw_events, false);
         let excerpt = plain_text_excerpt(&sanitized_for_excerpt);
 
         html_output.push_str("<div class=\"blk\" data-kind=\"block\" data-hash=\"");
@@ -200,7 +235,14 @@ pub fn to_html(markdown: &str) -> String {
         // function handled). See its docs for why that state can't just be
         // recovered from a fresh `push_html` call once a row's cells are
         // rendered separately from `Start(Tag::Table(_))`.
-        render_events_html(markdown, &events, None, 0, &mut html_output);
+        render_events_html(
+            markdown,
+            &events,
+            None,
+            0,
+            rewrite_local_images,
+            &mut html_output,
+        );
 
         html_output.push_str("</div>\n");
     }
@@ -664,6 +706,7 @@ fn render_events_html(
     events: &[(Event<'_>, Range<usize>)],
     alignments: Option<&[Alignment]>,
     depth: u32,
+    rewrite_local_images: bool,
     out: &mut String,
 ) {
     let mut alignment_stack: Vec<Vec<Alignment>> = match alignments {
@@ -696,11 +739,15 @@ fn render_events_html(
             i += 1;
             continue;
         };
-        flush_leaf(events, leaf_start, i, out);
+        flush_leaf(events, leaf_start, i, rewrite_local_images, out);
 
         let span = scan_anchor_span(markdown, events, i, kind);
         let inner = &events[i + 1..span.end_idx];
-        let inner_sanitized = sanitize_events(inner.iter().map(|(e, _)| e.clone()).collect());
+        // `false`: same reasoning as the excerpt pass in `to_html` — an
+        // image's `dest_url` is never part of `Text`/`Code` content, so it
+        // can't affect `data_excerpt` either way.
+        let inner_sanitized =
+            sanitize_events(inner.iter().map(|(e, _)| e.clone()).collect(), false);
         let data_excerpt = match kind {
             AnchorKind::Item => plain_text_excerpt(&inner_sanitized),
             AnchorKind::Row => plain_text_excerpt_row(&inner_sanitized),
@@ -712,7 +759,14 @@ fn render_events_html(
         match kind {
             AnchorKind::Item => {
                 push_anchor_open(out, "li", "item", &span, &data_excerpt);
-                render_events_html(markdown, inner, current_alignments, depth + 1, out);
+                render_events_html(
+                    markdown,
+                    inner,
+                    current_alignments,
+                    depth + 1,
+                    rewrite_local_images,
+                    out,
+                );
                 out.push_str("</li>\n");
             }
             AnchorKind::Row => {
@@ -720,7 +774,13 @@ fn render_events_html(
                     out.push_str("<thead>");
                 }
                 push_anchor_open(out, "tr", "row", &span, &data_excerpt);
-                render_row_cells(inner, current_alignments, is_head, out);
+                render_row_cells(
+                    inner,
+                    current_alignments,
+                    is_head,
+                    rewrite_local_images,
+                    out,
+                );
                 out.push_str("</tr>\n");
                 if is_head {
                     out.push_str("</thead><tbody>\n");
@@ -732,7 +792,7 @@ fn render_events_html(
         i = span.end_idx + 1;
         leaf_start = i;
     }
-    flush_leaf(events, leaf_start, events.len(), out);
+    flush_leaf(events, leaf_start, events.len(), rewrite_local_images, out);
 }
 
 /// Sanitizes and renders `events[start..end]` (a maximal run of events
@@ -754,12 +814,18 @@ fn render_events_html(
 /// never contain `Paragraph` events in the first place), not in
 /// `html::push_html`, so that distinction is unaffected by how many pieces
 /// the event stream ends up rendered in.
-fn flush_leaf(events: &[(Event<'_>, Range<usize>)], start: usize, end: usize, out: &mut String) {
+fn flush_leaf(
+    events: &[(Event<'_>, Range<usize>)],
+    start: usize,
+    end: usize,
+    rewrite_local_images: bool,
+    out: &mut String,
+) {
     if start == end {
         return;
     }
     let slice: Vec<Event<'_>> = events[start..end].iter().map(|(e, _)| e.clone()).collect();
-    let sanitized = sanitize_events(slice);
+    let sanitized = sanitize_events(slice, rewrite_local_images);
     html::push_html(out, sanitized.into_iter());
 }
 
@@ -777,6 +843,7 @@ fn render_row_cells(
     events: &[(Event<'_>, Range<usize>)],
     alignments: Option<&[Alignment]>,
     is_head: bool,
+    rewrite_local_images: bool,
     out: &mut String,
 ) {
     let tag = if is_head { "th" } else { "td" };
@@ -798,7 +865,10 @@ fn render_row_cells(
             _ => out.push('>'),
         }
         let inner: Vec<Event<'_>> = events[i + 1..end].iter().map(|(e, _)| e.clone()).collect();
-        html::push_html(out, sanitize_events(inner).into_iter());
+        html::push_html(
+            out,
+            sanitize_events(inner, rewrite_local_images).into_iter(),
+        );
         out.push_str("</");
         out.push_str(tag);
         out.push('>');
@@ -899,7 +969,16 @@ fn is_code_fence_line(line: &str) -> bool {
 ///   executable/renderable in ways that amount to script injection.
 ///   [`sanitize_link_target`] replaces anything that isn't on a small
 ///   allowlist with `#`.
-fn sanitize_events(events: Vec<Event<'_>>) -> Vec<Event<'_>> {
+///
+///   When `rewrite_local_images` is `true`, an *image* target (never a
+///   link — [`GET /asset`](crate::routes) only ever needs to serve
+///   `<img>` sources) that survives that allowlist and is itself a
+///   relative, scheme-less, non-fragment, non-rooted reference is further
+///   rewritten by [`rewrite_local_image_target`] to
+///   `/asset?p=<percent-encoded path>`, so the live view can request it
+///   from the running server instead of the (nonexistent, in a browser)
+///   local filesystem.
+fn sanitize_events(events: Vec<Event<'_>>, rewrite_local_images: bool) -> Vec<Event<'_>> {
     let mut output = Vec::with_capacity(events.len());
     // While `Some`, we're between a `Start(Tag::HtmlBlock)` and its
     // matching `End`, accumulating every `Html` event's text so the whole
@@ -942,12 +1021,20 @@ fn sanitize_events(events: Vec<Event<'_>>) -> Vec<Event<'_>> {
                 dest_url,
                 title,
                 id,
-            }) => output.push(Event::Start(Tag::Image {
-                link_type,
-                dest_url: sanitize_link_target(dest_url),
-                title,
-                id,
-            })),
+            }) => {
+                let dest_url = sanitize_link_target(dest_url);
+                let dest_url = if rewrite_local_images {
+                    rewrite_local_image_target(dest_url)
+                } else {
+                    dest_url
+                };
+                output.push(Event::Start(Tag::Image {
+                    link_type,
+                    dest_url,
+                    title,
+                    id,
+                }));
+            }
             other => output.push(other),
         }
     }
@@ -1051,6 +1138,79 @@ fn is_safe_link_target(dest_url: &str) -> bool {
     }
 }
 
+/// Whether an already-[`sanitize_link_target`]-approved image `dest_url` is
+/// a *local relative* reference — the kind [`rewrite_local_image_target`]
+/// rewrites to `/asset?p=...` so the live view can serve it from disk next
+/// to the open document. `false` for a same-page fragment (`#...`), a
+/// protocol-relative (`//...`) or root-relative (`/...`) reference — both
+/// caught by the same `starts_with('/')` check — anything carrying a URL
+/// scheme (`http:`, `https:`, `mailto:`, the only schemes that can reach
+/// here at all; [`is_safe_link_target`] already rejected everything else),
+/// or anything with a `..` path segment anywhere in it (leading, like
+/// `../a.png`, or mid-path, like `a/../b.png`): those name a location
+/// *outside* the directory `routes::handle_asset` is willing to serve from,
+/// so rewriting them would only produce a `/asset` request guaranteed to
+/// come back `400` — better to leave the target alone. Left as a bare
+/// relative reference, the browser resolves it against the current page's
+/// own origin, so the CSP's `img-src 'self'` does *not* block the request
+/// (it's same-origin) — what actually stops the file from loading is that
+/// the resolved path is neither `/asset` nor any other route this app
+/// serves, so `routes::handle` answers `404` and nothing is read. None of
+/// these name a file next to the Markdown document on this machine.
+fn is_local_relative_image_target(dest_url: &str) -> bool {
+    if dest_url.starts_with('#') || dest_url.starts_with('/') {
+        return false;
+    }
+    if dest_url.split('/').any(|segment| segment == "..") {
+        return false;
+    }
+    match dest_url.find(':') {
+        // No colon at all: a relative path, not an absolute URL — same
+        // reasoning as the `None` arm of `is_safe_link_target`.
+        None => true,
+        Some(colon_idx) => dest_url[..colon_idx].contains(['/', '?', '#']),
+    }
+}
+
+/// Rewrites `dest_url` (an image target already passed through
+/// [`sanitize_link_target`]) to `/asset?p=<percent-encoded path>` when
+/// [`is_local_relative_image_target`] accepts it, so the live view fetches
+/// it from the running server (`GET /asset`, see `routes::handle_asset`)
+/// instead of a bare relative path the browser has no way to resolve
+/// against a file on disk. Left unchanged otherwise (a fragment, an
+/// absolute path, a remote URL, a `..`-escaping path, or one already
+/// neutralized to `#`) — see [`sanitize_events`]'s docs for when this runs
+/// at all.
+///
+/// A leading `./` is stripped before encoding (`./a.png` -> `p=a.png`,
+/// not `p=./a.png`): `routes::handle_asset` requires the decoded path to
+/// be made up only of `Component::Normal` segments, and `.` is
+/// [`Component::CurDir`], not `Normal` — an unstripped `./a.png` would
+/// round-trip into a request that route always rejects with `400`. If
+/// stripping every leading `./` leaves a path that itself starts with `/`
+/// (`.//a.png` -> `/a.png`), the target is left unchanged instead —
+/// `handle_asset` would reject that too (`Component::RootDir`), so
+/// rewriting it would only trade one always-`400` request for another.
+fn rewrite_local_image_target(dest_url: CowStr<'_>) -> CowStr<'_> {
+    if !is_local_relative_image_target(&dest_url) {
+        return dest_url;
+    }
+    let mut path = dest_url.as_ref();
+    while let Some(rest) = path.strip_prefix("./") {
+        path = rest;
+    }
+    if path.starts_with('/') {
+        // Stripping every leading `./` can still leave a root-relative
+        // path (`.//a.png` -> `/a.png`) that `routes::handle_asset` would
+        // always reject anyway (`Component::RootDir`, not `Normal`) —
+        // give up and leave the original target alone rather than produce
+        // a request guaranteed to `400`.
+        return dest_url;
+    }
+    let encoded = utf8_percent_encode(path, IMAGE_PATH_ENCODE_SET).to_string();
+    CowStr::from(format!("/asset?p={encoded}"))
+}
+
 /// Wraps a rendered body in the full HTML page: doctype, embedded
 /// stylesheet, a strict Content-Security-Policy, and — when `live` is
 /// `Some(version)` — the embedded live-reload script plus a two-pane
@@ -1134,28 +1294,28 @@ mod tests {
 
     #[test]
     fn renders_headings() {
-        let html = to_html("# Title\n\n## Subtitle");
+        let html = to_html("# Title\n\n## Subtitle", false);
         assert!(html.contains("<h1>Title</h1>"));
         assert!(html.contains("<h2>Subtitle</h2>"));
     }
 
     #[test]
     fn renders_emphasis() {
-        let html = to_html("*em* and **strong**");
+        let html = to_html("*em* and **strong**", false);
         assert!(html.contains("<em>em</em>"));
         assert!(html.contains("<strong>strong</strong>"));
     }
 
     #[test]
     fn renders_code_blocks() {
-        let html = to_html("```\nlet x = 1;\n```");
+        let html = to_html("```\nlet x = 1;\n```", false);
         assert!(html.contains("<pre><code>"));
         assert!(html.contains("let x = 1;"));
     }
 
     #[test]
     fn renders_tables() {
-        let html = to_html("| a | b |\n|---|---|\n| 1 | 2 |\n");
+        let html = to_html("| a | b |\n|---|---|\n| 1 | 2 |\n", false);
         assert!(html.contains("<table>"));
         assert!(html.contains("<th>a</th>"));
         assert!(html.contains("<td>1</td>"));
@@ -1163,41 +1323,41 @@ mod tests {
 
     #[test]
     fn renders_strikethrough() {
-        let html = to_html("~~gone~~");
+        let html = to_html("~~gone~~", false);
         assert!(html.contains("<del>gone</del>"));
     }
 
     #[test]
     fn renders_task_lists() {
-        let html = to_html("- [ ] todo\n- [x] done\n");
+        let html = to_html("- [ ] todo\n- [x] done\n", false);
         assert!(html.contains(r#"type="checkbox""#));
         assert!(html.contains("checked"));
     }
 
     #[test]
     fn renders_footnotes() {
-        let html = to_html("Body text[^1].\n\n[^1]: A note.\n");
+        let html = to_html("Body text[^1].\n\n[^1]: A note.\n", false);
         assert!(html.contains("footnote-reference"));
         assert!(html.contains("footnote-definition"));
     }
 
     #[test]
     fn escapes_raw_html_instead_of_passing_it_through() {
-        let html = to_html("<script>alert(1)</script>");
+        let html = to_html("<script>alert(1)</script>", false);
         assert!(html.contains("&lt;script&gt;"));
         assert!(!html.contains("<script>"));
     }
 
     #[test]
     fn escapes_inline_raw_html() {
-        let html = to_html("before <b>bold</b> after");
+        let html = to_html("before <b>bold</b> after", false);
         assert!(html.contains("&lt;b&gt;"));
         assert!(!html.contains("<b>"));
     }
 
     #[test]
     fn discards_html_comments() {
-        let html = to_html("<!-- x -->\n\ntext");
+        let html = to_html("<!-- x -->\n\ntext", false);
         assert!(!html.contains("x -->"));
         assert!(!html.contains("<!--"));
         assert!(html.contains("text"));
@@ -1205,7 +1365,7 @@ mod tests {
 
     #[test]
     fn discards_inline_html_comments() {
-        let html = to_html("before <!-- secret --> after");
+        let html = to_html("before <!-- secret --> after", false);
         assert!(!html.contains("secret"));
         assert!(!html.contains("<!--"));
     }
@@ -1216,7 +1376,7 @@ mod tests {
         // (`<!--\n`, `secret\n`, `-->\n`); a naive per-event
         // "starts with `<!--`" check only catches the first of the three
         // and lets `secret` leak through as escaped text.
-        let html = to_html("<!--\nsecret\n-->\n\ntext");
+        let html = to_html("<!--\nsecret\n-->\n\ntext", false);
         assert!(!html.contains("secret"));
         assert!(!html.contains("<!--"));
         assert!(!html.contains("-->"));
@@ -1228,7 +1388,7 @@ mod tests {
         // The whole line is a single `Html` event here. Dropping any event
         // that merely *starts with* `<!--` would discard "visible" along
         // with the comment.
-        let html = to_html("<!-- secretword --> visible\n");
+        let html = to_html("<!-- secretword --> visible\n", false);
         assert!(!html.contains("secretword"));
         assert!(!html.contains("<!--"));
         assert!(html.contains("visible"));
@@ -1236,7 +1396,7 @@ mod tests {
 
     #[test]
     fn discards_crlf_html_comments() {
-        let html = to_html("<!--\r\nsecret\r\n-->\r\n\r\ntext");
+        let html = to_html("<!--\r\nsecret\r\n-->\r\n\r\ntext", false);
         assert!(!html.contains("secret"));
         assert!(!html.contains("<!--"));
         assert!(html.contains("text"));
@@ -1244,64 +1404,179 @@ mod tests {
 
     #[test]
     fn renders_ordinary_html_blocks_as_escaped_text() {
-        let html = to_html("<div>x</div>\n");
+        let html = to_html("<div>x</div>\n", false);
         assert!(html.contains("&lt;div&gt;x&lt;/div&gt;"));
         assert!(!html.contains("<div>x</div>"));
     }
 
     #[test]
     fn neutralizes_javascript_link_target() {
-        let html = to_html("[x](javascript:alert(1))");
+        let html = to_html("[x](javascript:alert(1))", false);
         assert!(!html.contains("javascript:"));
         assert!(html.contains("href=\"#\""));
     }
 
     #[test]
     fn neutralizes_data_link_target() {
-        let html = to_html("[y](data:text/html,alert(1))");
+        let html = to_html("[y](data:text/html,alert(1))", false);
         assert!(!html.contains("data:"));
         assert!(html.contains("href=\"#\""));
     }
 
     #[test]
     fn neutralizes_javascript_reference_link_target() {
-        let html = to_html("[z][r]\n\n[r]: JaVaScRiPt:alert(1)\n");
+        let html = to_html("[z][r]\n\n[r]: JaVaScRiPt:alert(1)\n", false);
         assert!(!html.to_lowercase().contains("javascript:"));
         assert!(html.contains("href=\"#\""));
     }
 
     #[test]
     fn neutralizes_javascript_image_target() {
-        let html = to_html("![i](javascript:alert(1))");
+        let html = to_html("![i](javascript:alert(1))", false);
         assert!(!html.contains("javascript:"));
         assert!(html.contains("src=\"#\""));
     }
 
+    // -- rewrite_local_images: local image dest_url -> /asset?p=... --------
+
+    #[test]
+    fn rewrites_a_relative_image_target_to_asset_route_when_enabled() {
+        let html = to_html("![x](img.png)", true);
+        assert!(html.contains(r#"src="/asset?p=img.png""#), "{html}");
+    }
+
+    #[test]
+    fn rewrites_a_subdirectory_image_target_preserving_the_path() {
+        let html = to_html("![x](imgs/a.png)", true);
+        assert!(html.contains(r#"src="/asset?p=imgs/a.png""#), "{html}");
+    }
+
+    #[test]
+    fn percent_encodes_special_characters_in_a_rewritten_image_path() {
+        // A raw space in a link/image destination needs the `<...>`
+        // bracketed form in CommonMark; unbracketed, pulldown-cmark
+        // doesn't parse this as an image target at all.
+        let html = to_html("![x](<my image.png>)", true);
+        assert!(html.contains("src=\"/asset?p=my%20image.png\""), "{html}");
+    }
+
+    #[test]
+    fn leaves_relative_image_targets_alone_when_rewriting_is_disabled() {
+        let html = to_html("![x](img.png)", false);
+        assert!(html.contains(r#"src="img.png""#), "{html}");
+        assert!(!html.contains("/asset"), "{html}");
+    }
+
+    #[test]
+    fn does_not_rewrite_a_remote_image_target() {
+        let html = to_html("![x](https://example.com/img.png)", true);
+        assert!(
+            html.contains(r#"src="https://example.com/img.png""#),
+            "{html}"
+        );
+        assert!(!html.contains("/asset"), "{html}");
+    }
+
+    #[test]
+    fn does_not_rewrite_a_root_relative_image_target() {
+        let html = to_html("![x](/etc/passwd)", true);
+        assert!(html.contains(r#"src="/etc/passwd""#), "{html}");
+        assert!(!html.contains("/asset"), "{html}");
+    }
+
+    #[test]
+    fn does_not_rewrite_a_protocol_relative_image_target() {
+        let html = to_html("![x](//evil.example/img.png)", true);
+        assert!(!html.contains("evil.example"), "{html}");
+        assert!(!html.contains("/asset"), "{html}");
+        assert!(html.contains("src=\"#\""), "{html}");
+    }
+
+    #[test]
+    fn does_not_rewrite_a_fragment_image_target() {
+        let html = to_html("![x](#frag)", true);
+        assert!(html.contains("src=\"#frag\""), "{html}");
+        assert!(!html.contains("/asset"), "{html}");
+    }
+
+    #[test]
+    fn a_neutralized_javascript_image_target_is_still_hash_not_asset() {
+        // rewrite_local_images must not run on a target that
+        // sanitize_link_target already replaced with `#` — `#` itself
+        // starts with `#`, so is_local_relative_image_target must reject
+        // it regardless.
+        let html = to_html("![i](javascript:alert(1))", true);
+        assert!(!html.contains("javascript:"));
+        assert!(!html.contains("/asset"), "{html}");
+        assert!(html.contains("src=\"#\""));
+    }
+
+    #[test]
+    fn does_not_rewrite_a_link_target_only_an_image_target() {
+        let html = to_html("[a](img.png)", true);
+        assert!(html.contains(r#"href="img.png""#), "{html}");
+        assert!(!html.contains("/asset"), "{html}");
+    }
+
+    #[test]
+    fn does_not_rewrite_a_parent_directory_escaping_image_target() {
+        let html = to_html("![x](../a.png)", true);
+        assert!(html.contains(r#"src="../a.png""#), "{html}");
+        assert!(!html.contains("/asset"), "{html}");
+    }
+
+    #[test]
+    fn does_not_rewrite_an_image_target_with_a_parent_dir_segment_mid_path() {
+        let html = to_html("![x](a/../b.png)", true);
+        assert!(html.contains(r#"src="a/../b.png""#), "{html}");
+        assert!(!html.contains("/asset"), "{html}");
+    }
+
+    #[test]
+    fn rewrites_a_leading_current_dir_image_target_stripping_the_dot_slash() {
+        let html = to_html("![x](./a.png)", true);
+        assert!(html.contains(r#"src="/asset?p=a.png""#), "{html}");
+    }
+
+    #[test]
+    fn does_not_rewrite_when_stripping_leading_dot_slashes_leaves_a_root_relative_path() {
+        // `.//a.png` has no `..` segment (so `is_local_relative_image_target`
+        // accepts it), but stripping every leading `./` leaves `/a.png` —
+        // root-relative, which `routes::handle_asset` always rejects
+        // (`Component::RootDir`, not `Normal`). Rewriting it would only
+        // produce a request guaranteed to `400`.
+        let html = to_html("![x](.//a.png)", true);
+        assert!(html.contains(r#"src=".//a.png""#), "{html}");
+        assert!(!html.contains("/asset"), "{html}");
+    }
+
     #[test]
     fn neutralizes_link_target_with_surrounding_whitespace_and_mixed_case() {
-        let html = to_html("[w]( JAVASCRIPT:x)");
+        let html = to_html("[w]( JAVASCRIPT:x)", false);
         assert!(!html.to_lowercase().contains("javascript:"));
         assert!(html.contains("href=\"#\""));
     }
 
     #[test]
     fn neutralizes_protocol_relative_link_target() {
-        let html = to_html("[p](//evil.example/x)");
+        let html = to_html("[p](//evil.example/x)", false);
         assert!(!html.contains("evil.example"));
         assert!(html.contains("href=\"#\""));
     }
 
     #[test]
     fn keeps_allowed_link_schemes_and_relative_paths() {
-        assert!(to_html("[a](https://example.com)").contains(r#"href="https://example.com""#));
+        assert!(
+            to_html("[a](https://example.com)", false).contains(r#"href="https://example.com""#)
+        );
 
-        let mailto_html = to_html("[b](mailto:a@example.com)");
+        let mailto_html = to_html("[b](mailto:a@example.com)", false);
         assert!(mailto_html.contains("href=\"mailto:"));
         assert!(!mailto_html.contains("href=\"#\""));
 
-        assert!(to_html("[c](#frag)").contains("href=\"#frag\""));
-        assert!(to_html("[d](./a.md)").contains(r#"href="./a.md""#));
-        assert!(to_html("[e](a/b:c)").contains(r#"href="a/b:c""#));
+        assert!(to_html("[c](#frag)", false).contains("href=\"#frag\""));
+        assert!(to_html("[d](./a.md)", false).contains(r#"href="./a.md""#));
+        assert!(to_html("[e](a/b:c)", false).contains(r#"href="a/b:c""#));
     }
 
     #[test]
@@ -1310,7 +1585,7 @@ mod tests {
         // preserve the internal leading/trailing spaces in `dest_url`; left
         // untrimmed, `escape_href` would percent-encode them (`%20...`)
         // instead of producing a clean `https://example.com` URL.
-        let html = to_html("[r][ref]\n\n[ref]: < https://example.com >\n");
+        let html = to_html("[r][ref]\n\n[ref]: < https://example.com >\n", false);
         assert!(html.contains(r#"href="https://example.com""#));
         assert!(!html.contains("%20"));
     }
@@ -1399,14 +1674,22 @@ mod tests {
     #[test]
     fn page_blocks_remote_images_by_default() {
         let html = page("Doc", "<p>hi</p>", None, false);
-        assert!(html.contains("img-src data:;"));
-        assert!(!html.contains("img-src data: http: https:"));
+        assert!(html.contains("img-src data: 'self';"));
+        assert!(!html.contains("img-src data: 'self' http: https:"));
+    }
+
+    #[test]
+    fn page_img_src_includes_self_by_default_for_local_asset_images() {
+        // `/asset?p=...` (see routes::handle_asset) is same-origin, so
+        // img-src must allow 'self' even when remote images are blocked.
+        let html = page("Doc", "<p>hi</p>", None, false);
+        assert!(html.contains("img-src data: 'self';"));
     }
 
     #[test]
     fn page_allows_remote_images_when_opted_in() {
         let html = page("Doc", "<p>hi</p>", None, true);
-        assert!(html.contains("img-src data: http: https:"));
+        assert!(html.contains("img-src data: 'self' http: https:"));
     }
 
     #[test]
@@ -1608,7 +1891,7 @@ mod tests {
     fn to_html_wraps_every_block_in_a_data_hash_div_matching_blocks() {
         let md = "# H\n\npara\n\n- li\n\n```\ncode\n```\n";
         let expected = blocks(md);
-        let html = to_html(md);
+        let html = to_html(md, false);
 
         let found_hashes = block_level_hashes(&html);
 
@@ -1620,21 +1903,21 @@ mod tests {
 
     #[test]
     fn to_html_still_contains_expected_fragment_content_when_wrapped() {
-        let html = to_html("# Hello\n");
+        let html = to_html("# Hello\n", false);
         assert!(html.contains("<h1>Hello</h1>"));
         assert!(html.contains("class=\"blk\""));
     }
 
     #[test]
     fn to_html_includes_data_line_start_and_data_line_end_attributes() {
-        let html = to_html("# Title\n\nLine 1\nLine 2\nLine 3\n");
+        let html = to_html("# Title\n\nLine 1\nLine 2\nLine 3\n", false);
         assert!(html.contains("data-line-start=\"1\" data-line-end=\"1\""));
         assert!(html.contains("data-line-start=\"3\" data-line-end=\"5\""));
     }
 
     #[test]
     fn to_html_includes_an_escaped_data_excerpt_attribute() {
-        let html = to_html("Has <angle> & amp\n");
+        let html = to_html("Has <angle> & amp\n", false);
         // `<angle>` survives sanitize_events as literal, escaped text
         // (see escapes_inline_raw_html); the excerpt built from that text
         // must itself be HTML-escaped before landing in an attribute value.
@@ -1651,14 +1934,14 @@ mod tests {
         // just in a different attribute, undoing sanitize_events' whole
         // point. The excerpt here must come from sanitized text content
         // only.
-        let html = to_html("[click me](javascript:alert(1))\n");
+        let html = to_html("[click me](javascript:alert(1))\n", false);
         assert!(!html.contains("javascript:"));
         assert!(html.contains("data-excerpt=\"click me\""));
     }
 
     #[test]
     fn data_excerpt_never_leaks_a_discarded_html_comment() {
-        let html = to_html("<!-- secretword --> visible text\n");
+        let html = to_html("<!-- secretword --> visible text\n", false);
         assert!(!html.contains("secretword"));
         assert!(html.contains("data-excerpt=\"visible text\""));
     }
@@ -1724,7 +2007,7 @@ final paragraph
             "no thematic-break block in {expected:#?}"
         );
 
-        let html = to_html(md);
+        let html = to_html(md, false);
         let found_hashes = block_level_hashes(&html);
 
         assert_eq!(found_hashes.len(), expected.len());
@@ -1893,14 +2176,14 @@ final paragraph
 
     #[test]
     fn to_html_wraps_list_items_in_anchor_li_tags() {
-        let html = to_html("- one\n- two\n");
+        let html = to_html("- one\n- two\n", false);
         assert!(html.contains(r#"<li class="anchor" data-kind="item""#));
         assert_eq!(html.matches(r#"<li class="anchor""#).count(), 2);
     }
 
     #[test]
     fn to_html_wraps_table_rows_in_anchor_tr_tags_including_the_header() {
-        let html = to_html("| a | b |\n|---|---|\n| 1 | 2 |\n");
+        let html = to_html("| a | b |\n|---|---|\n| 1 | 2 |\n", false);
         assert!(html.contains(r#"<thead><tr class="anchor" data-kind="row""#));
         assert_eq!(html.matches(r#"<tr class="anchor""#).count(), 2);
         assert!(html.contains("</tr>\n</thead><tbody>\n"));
@@ -1909,7 +2192,7 @@ final paragraph
 
     #[test]
     fn to_html_nested_list_items_each_get_their_own_anchor() {
-        let html = to_html("- outer\n  - middle\n    - inner\n");
+        let html = to_html("- outer\n  - middle\n    - inner\n", false);
         assert_eq!(html.matches(r#"data-kind="item""#).count(), 3);
     }
 
@@ -1937,7 +2220,7 @@ final paragraph
 final paragraph
 ";
         let expected = anchors(md);
-        let html = to_html(md);
+        let html = to_html(md, false);
 
         let found: Vec<(&str, &str)> = html
             .match_indices("data-kind=\"")
@@ -1971,7 +2254,7 @@ final paragraph
         // (rather than replicating pulldown-cmark's own TableCell handling
         // by hand) would default to head state (`<th>` instead of `<td>`)
         // and lose column alignment entirely.
-        let html = to_html("| a | b |\n|:--|--:|\n| 1 | 2 |\n");
+        let html = to_html("| a | b |\n|:--|--:|\n| 1 | 2 |\n", false);
         assert!(html.contains(r#"<td style="text-align: left">1</td>"#));
         assert!(html.contains(r#"<td style="text-align: right">2</td>"#));
         assert!(!html.contains("<th>1</th>"));
@@ -1985,7 +2268,7 @@ final paragraph
         // block whose first event is Start(Tag::BlockQuote), so the old
         // code never captured its alignments at all and every cell lost
         // its text-align styling.
-        let html = to_html("> | a | b |\n> |:--|--:|\n> | 1 | 2 |\n");
+        let html = to_html("> | a | b |\n> |:--|--:|\n> | 1 | 2 |\n", false);
         assert!(
             html.contains(r#"<td style="text-align: left">1</td>"#),
             "{html}"
@@ -1998,7 +2281,7 @@ final paragraph
 
     #[test]
     fn to_html_keeps_table_alignment_for_a_table_nested_inside_a_list_item() {
-        let html = to_html("- item\n\n  | a | b |\n  |:--|--:|\n  | 1 | 2 |\n");
+        let html = to_html("- item\n\n  | a | b |\n  |:--|--:|\n  | 1 | 2 |\n", false);
         assert!(
             html.contains(r#"<td style="text-align: left">1</td>"#),
             "{html}"
@@ -2011,7 +2294,7 @@ final paragraph
 
     #[test]
     fn to_html_task_list_checkboxes_still_render_inside_item_anchors() {
-        let html = to_html("- [ ] todo\n- [x] done\n");
+        let html = to_html("- [ ] todo\n- [x] done\n", false);
         assert!(html.contains(r#"type="checkbox""#));
         assert!(html.contains("checked"));
         assert!(html.contains(r#"<li class="anchor" data-kind="item""#));
@@ -2019,7 +2302,7 @@ final paragraph
 
     #[test]
     fn to_html_item_data_excerpt_strips_the_marker_and_is_escaped() {
-        let html = to_html("- Has <angle> item\n");
+        let html = to_html("- Has <angle> item\n", false);
         assert!(html.contains(r#"data-kind="item""#));
         let marker = "data-excerpt=\"";
         let idx = html.find(marker).expect("a data-excerpt attribute exists");
@@ -2042,7 +2325,7 @@ final paragraph
         // an item's data-excerpt must come from sanitized content, not the
         // raw Markdown source, even though the item is nested inside a
         // list rather than being its own top-level block.
-        let html = to_html("- [click me](javascript:alert(1))\n");
+        let html = to_html("- [click me](javascript:alert(1))\n", false);
         assert!(!html.contains("javascript:"));
         assert!(html.contains(r#"data-kind="item""#));
         assert!(html.contains("data-excerpt=\"click me\""));
@@ -2050,7 +2333,7 @@ final paragraph
 
     #[test]
     fn item_data_excerpt_never_leaks_a_discarded_html_comment() {
-        let html = to_html("- <!-- secretword --> visible text\n");
+        let html = to_html("- <!-- secretword --> visible text\n", false);
         assert!(!html.contains("secretword"));
         assert!(html.contains(r#"data-kind="item""#));
         assert!(html.contains("data-excerpt=\"visible text\""));
@@ -2058,7 +2341,7 @@ final paragraph
 
     #[test]
     fn to_html_row_data_excerpt_joins_cells() {
-        let html = to_html("| 値1 | 値2 |\n|---|---|\n| a | b |\n");
+        let html = to_html("| 値1 | 値2 |\n|---|---|\n| a | b |\n", false);
         assert!(html.contains(r#"data-kind="row""#));
         assert!(html.contains("data-excerpt=\"値1 | 値2\""));
         assert!(html.contains("data-excerpt=\"a | b\""));
@@ -2066,7 +2349,7 @@ final paragraph
 
     #[test]
     fn blk_div_carries_data_kind_block() {
-        let html = to_html("# Title\n");
+        let html = to_html("# Title\n", false);
         assert!(html.contains(r#"<div class="blk" data-kind="block""#));
     }
 
@@ -2198,11 +2481,11 @@ final paragraph
     /// the same `markdown` (same `Options`, same `sanitize_events` pass),
     /// ignoring whitespace-only differences.
     fn assert_to_html_matches_push_html(markdown: &str) {
-        let ours_raw = to_html(markdown);
+        let ours_raw = to_html(markdown, false);
         let ours = strip_all_whitespace(&strip_anchor_wrappers(&ours_raw));
 
         let events: Vec<Event<'_>> = Parser::new_ext(markdown, markdown_options()).collect();
-        let sanitized = sanitize_events(events);
+        let sanitized = sanitize_events(events, false);
         let mut canonical_raw = String::new();
         html::push_html(&mut canonical_raw, sanitized.into_iter());
         let canonical = strip_all_whitespace(&canonical_raw);
@@ -2296,7 +2579,7 @@ final paragraph
             md.push_str("- level\n");
         }
 
-        let html = to_html(&md);
+        let html = to_html(&md, false);
         assert!(!html.is_empty());
         assert!(html.contains("level"));
 

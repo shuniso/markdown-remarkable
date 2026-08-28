@@ -5,3 +5,4 @@
 # Local build/release artifacts must never be committed
 *.zip
 *.exe
+.DS_Store

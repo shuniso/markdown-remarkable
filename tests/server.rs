@@ -520,6 +520,34 @@ fn put_review_with_the_request_header_succeeds_over_raw_http() {
 }
 
 #[test]
+fn head_asset_returns_ok_with_image_content_type_and_csp() {
+    let harness = start_test_server("# Hi\n\n![x](img.png)\n");
+    std::fs::write(harness._dir.path().join("img.png"), b"not-really-a-png")
+        .expect("write image file next to the document");
+
+    let response = raw_request(
+        harness.addr,
+        "HEAD",
+        "/asset?p=img.png",
+        "1.1",
+        Some("127.0.0.1"),
+    );
+    assert!(
+        response.starts_with("HTTP/1.1 200"),
+        "expected 200 for HEAD /asset?p=img.png, got: {response}"
+    );
+    let headers = response_headers(&response);
+    assert!(
+        headers.contains("content-type: image/png"),
+        "missing/incorrect Content-Type on HEAD /asset: {headers}"
+    );
+    assert!(
+        headers.contains("content-security-policy: default-src 'none'; sandbox"),
+        "missing/incorrect CSP on HEAD /asset: {headers}"
+    );
+}
+
+#[test]
 fn put_review_body_over_1_mib_is_413_over_raw_http() {
     let harness = start_test_server("# Hi\n");
     // A JSON body comfortably over the 1 MiB limit.

@@ -904,6 +904,23 @@ fn start_watch(path: &Path, version: &Arc<AtomicU64>) -> Option<RecommendedWatch
     }
 }
 
+/// The path `routes::handle` should route on for `request` — `path` plus
+/// `?query` when there is one, e.g. `/asset?p=img.png`. `Uri::path()` alone
+/// drops the query string entirely; using it directly used to make every
+/// query-string-dependent route (`GET /asset?p=...`, the only one so far)
+/// see no query at all through the native window's custom protocol, so
+/// e.g. `handle_asset` always fell straight to its "missing `p` query
+/// parameter" `400` regardless of what the page actually requested — a
+/// regression the browser server (`server.rs`, which reads `path` straight
+/// off the raw request line, query string included) never had.
+fn request_path(request: &Request<Vec<u8>>) -> &str {
+    request
+        .uri()
+        .path_and_query()
+        .map(|path_and_query| path_and_query.as_str())
+        .unwrap_or("/")
+}
+
 /// The custom-protocol handler shared by every window: looks up
 /// `webview_id` in `registry` (populated by [`create_window`], cleared by
 /// `run` on `CloseRequested`) for that window's current file/version state
@@ -934,7 +951,7 @@ fn protocol_response(
             .expect("static fallback response is valid");
     };
 
-    let path = request.uri().path().to_owned();
+    let path = request_path(&request).to_owned();
     let method = request.method().as_str().to_owned();
     let headers: Vec<(String, String)> = request
         .headers()
@@ -1208,6 +1225,28 @@ fn install_menu(_proxy: &EventLoopProxy<UserEvent>) -> Result<NoMenu> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // `request_path` is what feeds `RouteRequest::path` in
+    // `protocol_response` — see its doc comment for why `Uri::path()` alone
+    // (dropping the query string) made every query-string-dependent route
+    // (`GET /asset?p=...`) see no query at all in the native window.
+    #[test]
+    fn request_path_includes_the_query_string() {
+        let request = Request::builder()
+            .uri("mdview://localhost/asset?p=img.png")
+            .body(Vec::new())
+            .expect("build request");
+        assert_eq!(request_path(&request), "/asset?p=img.png");
+    }
+
+    #[test]
+    fn request_path_without_a_query_string_is_just_the_path() {
+        let request = Request::builder()
+            .uri("mdview://localhost/body")
+            .body(Vec::new())
+            .expect("build request");
+        assert_eq!(request_path(&request), "/body");
+    }
 
     // `is_windows_internal_url` is tested directly against a Windows-shaped
     // prefix regardless of which OS actually built this test binary — see

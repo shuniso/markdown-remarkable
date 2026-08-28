@@ -217,7 +217,7 @@ fn run_browser(file: &Path, port: u16, no_open: bool, allow_remote_images: bool)
 fn export(file: &Path, markdown: &str, out: &Path, allow_remote_images: bool) -> Result<()> {
     ensure_not_same_file(file, out)?;
 
-    let body_html = to_html(markdown);
+    let body_html = to_html(markdown, false);
     let title = file
         .file_name()
         .map(|name| name.to_string_lossy().into_owned())

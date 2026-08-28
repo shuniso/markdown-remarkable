@@ -12,9 +12,9 @@
 use crate::render::{self, page, to_html};
 use crate::review::{self, ReviewDoc};
 use crate::util::file_title;
-use percent_encoding::{utf8_percent_encode, AsciiSet, CONTROLS};
+use percent_encoding::{percent_decode_str, utf8_percent_encode, AsciiSet, CONTROLS};
 use std::fs;
-use std::path::Path;
+use std::path::{Component, Path};
 use std::sync::atomic::{AtomicU64, Ordering};
 
 /// Bytes that must be percent-encoded before a file name can travel in the
@@ -144,10 +144,26 @@ fn has_request_header(req: &RouteRequest) -> bool {
 ///   and a successful write (`500` on I/O failure).
 /// - `POST /export` — requires [`REQUEST_HEADER`], writes
 ///   `<stem>.review.md`, and returns its file name and contents as JSON.
+/// - `GET`/`HEAD /asset?p=<percent-encoded relative path>` — a local image
+///   file next to the open document, for `<img>` targets `render::to_html`
+///   rewrote to this route (`rewrite_local_images: true`, only in effect
+///   for `/`/`/body`, never `--export`). See [`handle_asset`] for the full
+///   set of checks a request has to pass before any file is read. This is
+///   the one route whose response carries its *own*
+///   `Content-Security-Policy: default-src 'none'; sandbox` instead of the
+///   common `frame-ancestors 'none'` below — an image response has no
+///   reason to allow itself to be framed *or* to load anything else at
+///   all, and `sandbox` (with no allowlisted capabilities) is defense in
+///   depth against an `.svg` served here ever being navigated to directly
+///   as a top-level document rather than loaded through `<img>` — it can't
+///   run scripts, submit forms, or open popups even then. `<img>` loading
+///   is unaffected: `sandbox` only restricts a response when it's
+///   navigated to/rendered as its own document.
 /// - anything else — `404`.
 ///
 /// `GET`/`PUT /review` and `POST /export` all answer `409` when `file` is
-/// `None` — there's nothing to review yet.
+/// `None` — there's nothing to review yet. So does `GET`/`HEAD /asset` —
+/// there's no document to resolve a relative path against.
 ///
 /// A read failure (file deleted, permissions changed, etc.) never leaks the
 /// absolute path or OS error text (those go to stderr, same as every other
@@ -163,6 +179,18 @@ pub fn handle(
     allow_remote_images: bool,
 ) -> Reply {
     let route = req.path.split('?').next().unwrap_or("/");
+    if route == "/asset" && matches!(req.method, "GET" | "HEAD") {
+        // Deliberately bypasses the common `Content-Security-Policy:
+        // frame-ancestors 'none'` applied below — `handle_asset`'s own
+        // reply carries a stricter `default-src 'none'; sandbox` instead
+        // (see the route doc above), and adding both would leave two
+        // `Content-Security-Policy` headers on the same response instead
+        // of one.
+        return handle_asset(req, file)
+            .with_header("Cache-Control", "no-store")
+            .with_header("X-Content-Type-Options", "nosniff")
+            .with_header("Content-Security-Policy", "default-src 'none'; sandbox");
+    }
     let reply = match (req.method, route) {
         ("GET", "/") | ("HEAD", "/") => handle_root(file, version, allow_remote_images),
         ("GET", "/version") | ("HEAD", "/version") => handle_version(version),
@@ -351,6 +379,189 @@ fn handle_export(req: &RouteRequest, file: Option<&Path>) -> Reply {
     }
 }
 
+/// File extensions (already lowercased for comparison) `GET /asset` will
+/// serve — see [`handle_asset`]. Deliberately an allowlist, not a
+/// denylist: any extension not on it (`.txt`, `.md`, no extension at all,
+/// ...) is treated the same as a file that doesn't exist (`404`), so this
+/// route can never be used to read an arbitrary file next to the document
+/// regardless of what other checks it passes.
+const ASSET_EXTENSIONS: &[&str] = &[
+    "png", "jpg", "jpeg", "gif", "webp", "bmp", "svg", "avif", "ico",
+];
+
+/// Largest file `GET /asset` will read and return — see [`handle_asset`].
+/// Comfortably larger than any image actually worth inlining in a
+/// Markdown document, while still bounding how much memory/response size
+/// an oversized (accidental or planted) file next to the document can
+/// force onto a single request.
+const ASSET_MAX_BYTES: u64 = 20 * 1024 * 1024;
+
+/// The directory `GET /asset` resolves its `p` query value against —
+/// `md_path`'s parent, falling back to `.` (the current directory) when
+/// that parent is empty. `Path::parent()` on a bare relative file name
+/// with no directory components at all (e.g. `doc.md`, from `mdview
+/// doc.md` run in that file's own directory) returns `Some("")`, not
+/// `None` and not `.` — and `Path::new("").canonicalize()` fails with
+/// `ENOENT` rather than resolving to the current directory the way a
+/// shell would treat a bare file name. Left unhandled, that used to make
+/// every `/asset` request `404` whenever mdview was opened this way. Same
+/// fallback `main::ensure_not_same_file` uses, for the same reason.
+fn asset_parent_dir(md_path: &Path) -> &Path {
+    md_path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."))
+}
+
+/// `GET /asset?p=<percent-encoded relative path>`: serves a local image
+/// file from next to the currently-open Markdown document. The one route
+/// in this module that reads a file other than the document itself or its
+/// review sidecar — see `docs/SECURITY.md`'s "読み取りの範囲" for the
+/// resulting guarantee this has to uphold.
+///
+/// Every one of the following must hold, checked in this order, before any
+/// file is touched:
+/// - `file` is `Some` — `409` otherwise (nothing to resolve a relative
+///   path against).
+/// - The query string carries a `p` parameter, and percent-decoding its
+///   value succeeds as UTF-8 — `400` otherwise.
+/// - The decoded value, parsed as a [`Path`], is made up *only* of
+///   [`Component::Normal`] segments — no `..` ([`Component::ParentDir`]),
+///   no absolute root ([`Component::RootDir`]), no Windows drive prefix
+///   ([`Component::Prefix`]), no bare `.` ([`Component::CurDir`]), and not
+///   empty. `400` otherwise — this rejects `p=../secret`, `p=/etc/hosts`,
+///   and (since decoding already happened) `p=%2e%2e%2fsecret` alike.
+/// - Its extension, lowercased, is on [`ASSET_EXTENSIONS`] — `404`
+///   otherwise, the same status a nonexistent file would get, so this
+///   can't be used to distinguish "wrong extension" from "no such file".
+/// - Joining it onto the document's parent directory and calling
+///   `canonicalize()` on both succeeds, *and* the joined path's
+///   canonical form has the parent directory's own canonical form as a
+///   prefix — `404` on either failure. This is what actually blocks a
+///   symlink planted inside the allowed directory from resolving to a
+///   target *outside* it; the `Component::Normal` check above can't catch
+///   that by itself.
+/// - Its metadata is readable and `len() <= ASSET_MAX_BYTES` — `413` if
+///   larger.
+///
+/// A read failure past all of the above (deleted between the metadata
+/// check and the read, permissions changed, ...) is `404` — the OS error
+/// and path go to stderr only, never the response body, same as every
+/// other read failure in this module.
+///
+/// On success: `200`, the file's raw bytes, and `Content-Type` derived
+/// from its extension (`image/svg+xml` for `.svg`; the obvious `image/*`
+/// MIME type for every other allowed extension). The
+/// `Content-Security-Policy: default-src 'none'; sandbox` this response
+/// needs instead of the common `frame-ancestors 'none'` is applied by the
+/// caller ([`handle`]), not here.
+fn handle_asset(req: &RouteRequest, file: Option<&Path>) -> Reply {
+    let Some(md_path) = file else {
+        return no_file_open();
+    };
+    let parent = asset_parent_dir(md_path);
+
+    let query = req.path.split_once('?').map(|(_, q)| q).unwrap_or("");
+    let Some(raw_p) = query_param(query, "p") else {
+        return error_json(400, "missing p query parameter");
+    };
+    let Ok(decoded) = percent_decode_str(raw_p).decode_utf8() else {
+        return error_json(400, "invalid p query parameter");
+    };
+    let rel_path = Path::new(decoded.as_ref());
+    if !is_plain_relative_path(rel_path) {
+        return error_json(400, "invalid path");
+    }
+
+    let extension_allowed = rel_path
+        .extension()
+        .and_then(|ext| ext.to_str())
+        .is_some_and(|ext| ASSET_EXTENSIONS.contains(&ext.to_ascii_lowercase().as_str()));
+    if !extension_allowed {
+        return Reply::text(404, "404 Not Found");
+    }
+
+    let Ok(parent_canonical) = parent.canonicalize() else {
+        return Reply::text(404, "404 Not Found");
+    };
+    let Ok(candidate_canonical) = parent.join(rel_path).canonicalize() else {
+        return Reply::text(404, "404 Not Found");
+    };
+    if !candidate_canonical.starts_with(&parent_canonical) {
+        return Reply::text(404, "404 Not Found");
+    }
+
+    let metadata = match fs::metadata(&candidate_canonical) {
+        Ok(metadata) => metadata,
+        Err(err) => {
+            eprintln!("warning: failed to stat asset file: {err}");
+            return Reply::text(404, "404 Not Found");
+        }
+    };
+    if metadata.len() > ASSET_MAX_BYTES {
+        return Reply::text(413, "413 Payload Too Large");
+    }
+
+    match fs::read(&candidate_canonical) {
+        Ok(body) => Reply {
+            status: 200,
+            content_type: asset_content_type(rel_path),
+            headers: Vec::new(),
+            body,
+        },
+        Err(err) => {
+            eprintln!("warning: failed to read asset file: {err}");
+            Reply::text(404, "404 Not Found")
+        }
+    }
+}
+
+/// `true` if `path` is a non-empty relative reference with no `..`,
+/// absolute root, drive prefix, or `.` component anywhere in it — see
+/// [`handle_asset`].
+fn is_plain_relative_path(path: &Path) -> bool {
+    !path.as_os_str().is_empty()
+        && path
+            .components()
+            .all(|component| matches!(component, Component::Normal(_)))
+}
+
+/// The `Content-Type` for an asset whose extension already passed
+/// [`ASSET_EXTENSIONS`] — every arm here is one of those extensions, so
+/// the fallback is unreachable in practice but kept rather than panicking
+/// on a future extension added to the allowlist without a matching arm
+/// here.
+fn asset_content_type(path: &Path) -> &'static str {
+    let extension = path
+        .extension()
+        .and_then(|ext| ext.to_str())
+        .map(|ext| ext.to_ascii_lowercase())
+        .unwrap_or_default();
+    match extension.as_str() {
+        "png" => "image/png",
+        "jpg" | "jpeg" => "image/jpeg",
+        "gif" => "image/gif",
+        "webp" => "image/webp",
+        "bmp" => "image/bmp",
+        "svg" => "image/svg+xml",
+        "avif" => "image/avif",
+        "ico" => "image/x-icon",
+        _ => "application/octet-stream",
+    }
+}
+
+/// Extracts `name`'s raw (still percent-encoded) value from a query
+/// string — the substring of `req.path` after `?`, e.g. `p=img.png`.
+/// `None` if `name` doesn't appear. Only the first occurrence is
+/// returned; nothing in this module relies on a query string carrying the
+/// same key twice.
+fn query_param<'a>(query: &'a str, name: &str) -> Option<&'a str> {
+    query.split('&').find_map(|pair| {
+        let (key, value) = pair.split_once('=')?;
+        (key == name).then_some(value)
+    })
+}
+
 fn no_file_open() -> Reply {
     error_json(409, "no file open")
 }
@@ -392,7 +603,7 @@ fn handle_version(version: &AtomicU64) -> Reply {
 fn read_and_render(path: &Path) -> Result<(String, String), String> {
     let title = file_title(path);
     match fs::read_to_string(path) {
-        Ok(markdown) => Ok((title, to_html(&markdown))),
+        Ok(markdown) => Ok((title, to_html(&markdown, true))),
         Err(err) => {
             eprintln!("warning: failed to read {}: {err}", path.display());
             Err(title)
@@ -969,5 +1180,234 @@ mod tests {
             .unwrap()
             .starts_with("# Review: notes.md"));
         assert!(dir.path().join("notes.review.md").exists());
+    }
+
+    // -- /asset -----------------------------------------------------------
+
+    #[test]
+    fn asset_parent_dir_falls_back_to_current_dir_for_a_bare_relative_file_name() {
+        // `Path::new("doc.md").parent()` is `Some("")`, not `None` and not
+        // `.` — `"".canonicalize()` fails with `ENOENT`, which used to make
+        // every `/asset` request 404 whenever mdview was opened with a bare
+        // relative file name (e.g. `mdview doc.md` from that file's own
+        // directory) instead of an absolute/directory-qualified path.
+        assert_eq!(asset_parent_dir(Path::new("doc.md")), Path::new("."));
+    }
+
+    #[test]
+    fn asset_parent_dir_uses_the_real_parent_when_there_is_one() {
+        assert_eq!(
+            asset_parent_dir(Path::new("/tmp/x/doc.md")),
+            Path::new("/tmp/x")
+        );
+        assert_eq!(
+            asset_parent_dir(Path::new("subdir/doc.md")),
+            Path::new("subdir")
+        );
+    }
+
+    #[test]
+    fn asset_serves_a_local_image_next_to_the_document() {
+        let dir = tempfile::tempdir().expect("create tempdir");
+        let file_path = dir.path().join("doc.md");
+        std::fs::write(&file_path, "# Hi\n").expect("write markdown file");
+        std::fs::write(dir.path().join("img.png"), b"not-really-a-png").expect("write image");
+        let version = AtomicU64::new(0);
+
+        let reply = handle(&get("/asset?p=img.png"), Some(&file_path), &version, false);
+
+        assert_eq!(reply.status, 200);
+        assert_eq!(reply.content_type, "image/png");
+        assert_eq!(reply.body, b"not-really-a-png");
+        assert_eq!(
+            header(&reply, "Content-Security-Policy"),
+            Some("default-src 'none'; sandbox")
+        );
+        assert_eq!(header(&reply, "Cache-Control"), Some("no-store"));
+        assert_eq!(header(&reply, "X-Content-Type-Options"), Some("nosniff"));
+        // The common `frame-ancestors 'none'` CSP every other route gets
+        // must not also be present alongside asset's own stricter one.
+        assert_eq!(
+            reply
+                .headers
+                .iter()
+                .filter(|(name, _)| name.eq_ignore_ascii_case("Content-Security-Policy"))
+                .count(),
+            1
+        );
+    }
+
+    #[test]
+    fn asset_serves_an_image_in_a_subdirectory() {
+        let dir = tempfile::tempdir().expect("create tempdir");
+        let file_path = dir.path().join("doc.md");
+        std::fs::write(&file_path, "# Hi\n").expect("write markdown file");
+        std::fs::create_dir(dir.path().join("imgs")).expect("create subdir");
+        std::fs::write(dir.path().join("imgs").join("a.png"), b"sub-image").expect("write image");
+        let version = AtomicU64::new(0);
+
+        let reply = handle(
+            &get("/asset?p=imgs/a.png"),
+            Some(&file_path),
+            &version,
+            false,
+        );
+
+        assert_eq!(reply.status, 200);
+        assert_eq!(reply.content_type, "image/png");
+        assert_eq!(reply.body, b"sub-image");
+    }
+
+    #[test]
+    fn asset_rejects_a_parent_directory_escape() {
+        let dir = tempfile::tempdir().expect("create tempdir");
+        let file_path = dir.path().join("doc.md");
+        std::fs::write(&file_path, "# Hi\n").expect("write markdown file");
+        let version = AtomicU64::new(0);
+
+        let reply = handle(
+            &get("/asset?p=../secret.txt"),
+            Some(&file_path),
+            &version,
+            false,
+        );
+        assert_eq!(reply.status, 400);
+    }
+
+    #[test]
+    fn asset_rejects_an_absolute_path() {
+        let dir = tempfile::tempdir().expect("create tempdir");
+        let file_path = dir.path().join("doc.md");
+        std::fs::write(&file_path, "# Hi\n").expect("write markdown file");
+        let version = AtomicU64::new(0);
+
+        let reply = handle(
+            &get("/asset?p=/etc/hosts"),
+            Some(&file_path),
+            &version,
+            false,
+        );
+        assert_eq!(reply.status, 400);
+    }
+
+    #[test]
+    fn asset_rejects_a_percent_encoded_parent_directory_escape() {
+        let dir = tempfile::tempdir().expect("create tempdir");
+        let file_path = dir.path().join("doc.md");
+        std::fs::write(&file_path, "# Hi\n").expect("write markdown file");
+        let version = AtomicU64::new(0);
+
+        // `%2e%2e%2fsecret` decodes to `../secret` — the rejection has to
+        // happen on the *decoded* path, not the raw query text.
+        let reply = handle(
+            &get("/asset?p=%2e%2e%2fsecret"),
+            Some(&file_path),
+            &version,
+            false,
+        );
+        assert_eq!(reply.status, 400);
+    }
+
+    #[test]
+    fn asset_rejects_a_disallowed_extension() {
+        let dir = tempfile::tempdir().expect("create tempdir");
+        let file_path = dir.path().join("doc.md");
+        std::fs::write(&file_path, "# Hi\n").expect("write markdown file");
+        std::fs::write(dir.path().join("note.txt"), b"hello").expect("write file");
+        let version = AtomicU64::new(0);
+
+        let reply = handle(&get("/asset?p=note.txt"), Some(&file_path), &version, false);
+        assert_eq!(reply.status, 404);
+    }
+
+    #[test]
+    fn asset_for_a_nonexistent_file_is_404() {
+        let dir = tempfile::tempdir().expect("create tempdir");
+        let file_path = dir.path().join("doc.md");
+        std::fs::write(&file_path, "# Hi\n").expect("write markdown file");
+        let version = AtomicU64::new(0);
+
+        let reply = handle(
+            &get("/asset?p=missing.png"),
+            Some(&file_path),
+            &version,
+            false,
+        );
+        assert_eq!(reply.status, 404);
+    }
+
+    #[test]
+    fn asset_with_no_file_open_is_409() {
+        let version = AtomicU64::new(0);
+        let reply = handle(&get("/asset?p=img.png"), None, &version, false);
+        assert_eq!(reply.status, 409);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn asset_rejects_a_symlink_that_escapes_the_document_directory() {
+        let dir = tempfile::tempdir().expect("create tempdir");
+        let file_path = dir.path().join("doc.md");
+        std::fs::write(&file_path, "# Hi\n").expect("write markdown file");
+
+        let outside = tempfile::tempdir().expect("create outside tempdir");
+        let secret = outside.path().join("secret.png");
+        std::fs::write(&secret, b"outside-bytes").expect("write outside file");
+
+        let link_path = dir.path().join("escape.png");
+        std::os::unix::fs::symlink(&secret, &link_path).expect("create symlink");
+
+        let version = AtomicU64::new(0);
+        let reply = handle(
+            &get("/asset?p=escape.png"),
+            Some(&file_path),
+            &version,
+            false,
+        );
+        assert_eq!(reply.status, 404);
+    }
+
+    #[test]
+    fn asset_over_the_size_limit_is_413() {
+        let dir = tempfile::tempdir().expect("create tempdir");
+        let file_path = dir.path().join("doc.md");
+        std::fs::write(&file_path, "# Hi\n").expect("write markdown file");
+        let big = vec![0u8; ASSET_MAX_BYTES as usize + 1];
+        std::fs::write(dir.path().join("big.png"), &big).expect("write big image");
+        let version = AtomicU64::new(0);
+
+        let reply = handle(&get("/asset?p=big.png"), Some(&file_path), &version, false);
+        assert_eq!(reply.status, 413);
+    }
+
+    #[test]
+    fn asset_content_type_covers_every_allowed_extension() {
+        let dir = tempfile::tempdir().expect("create tempdir");
+        let file_path = dir.path().join("doc.md");
+        std::fs::write(&file_path, "# Hi\n").expect("write markdown file");
+        let version = AtomicU64::new(0);
+
+        let cases = [
+            ("a.png", "image/png"),
+            ("a.jpg", "image/jpeg"),
+            ("a.jpeg", "image/jpeg"),
+            ("a.gif", "image/gif"),
+            ("a.webp", "image/webp"),
+            ("a.bmp", "image/bmp"),
+            ("a.svg", "image/svg+xml"),
+            ("a.avif", "image/avif"),
+            ("a.ico", "image/x-icon"),
+        ];
+        for (name, expected_type) in cases {
+            std::fs::write(dir.path().join(name), b"data").expect("write image");
+            let reply = handle(
+                &get(&format!("/asset?p={name}")),
+                Some(&file_path),
+                &version,
+                false,
+            );
+            assert_eq!(reply.status, 200, "{name}");
+            assert_eq!(reply.content_type, expected_type, "{name}");
+        }
     }
 }
