@@ -264,8 +264,12 @@ body {
   user-select: none;
 }
 
+/* `#splitter`/`#tree-splitter` (ids), not the shared `.splitter` class —
+   there are two splitters now (this one, between the doc and the review
+   pane, and the tree pane's own — see the tree-pane section below), and a
+   bare `.splitter` here would hide both whenever either pane collapses. */
 .layout.review-collapsed .review,
-.layout.review-collapsed .splitter {
+.layout.review-collapsed #splitter {
   display: none;
 }
 
@@ -301,6 +305,170 @@ body {
 
 .review-collapse-tab:hover {
   background-color: var(--md-review-bg);
+}
+
+/* -- File tree pane (assets/tree.js) ------------------------------------ */
+
+.tree {
+  /* Overridden inline (assets/tree.js) from the persisted mdview.tree.width
+     — this is just the first-paint default. */
+  width: 240px;
+  flex: 0 0 auto;
+  border-right: 1px solid var(--md-border);
+  overflow-y: auto;
+  position: sticky;
+  top: 0;
+  height: 100vh;
+  padding: 0.5rem;
+  background-color: var(--md-bg);
+  font-family:
+    -apple-system, BlinkMacSystemFont, "Segoe UI", "Noto Sans", Helvetica,
+    Arial, sans-serif, "Apple Color Emoji", "Segoe UI Emoji";
+  font-size: 0.85rem;
+  line-height: 1.5;
+}
+
+/* `#tree`/`#tree-splitter` (ids), same reasoning as `.layout.review-
+   collapsed` above — `.tree`'s own splitter must stay put while the review
+   pane collapses (and vice versa), so neither rule can key off the shared
+   `.splitter` class alone. */
+.layout.tree-collapsed .tree,
+.layout.tree-collapsed #tree-splitter {
+  display: none;
+}
+
+.tree-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 0.5rem;
+  padding: 0.15em 0.4em 0.6em;
+  margin-bottom: 0.4em;
+  border-bottom: 1px solid var(--md-border);
+  font-weight: 600;
+}
+
+.tree-root-name {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  color: var(--md-muted);
+  font-size: 0.8em;
+}
+
+.tree-collapse-btn {
+  flex: 0 0 auto;
+  font: inherit;
+  font-size: 0.8em;
+  color: inherit;
+  background-color: var(--md-review-bg);
+  border: 1px solid var(--md-border);
+  border-radius: 6px;
+  padding: 0.2em 0.55em;
+  line-height: 1;
+  cursor: pointer;
+}
+
+.tree-collapse-btn:hover {
+  background-color: var(--md-border);
+}
+
+.tree-collapse-tab {
+  position: fixed;
+  top: 0;
+  left: 0;
+  /* rem, not px — see .splitter above. */
+  width: 1.75rem;
+  height: 100vh;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 0.4em;
+  border: 0;
+  border-right: 1px solid var(--md-border);
+  background-color: var(--md-bg);
+  color: var(--md-muted);
+  cursor: pointer;
+  writing-mode: vertical-rl;
+  transform: rotate(180deg);
+  font: inherit;
+  font-size: 0.75rem;
+  font-weight: 600;
+  letter-spacing: 0.02em;
+  z-index: 10;
+}
+
+.tree-collapse-tab:hover {
+  background-color: var(--md-review-bg);
+}
+
+.tree-placeholder {
+  color: var(--md-muted);
+  padding: 0.3em 0.4em;
+}
+
+.tree-error {
+  padding: 0.4em 0.6em;
+  margin-bottom: 0.5em;
+  border-radius: 6px;
+  background-color: color-mix(in srgb, var(--md-danger) 15%, var(--md-bg));
+  color: var(--md-danger);
+  font-size: 0.85em;
+}
+
+.tree-truncated {
+  margin-top: 0.4em;
+  padding: 0.3em 0.4em;
+  color: var(--md-muted);
+  font-size: 0.75rem;
+}
+
+.tree-list {
+  display: flex;
+  flex-direction: column;
+}
+
+.tree-item {
+  display: flex;
+  align-items: center;
+  gap: 0.3em;
+  padding: 0.2em 0.4em;
+  border-radius: 6px;
+  cursor: pointer;
+  white-space: nowrap;
+  overflow: hidden;
+}
+
+.tree-item:hover {
+  background-color: var(--md-review-bg);
+}
+
+.tree-item.tree-current {
+  background-color: var(--md-review-bg);
+  color: var(--md-accent);
+  font-weight: 600;
+}
+
+.tree-toggle {
+  flex: 0 0 auto;
+  width: 1em;
+  text-align: center;
+  color: var(--md-muted);
+  transition: transform 0.1s ease;
+}
+
+.tree-dir.collapsed .tree-toggle {
+  transform: rotate(-90deg);
+}
+
+.tree-spacer {
+  flex: 0 0 auto;
+  width: 1em;
+}
+
+.tree-name {
+  overflow: hidden;
+  text-overflow: ellipsis;
 }
 
 /* -- Block markers (.blk wraps every top-level block; data-hash/-count

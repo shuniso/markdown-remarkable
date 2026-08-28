@@ -96,7 +96,27 @@ fn handle_request(
                 headers: &headers,
                 body: &body,
             };
-            let reply = routes::handle(&route_request, Some(path), version, allow_remote_images);
+            // `allow_open: false` — `--browser` serves exactly one file for
+            // its whole run (there's no second window to switch between, the
+            // way the native app has), so `PUT /open` always answers `501`
+            // here regardless of what it's asked to switch to. See
+            // `routes::handle_open`'s docs. `root_dir: None` — `--browser`
+            // has no window/root concept of its own, so `GET /tree` falls
+            // back to `asset_parent_dir(path)`, which never changes anyway
+            // since `path` is fixed for this process's whole run.
+            let (reply, action) = routes::handle(
+                &route_request,
+                Some(path),
+                version,
+                allow_remote_images,
+                false,
+                None,
+            );
+            debug_assert!(
+                matches!(action, routes::Action::None),
+                "--browser must never receive an Action — allow_open is always false here, \
+                 so routes::handle_open can never return Action::OpenFile"
+            );
             send_reply(request, reply)
         }
         _ => request

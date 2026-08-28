@@ -548,6 +548,46 @@ fn head_asset_returns_ok_with_image_content_type_and_csp() {
 }
 
 #[test]
+fn get_tree_returns_the_file_tree_as_json() {
+    let harness = start_test_server("# Hi\n");
+    std::fs::write(harness._dir.path().join("b.md"), "# B\n").expect("write sibling markdown file");
+
+    let response = raw_get(harness.addr, "/tree");
+    assert!(
+        response.starts_with("HTTP/1.1 200"),
+        "expected 200 for GET /tree, got: {response}"
+    );
+    let headers = response_headers(&response);
+    assert!(
+        headers.contains("content-type: application/json; charset=utf-8"),
+        "missing/incorrect Content-Type on GET /tree: {headers}"
+    );
+    let body = response_body(&response);
+    assert!(body.contains(r#""current":"doc.md""#), "{body}");
+    assert!(body.contains(r#""name":"b.md""#), "{body}");
+}
+
+#[test]
+fn put_open_is_501_in_browser_mode() {
+    let harness = start_test_server("# Hi\n");
+    std::fs::write(harness._dir.path().join("b.md"), "# B\n").expect("write sibling markdown file");
+    let body = br#"{"path":"b.md"}"#;
+
+    let response = raw_request_with_body(
+        harness.addr,
+        "PUT",
+        "/open",
+        &[("X-Mdview-Request", "1")],
+        body,
+    );
+    let response = String::from_utf8_lossy(&response);
+    assert!(
+        response.starts_with("HTTP/1.1 501"),
+        "expected 501 for PUT /open in --browser mode, got: {response}"
+    );
+}
+
+#[test]
 fn put_review_body_over_1_mib_is_413_over_raw_http() {
     let harness = start_test_server("# Hi\n");
     // A JSON body comfortably over the 1 MiB limit.

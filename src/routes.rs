@@ -13,8 +13,9 @@ use crate::render::{self, page, to_html};
 use crate::review::{self, ReviewDoc};
 use crate::util::file_title;
 use percent_encoding::{percent_decode_str, utf8_percent_encode, AsciiSet, CONTROLS};
+use serde::Deserialize;
 use std::fs;
-use std::path::{Component, Path};
+use std::path::{Component, Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 
 /// Bytes that must be percent-encoded before a file name can travel in the
@@ -92,6 +93,25 @@ fn error_json(status: u16, message: &str) -> Reply {
     Reply::json(status, serde_json::json!({ "error": message }))
 }
 
+/// A side effect [`handle`] wants its caller to perform beyond sending the
+/// returned [`Reply`] — today, only "switch the currently-viewed file to
+/// this path" (`PUT /open`, see [`handle_open`]). `handle` itself never
+/// touches any window/server state to make that happen; each caller
+/// (`server.rs`, `app.rs`) applies it in its own way — `server.rs` never
+/// actually receives `OpenFile` in practice (`allow_open: false` makes
+/// `handle_open` answer `501` before ever returning one), while `app.rs`
+/// swaps the owning window's file, re-points its watcher, bumps its
+/// version, updates its title, and reloads the WebView.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Action {
+    /// Nothing beyond the `Reply` itself — every route except a successful
+    /// `PUT /open`.
+    None,
+    /// Switch the current window's file to this (already canonicalized)
+    /// path.
+    OpenFile(PathBuf),
+}
+
 /// A routing request: transport-agnostic method/path/headers/body, built by
 /// each caller (`server.rs` from a `tiny_http::Request`, `app.rs` from a
 /// `wry`/`http::Request`) and handed to [`handle`].
@@ -159,11 +179,39 @@ fn has_request_header(req: &RouteRequest) -> bool {
 ///   run scripts, submit forms, or open popups even then. `<img>` loading
 ///   is unaffected: `sandbox` only restricts a response when it's
 ///   navigated to/rendered as its own document.
+/// - `GET /tree` — the file tree rooted at `root_dir` (the *window's own*
+///   fixed root — see [`handle_tree`] and the "root_dir" section of the
+///   file-tree design doc for why this is not simply `asset_parent_dir(file)`
+///   any more).
+/// - `PUT /open` — switches the currently-viewed file to a `.md`/
+///   `.markdown` file named by a JSON body, within `root_dir`'s scope.
+///   `allow_open` gates this entirely: `false` (the browser server,
+///   `server.rs`) always answers `501` — there's no second window to switch
+///   there, so the CLI's own FILE argument stays authoritative for the life
+///   of the process. `true` (the native app, `app.rs`) applies the switch
+///   to *this* WebView's window via the returned [`Action::OpenFile`]. See
+///   [`handle_open`].
 /// - anything else — `404`.
 ///
+/// `root_dir`, when `Some`, is the directory `GET /tree`/`PUT /open` treat
+/// as their read/switch boundary — the *window's* fixed root (its very
+/// first file's parent, established once and never moved by a later
+/// switch — see `app.rs`'s `WindowCtx::root_dir`), not
+/// `asset_parent_dir(file)` (which would drift every time the current file
+/// changes, making "switch to a subfolder, then switch back" impossible —
+/// see the file-tree design doc). `None` (always passed by `server.rs`,
+/// which has no window/root concept of its own) falls back to
+/// `asset_parent_dir(file)` for both routes, same as before `root_dir`
+/// existed. `GET`/`HEAD /asset` deliberately keeps using
+/// `asset_parent_dir(file)` directly regardless of `root_dir` — an image's
+/// `src="…"` is a relative reference resolved against the *document
+/// currently rendering it*, not the window's root, so switching files must
+/// keep resolving images against whichever file is open right now.
+///
 /// `GET`/`PUT /review` and `POST /export` all answer `409` when `file` is
-/// `None` — there's nothing to review yet. So does `GET`/`HEAD /asset` —
-/// there's no document to resolve a relative path against.
+/// `None` — there's nothing to review yet. So does `GET`/`HEAD /asset` and
+/// `GET /tree`/`PUT /open` — there's no document to resolve a relative path
+/// against.
 ///
 /// A read failure (file deleted, permissions changed, etc.) never leaks the
 /// absolute path or OS error text (those go to stderr, same as every other
@@ -172,12 +220,19 @@ fn has_request_header(req: &RouteRequest) -> bool {
 /// own once the file is readable again; `/body` answers `200` with an
 /// error fragment for the same reason (the script treats a non-200 `/body`
 /// as "reload the whole page").
+///
+/// Returns `(Reply, Action)` rather than a bare `Reply`: routing never
+/// mutates any window/server state itself (see the module docs), so a
+/// route that needs to (only `PUT /open` today) hands its request back as
+/// an [`Action`] for the caller to apply in its own way instead.
 pub fn handle(
     req: &RouteRequest,
     file: Option<&Path>,
     version: &AtomicU64,
     allow_remote_images: bool,
-) -> Reply {
+    allow_open: bool,
+    root_dir: Option<&Path>,
+) -> (Reply, Action) {
     let route = req.path.split('?').next().unwrap_or("/");
     if route == "/asset" && matches!(req.method, "GET" | "HEAD") {
         // Deliberately bypasses the common `Content-Security-Policy:
@@ -186,24 +241,33 @@ pub fn handle(
         // (see the route doc above), and adding both would leave two
         // `Content-Security-Policy` headers on the same response instead
         // of one.
-        return handle_asset(req, file)
+        let reply = handle_asset(req, file)
             .with_header("Cache-Control", "no-store")
             .with_header("X-Content-Type-Options", "nosniff")
             .with_header("Content-Security-Policy", "default-src 'none'; sandbox");
+        return (reply, Action::None);
     }
-    let reply = match (req.method, route) {
-        ("GET", "/") | ("HEAD", "/") => handle_root(file, version, allow_remote_images),
-        ("GET", "/version") | ("HEAD", "/version") => handle_version(version),
-        ("GET", "/body") | ("HEAD", "/body") => handle_body(file),
-        ("GET", "/review") => handle_get_review(file),
-        ("PUT", "/review") => handle_put_review(req, file),
-        ("POST", "/export") => handle_export(req, file),
-        _ => Reply::text(404, "404 Not Found"),
+    let (reply, action) = match (req.method, route) {
+        ("GET", "/") | ("HEAD", "/") => (
+            handle_root(file, version, allow_remote_images),
+            Action::None,
+        ),
+        ("GET", "/version") | ("HEAD", "/version") => (handle_version(version), Action::None),
+        ("GET", "/body") | ("HEAD", "/body") => (handle_body(file), Action::None),
+        ("GET", "/review") => (handle_get_review(file), Action::None),
+        ("PUT", "/review") => (handle_put_review(req, file), Action::None),
+        ("POST", "/export") => (handle_export(req, file), Action::None),
+        ("GET", "/tree") => (handle_tree(file, root_dir), Action::None),
+        ("PUT", "/open") => handle_open(req, file, allow_open, root_dir),
+        _ => (Reply::text(404, "404 Not Found"), Action::None),
     };
-    reply
-        .with_header("Cache-Control", "no-store")
-        .with_header("X-Content-Type-Options", "nosniff")
-        .with_header("Content-Security-Policy", "frame-ancestors 'none'")
+    (
+        reply
+            .with_header("Cache-Control", "no-store")
+            .with_header("X-Content-Type-Options", "nosniff")
+            .with_header("Content-Security-Policy", "frame-ancestors 'none'"),
+        action,
+    )
 }
 
 fn handle_root(file: Option<&Path>, version: &AtomicU64, allow_remote_images: bool) -> Reply {
@@ -379,6 +443,495 @@ fn handle_export(req: &RouteRequest, file: Option<&Path>) -> Reply {
     }
 }
 
+/// Maximum directory depth [`handle_tree`] walks below the open document's
+/// parent directory. `0` is the parent directory's own direct children; a
+/// subdirectory found there is itself scanned (depth `1`) as long as
+/// `1 <= TREE_MAX_DEPTH`, and so on. A subdirectory found at depth
+/// `TREE_MAX_DEPTH` is listed (if it has a `.md`/`.markdown` file directly
+/// in it — see [`scan_tree_dir`]) but never itself descended into, so
+/// nothing below it appears at all — not even to decide whether to prune
+/// it, unlike every shallower directory.
+const TREE_MAX_DEPTH: usize = 4;
+
+/// Maximum number of entries [`handle_tree`] returns before giving up and
+/// marking the response `"truncated": true` — see [`scan_tree_dir`]. Bounds
+/// the *response size* a directory tree with an enormous number of
+/// Markdown files can force onto a single `GET /tree` request.
+const TREE_MAX_ENTRIES: usize = 2000;
+
+/// Maximum number of directory entries (of any kind — file, dir, symlink,
+/// excluded, non-UTF-8, ...) [`scan_tree_dir`] will look at in total across
+/// the whole walk before giving up, independently of [`TREE_MAX_ENTRIES`].
+/// Bounds the *work* the walk itself can be made to do: a directory subtree
+/// containing thousands of folders with no Markdown in any of them would
+/// all get pruned from the output (never touching [`TREE_MAX_ENTRIES`] at
+/// all) but could still make the walk itself take a very long time — this
+/// caps that separately from how many entries actually end up in the
+/// response.
+const TREE_MAX_VISITED_ENTRIES: usize = 20_000;
+
+/// One entry in `GET /tree`'s `"entries"` array — see [`handle_tree`].
+struct TreeEntry {
+    /// `/`-separated path relative to the open document's parent directory
+    /// — what a `PUT /open` request should echo back as its own `path`.
+    path: String,
+    /// The entry's own file/directory name (`path`'s last segment).
+    name: String,
+    /// `"dir"` or `"file"`.
+    kind: &'static str,
+}
+
+/// The directory `GET /tree`/`PUT /open` scope their walk/switch to —
+/// `root_dir` if the caller passed one (the native app always does, once a
+/// window has a file open at all — see `app.rs`'s `WindowCtx::root_dir`),
+/// or `asset_parent_dir(md_path)` otherwise (`server.rs`, which has no
+/// window/root concept, always passes `None`). See [`handle`]'s docs for
+/// why this must be the window's *fixed* root rather than
+/// `asset_parent_dir` of whatever happens to be open right now.
+fn tree_root_dir<'a>(root_dir: Option<&'a Path>, md_path: &'a Path) -> &'a Path {
+    root_dir.unwrap_or_else(|| asset_parent_dir(md_path))
+}
+
+/// `md_path`, expressed relative to `root` and `/`-joined — the same form
+/// [`scan_tree_dir`]'s own `path`/`current` values take. Falls back to just
+/// `md_path`'s own file name if `md_path` isn't actually under `root` (a
+/// `strip_prefix` mismatch — expected whenever `root_dir` is `None` and
+/// `asset_parent_dir` was used instead, since that's always exactly
+/// `md_path`'s own parent, or when `md_path` hasn't been canonicalized the
+/// same way `root` has — see `app.rs`'s notes on why this still ends up
+/// correct in every reachable case), and to an *empty string* — never a
+/// leaked absolute/relative path — if `md_path` doesn't even have a file
+/// name (see [`file_title`]'s own fallback, which this deliberately does
+/// *not* use, for the case this guards against).
+fn tree_relative_path(md_path: &Path, root: &Path) -> String {
+    if let Ok(relative) = md_path.strip_prefix(root) {
+        return path_components_to_slash(relative);
+    }
+    md_path
+        .file_name()
+        .map(|name| name.to_string_lossy().into_owned())
+        .unwrap_or_default()
+}
+
+/// Joins a [`Path`]'s [`Component::Normal`] segments with `/`, ignoring any
+/// other component kind (there shouldn't be any in a path this module ever
+/// builds this way, but silently dropping rather than propagating an
+/// error/panic is consistent with every other best-effort path-to-string
+/// conversion here).
+fn path_components_to_slash(path: &Path) -> String {
+    path.components()
+        .filter_map(|component| match component {
+            Component::Normal(part) => Some(part.to_string_lossy().into_owned()),
+            _ => None,
+        })
+        .collect::<Vec<_>>()
+        .join("/")
+}
+
+/// `GET /tree`: the Markdown file tree rooted at [`tree_root_dir`], as
+/// JSON:
+/// ```json
+/// { "root": "<root dir name>", "current": "<path relative to root>",
+///   "entries": [ { "path": "...", "name": "...", "kind": "dir"|"file" } ],
+///   "truncated": true }
+/// ```
+/// `root` is the root directory's *name* only (never an absolute path —
+/// same reasoning as every other path this module ever hands back to a
+/// client). `current` is the currently-open file's path relative to that
+/// root (see [`tree_relative_path`]) — a bare file name when the window's
+/// root is that file's own parent (the common case: no switch has
+/// descended into a subfolder yet), a `/`-joined relative path otherwise.
+/// `"truncated"` is present (and `true`) only once [`TREE_MAX_ENTRIES`] or
+/// [`TREE_MAX_VISITED_ENTRIES`] is hit; otherwise the field is omitted
+/// entirely.
+///
+/// `409` if `file` is `None` — there's no document to root the tree at.
+/// A directory that can't be read (permissions, deleted mid-walk, ...) is
+/// skipped rather than failing the whole request, same as every other
+/// best-effort read in this module.
+fn handle_tree(file: Option<&Path>, root_dir: Option<&Path>) -> Reply {
+    let Some(md_path) = file else {
+        return no_file_open();
+    };
+    let parent = tree_root_dir(root_dir, md_path);
+    let root = parent
+        .file_name()
+        .map(|name| name.to_string_lossy().into_owned())
+        .unwrap_or_else(|| ".".to_string());
+    let current = tree_relative_path(md_path, parent);
+
+    let (entries, truncated) =
+        collect_tree_entries(parent, TREE_MAX_ENTRIES, TREE_MAX_VISITED_ENTRIES);
+
+    let entries_json: Vec<serde_json::Value> = entries
+        .into_iter()
+        .map(|entry| {
+            serde_json::json!({
+                "path": entry.path,
+                "name": entry.name,
+                "kind": entry.kind,
+            })
+        })
+        .collect();
+    let mut value = serde_json::json!({
+        "root": root,
+        "current": current,
+        "entries": entries_json,
+    });
+    if truncated {
+        value["truncated"] = serde_json::json!(true);
+    }
+    Reply::json(200, value)
+}
+
+/// The testable core of `GET /tree`'s walk: every entry under `parent`
+/// (see [`scan_tree_dir`]) plus whether either budget was exhausted.
+/// Factored out from [`handle_tree`] purely so tests can exercise the
+/// budget-exhaustion edge cases (see `scan_tree_dir`'s docs on why
+/// discarding already-collected entries there was a bug) with small budgets
+/// instead of having to create thousands of real files on disk to reach
+/// [`TREE_MAX_ENTRIES`]/[`TREE_MAX_VISITED_ENTRIES`].
+fn collect_tree_entries(
+    parent: &Path,
+    entries_budget: usize,
+    visited_budget: usize,
+) -> (Vec<TreeEntry>, bool) {
+    let mut entries = Vec::new();
+    let mut state = ScanBudget {
+        budget: entries_budget,
+        truncated: false,
+        visited_budget,
+        visited: 0,
+    };
+    scan_tree_dir(parent, "", 0, &mut state, &mut entries);
+    (entries, state.truncated)
+}
+
+/// The mutable state [`scan_tree_dir`] threads through its whole recursive
+/// walk, bundled into one struct purely to keep that function's own
+/// parameter list short (`clippy::too_many_arguments`) — every recursive
+/// call passes the same `&mut ScanBudget` straight through, so this is
+/// exactly the flat set of `&mut usize`/`&mut bool` parameters an earlier
+/// revision threaded by hand. See [`scan_tree_dir`]'s docs for what each
+/// field means and how the two budgets interact.
+struct ScanBudget {
+    budget: usize,
+    truncated: bool,
+    visited_budget: usize,
+    visited: usize,
+}
+
+/// Recursively fills `out` with every entry [`handle_tree`] should list
+/// inside `root.join(rel_prefix)` (`rel_prefix == ""` for `root` itself),
+/// in "each level: directories then files, both name-sorted
+/// case-insensitively" depth-first order — a directory's own row is
+/// immediately followed by everything inside it.
+///
+/// A subdirectory is only recursed into (to decide whether it belongs in
+/// the output at all) while `depth < TREE_MAX_DEPTH`; deeper than that it's
+/// simply never looked at. Once recursed into, a subdirectory that turns
+/// out to contain no `.md`/`.markdown` file anywhere within the depth
+/// budget contributes nothing and is pruned — neither it nor its (empty)
+/// contents are added to `out`. Hidden entries (name starting with `.`,
+/// which also covers `.git`), `node_modules`, and `target` are skipped
+/// outright, as directories, without being recursed into at all. A
+/// directory entry (symlink or not) that `DirEntry::file_type` reports as
+/// [`std::fs::FileType::is_symlink`] is skipped too — this walk never
+/// follows a symlink, matching `GET /asset`'s own refusal to (see
+/// `docs/SECURITY.md`). A name that isn't valid UTF-8 is skipped too rather
+/// than shown lossily (`OsStr::to_str` returning `None`) — a
+/// `to_string_lossy` placeholder full of U+FFFD wouldn't actually be
+/// openable via `PUT /open` (which requires the exact UTF-8 name back), so
+/// showing one at all would just be a dead end in the UI.
+///
+/// `state` (see [`ScanBudget`]) bundles the mutable counters threaded
+/// through the whole recursive walk, one `&mut` passed straight down every
+/// call. `state.budget` is the number of entries still allowed before
+/// hitting the caller's entries cap ([`TREE_MAX_ENTRIES`] in production,
+/// parameterized via [`collect_tree_entries`] for testing); once it reaches
+/// `0`, `state.truncated` is set. `state.visited`/`state.visited_budget`
+/// are the separate, independent cap on total directory entries *looked
+/// at* (including ones that are pruned, excluded, or don't qualify) — see
+/// [`TREE_MAX_VISITED_ENTRIES`]. Once *either* budget is exhausted,
+/// `state.truncated` is set and nothing more is added anywhere in the walk
+/// (every recursive call shares the same `state`, so this stops the
+/// *whole* traversal, not just the directory currently being
+/// scanned) — but, critically, whatever was already collected (in `out`,
+/// and in any still-pending `child_entries` a caller higher up the call
+/// stack is holding) is *never discarded* once budgeted; only entries that
+/// would come *after* the cap are ever left out. Earlier revisions of this
+/// function discarded an entire subdirectory's worth of already-budgeted
+/// results whenever the cap was hit while about to add *that
+/// subdirectory's own* row — this is the fix.
+fn scan_tree_dir(
+    root: &Path,
+    rel_prefix: &str,
+    depth: usize,
+    state: &mut ScanBudget,
+    out: &mut Vec<TreeEntry>,
+) {
+    if state.truncated {
+        return;
+    }
+    let abs_dir = if rel_prefix.is_empty() {
+        root.to_path_buf()
+    } else {
+        root.join(rel_prefix)
+    };
+    let Ok(read_dir) = fs::read_dir(&abs_dir) else {
+        // Unreadable directory (permissions, deleted mid-walk, ...): skip
+        // it silently, same as every other best-effort read in this
+        // module — a `GET /tree` for the rest of the tree shouldn't fail
+        // just because one subdirectory couldn't be listed.
+        return;
+    };
+
+    let mut dir_names: Vec<String> = Vec::new();
+    let mut file_names: Vec<String> = Vec::new();
+    for entry in read_dir.flatten() {
+        state.visited += 1;
+        if state.visited > state.visited_budget {
+            // Stop reading *this* directory's own entries right away, but
+            // still process whatever was already found above (sorted,
+            // possibly recursed into, possibly added to `out` below) —
+            // only further exploration (deeper directories, later
+            // siblings elsewhere in the tree) is what actually stops, via
+            // every other call's own `if state.truncated { return; }` at
+            // the top. Nothing already found here is thrown away.
+            state.truncated = true;
+            break;
+        }
+        let Some(name) = entry.file_name().to_str().map(str::to_owned) else {
+            continue;
+        };
+        let Ok(file_type) = entry.file_type() else {
+            continue;
+        };
+        if file_type.is_symlink() {
+            continue;
+        }
+        if file_type.is_dir() {
+            if is_excluded_tree_dir(&name) {
+                continue;
+            }
+            dir_names.push(name);
+        } else if file_type.is_file() && is_markdown_name(&name) {
+            file_names.push(name);
+        }
+    }
+    dir_names.sort_by_key(|name| name.to_lowercase());
+    file_names.sort_by_key(|name| name.to_lowercase());
+
+    for name in dir_names {
+        if depth >= TREE_MAX_DEPTH {
+            continue;
+        }
+        let child_rel = join_tree_path(rel_prefix, &name);
+        let mut child_entries = Vec::new();
+        scan_tree_dir(root, &child_rel, depth + 1, state, &mut child_entries);
+        if child_entries.is_empty() {
+            // No `.md`/`.markdown` file anywhere inside (within the depth
+            // budget, or nothing could be verified because a budget ran
+            // out while exploring it) — prune this directory entirely
+            // rather than show an empty folder.
+            continue;
+        }
+        if state.budget == 0 {
+            // No budget left for *this directory's own* placeholder row,
+            // but everything already found inside it was legitimately
+            // budgeted by the recursive call above — keep it (as orphaned
+            // rows, minus their own parent row) rather than discard
+            // already-valid results just because one more row won't fit.
+            out.extend(child_entries);
+            continue;
+        }
+        state.budget -= 1;
+        out.push(TreeEntry {
+            path: child_rel,
+            name,
+            kind: "dir",
+        });
+        out.extend(child_entries);
+    }
+
+    for name in file_names {
+        if state.budget == 0 {
+            state.truncated = true;
+            return;
+        }
+        state.budget -= 1;
+        let child_rel = join_tree_path(rel_prefix, &name);
+        out.push(TreeEntry {
+            path: child_rel,
+            name,
+            kind: "file",
+        });
+    }
+}
+
+fn join_tree_path(prefix: &str, name: &str) -> String {
+    if prefix.is_empty() {
+        name.to_string()
+    } else {
+        format!("{prefix}/{name}")
+    }
+}
+
+/// `true` for a directory name [`scan_tree_dir`] never even looks inside:
+/// hidden directories (`.` prefix — this also covers `.git`), plus
+/// `node_modules` and `target` by name.
+fn is_excluded_tree_dir(name: &str) -> bool {
+    name.starts_with('.') || matches!(name, "node_modules" | "target")
+}
+
+/// `true` if `name`'s extension is `.md`/`.markdown`, matched
+/// case-insensitively — the same test `app.rs`'s `is_markdown_file` applies
+/// to a dropped/opened file, applied here to a bare file name instead of a
+/// full path.
+fn is_markdown_name(name: &str) -> bool {
+    Path::new(name)
+        .extension()
+        .and_then(|ext| ext.to_str())
+        .is_some_and(|ext| ext.eq_ignore_ascii_case("md") || ext.eq_ignore_ascii_case("markdown"))
+}
+
+/// The JSON body `PUT /open` expects: `{"path": "<relative path>"}`, the
+/// same `path` value a `GET /tree` entry reported.
+#[derive(Deserialize)]
+struct OpenRequest {
+    path: String,
+}
+
+/// `PUT /open`: switches the currently-viewed file to `path` (a JSON body,
+/// `{"path": "..."}`), within [`tree_root_dir`]'s scope. Gated entirely by
+/// `allow_open` — `false` (the browser server) always answers `501` before
+/// checking anything else, so `--browser`'s single served file never
+/// changes out from under whatever else might have it open in a tab.
+///
+/// With `allow_open: true` (the native app), every one of the following
+/// must hold, checked in this order, before the switch is accepted:
+/// - [`REQUEST_HEADER`] is present — `403` otherwise (same CSRF defense as
+///   `PUT /review`/`POST /export`).
+/// - `file` is `Some` — `409` otherwise (nothing to resolve a relative
+///   path against).
+/// - The body parses as [`OpenRequest`] — `400` otherwise.
+/// - `path`, parsed as a [`Path`], is made up *only* of
+///   [`Component::Normal`] segments (see [`is_plain_relative_path`], the
+///   same check [`handle_asset`] applies to its own `p` query value) and
+///   its extension (lowercased) is `md` or `markdown` — `400` otherwise.
+/// - `root_dir.join(path)` (not yet canonicalized) is not itself a symlink
+///   — `404` otherwise, checked via `fs::symlink_metadata` so the check
+///   can't be fooled by `canonicalize` transparently resolving it first.
+///   This is stricter than the escape check just below on its own: a
+///   symlink that resolves to a target *inside* the root would pass that
+///   check, but `GET /tree` would never have listed it in the first place
+///   (`scan_tree_dir` skips every symlink outright) — this keeps `PUT
+///   /open` from accepting, via a hand-crafted `path`, something the tree
+///   itself would never offer to switch to.
+/// - Joining it onto `root_dir` and calling `canonicalize()` on both
+///   succeeds, *and* the joined path's canonical form has `root_dir`'s own
+///   canonical form as a prefix — `404` otherwise. Same symlink-*escape*
+///   defense as [`handle_asset`] (distinct from the symlink-*at-all* check
+///   just above).
+/// - The canonicalized target's metadata says it's a regular file
+///   (`fs::metadata(..).is_file()`) — `404` otherwise. Without this, a
+///   `path` naming a directory, FIFO, or device node that happens to end
+///   in `.md` would pass every check above and then hang the WebView's
+///   protocol-handler thread the moment the switch lands and something
+///   tries to `fs::read_to_string` it (a FIFO's read blocks until a writer
+///   opens the other end, which may be never).
+///
+/// The [`TREE_MAX_DEPTH`]/hidden-directory/`node_modules`/`target`
+/// exclusions and the [`TREE_MAX_ENTRIES`]/[`TREE_MAX_VISITED_ENTRIES`]
+/// caps `GET /tree` applies are a *display* concern only (what the tree
+/// pane chooses to draw) — none of them are access-control boundaries this
+/// function enforces. A `.md` file that lives inside a hidden directory or
+/// `node_modules` (something `GET /tree` would never list) is still a
+/// perfectly valid `PUT /open` target as long as it's within `root_dir` and
+/// passes every check above; the only boundary that matters here is the
+/// canonicalize-and-prefix escape check.
+///
+/// On success: `200` `{"ok": true, "reloaded": true}`, plus
+/// [`Action::OpenFile`] carrying the canonicalized target path for the
+/// caller to actually apply — this function never touches any window/server
+/// state itself (see [`Action`]'s docs). `"reloaded": true` tells the
+/// client it never needs to reload itself: this only ever succeeds under
+/// `allow_open: true` (the native app), whose caller *always* ends up
+/// reloading some window in response to [`Action::OpenFile`] — either this
+/// one (the common case) or, if the target is already open in a different
+/// window, that other window is focused instead and brought to front while
+/// this one is left untouched (see `app.rs`'s `UserEvent::SwitchFile`
+/// handling) — neither outcome ever needs `assets/tree.js` to additionally
+/// call `location.reload()` itself.
+fn handle_open(
+    req: &RouteRequest,
+    file: Option<&Path>,
+    allow_open: bool,
+    root_dir: Option<&Path>,
+) -> (Reply, Action) {
+    if !allow_open {
+        return (
+            error_json(501, "switching files is not supported in --browser mode"),
+            Action::None,
+        );
+    }
+    if !has_request_header(req) {
+        return (
+            error_json(403, "missing X-Mdview-Request header"),
+            Action::None,
+        );
+    }
+    let Some(md_path) = file else {
+        return (no_file_open(), Action::None);
+    };
+
+    let Ok(open_request) = serde_json::from_slice::<OpenRequest>(req.body) else {
+        return (error_json(400, "invalid request body"), Action::None);
+    };
+    let rel_path = Path::new(&open_request.path);
+    if !is_plain_relative_path(rel_path) {
+        return (error_json(400, "invalid path"), Action::None);
+    }
+    let extension_allowed = rel_path
+        .extension()
+        .and_then(|ext| ext.to_str())
+        .is_some_and(|ext| ext.eq_ignore_ascii_case("md") || ext.eq_ignore_ascii_case("markdown"));
+    if !extension_allowed {
+        return (error_json(400, "invalid file extension"), Action::None);
+    }
+
+    let parent = tree_root_dir(root_dir, md_path);
+    let candidate = parent.join(rel_path);
+    // Checked on the *un*canonicalized `candidate` — canonicalize()
+    // transparently follows symlinks, which is exactly what would hide
+    // this from a check made afterward. See the doc comment above for why
+    // this is stricter than (and separate from) the escape check below.
+    if fs::symlink_metadata(&candidate).is_ok_and(|metadata| metadata.file_type().is_symlink()) {
+        return (error_json(404, "not found"), Action::None);
+    }
+
+    let Ok(parent_canonical) = parent.canonicalize() else {
+        return (error_json(404, "not found"), Action::None);
+    };
+    let Ok(candidate_canonical) = candidate.canonicalize() else {
+        return (error_json(404, "not found"), Action::None);
+    };
+    if !candidate_canonical.starts_with(&parent_canonical) {
+        return (error_json(404, "not found"), Action::None);
+    }
+    let Ok(metadata) = fs::metadata(&candidate_canonical) else {
+        return (error_json(404, "not found"), Action::None);
+    };
+    if !metadata.is_file() {
+        return (error_json(404, "not found"), Action::None);
+    }
+
+    (
+        Reply::json(200, serde_json::json!({ "ok": true, "reloaded": true })),
+        Action::OpenFile(candidate_canonical),
+    )
+}
+
 /// File extensions (already lowercased for comparison) `GET /asset` will
 /// serve — see [`handle_asset`]. Deliberately an allowlist, not a
 /// denylist: any extension not on it (`.txt`, `.md`, no extension at all,
@@ -406,7 +959,7 @@ const ASSET_MAX_BYTES: u64 = 20 * 1024 * 1024;
 /// shell would treat a bare file name. Left unhandled, that used to make
 /// every `/asset` request `404` whenever mdview was opened this way. Same
 /// fallback `main::ensure_not_same_file` uses, for the same reason.
-fn asset_parent_dir(md_path: &Path) -> &Path {
+pub(crate) fn asset_parent_dir(md_path: &Path) -> &Path {
     md_path
         .parent()
         .filter(|parent| !parent.as_os_str().is_empty())
@@ -624,6 +1177,25 @@ mod tests {
             .map(|(_, value)| value.as_str())
     }
 
+    /// `handle`, but returning just the `Reply` half of its
+    /// `(Reply, Action)` result and always passing `allow_open: false`,
+    /// `root_dir: None` — what every test below that predates `PUT
+    /// /open`/`Action`/`root_dir` (i.e. nearly all of them) wants, so they
+    /// didn't have to be individually rewritten to thread extra arguments
+    /// through and discard a tuple element they don't care about. `/tree`
+    /// tests that use this still get the pre-`root_dir` fallback behavior
+    /// (`asset_parent_dir(file)`), which is what they were written against.
+    /// Tests that actually exercise `PUT /open`, `Action`, or a non-`None`
+    /// `root_dir` call `handle` directly instead.
+    fn handle_reply(
+        req: &RouteRequest,
+        file: Option<&Path>,
+        version: &AtomicU64,
+        allow_remote_images: bool,
+    ) -> Reply {
+        handle(req, file, version, allow_remote_images, false, None).0
+    }
+
     /// A `GET` request with no headers/body — what nearly every test that
     /// isn't specifically about `PUT`/`POST` wants.
     fn get(path: &str) -> RouteRequest<'_> {
@@ -655,6 +1227,15 @@ mod tests {
         }
     }
 
+    fn put_open<'a>(body: &'a [u8], headers: &'a [(String, String)]) -> RouteRequest<'a> {
+        RouteRequest {
+            method: "PUT",
+            path: "/open",
+            headers,
+            body,
+        }
+    }
+
     fn with_request_header() -> Vec<(String, String)> {
         vec![("X-Mdview-Request".to_string(), "1".to_string())]
     }
@@ -666,7 +1247,7 @@ mod tests {
         std::fs::write(&file_path, "# Hello\n").expect("write markdown file");
         let version = AtomicU64::new(3);
 
-        let reply = handle(&get("/"), Some(&file_path), &version, false);
+        let reply = handle_reply(&get("/"), Some(&file_path), &version, false);
 
         assert_eq!(reply.status, 200);
         assert_eq!(reply.content_type, "text/html; charset=utf-8");
@@ -684,7 +1265,7 @@ mod tests {
     #[test]
     fn head_root_behaves_like_get() {
         let version = AtomicU64::new(0);
-        let reply = handle(
+        let reply = handle_reply(
             &RouteRequest {
                 method: "HEAD",
                 path: "/",
@@ -701,7 +1282,7 @@ mod tests {
     #[test]
     fn version_returns_the_counter_as_plain_text() {
         let version = AtomicU64::new(42);
-        let reply = handle(&get("/version"), None, &version, false);
+        let reply = handle_reply(&get("/version"), None, &version, false);
 
         assert_eq!(reply.status, 200);
         assert_eq!(reply.content_type, "text/plain; charset=utf-8");
@@ -716,7 +1297,7 @@ mod tests {
         std::fs::write(&file_path, "# Hi\n").expect("write markdown file");
         let version = AtomicU64::new(0);
 
-        let reply = handle(&get("/body"), Some(&file_path), &version, false);
+        let reply = handle_reply(&get("/body"), Some(&file_path), &version, false);
 
         assert_eq!(reply.status, 200);
         assert_eq!(reply.content_type, "text/html; charset=utf-8");
@@ -732,13 +1313,13 @@ mod tests {
     fn no_file_selected_renders_empty_page_on_root_and_body() {
         let version = AtomicU64::new(0);
 
-        let root = handle(&get("/"), None, &version, false);
+        let root = handle_reply(&get("/"), None, &version, false);
         assert_eq!(root.status, 200);
         assert!(String::from_utf8(root.body)
             .unwrap()
             .contains("Drop a Markdown file here"));
 
-        let body = handle(&get("/body"), None, &version, false);
+        let body = handle_reply(&get("/body"), None, &version, false);
         assert_eq!(body.status, 200);
         // No file means no file name to report.
         assert_eq!(header(&body, "X-Mdview-Title"), None);
@@ -753,7 +1334,7 @@ mod tests {
         let missing_path = dir.path().join("gone.md");
         let version = AtomicU64::new(7);
 
-        let root = handle(&get("/"), Some(&missing_path), &version, false);
+        let root = handle_reply(&get("/"), Some(&missing_path), &version, false);
         assert_eq!(root.status, 500);
         assert_eq!(root.content_type, "text/html; charset=utf-8");
         let body = String::from_utf8(root.body).unwrap();
@@ -770,7 +1351,7 @@ mod tests {
         let missing_path = dir.path().join("gone.md");
         let version = AtomicU64::new(0);
 
-        let reply = handle(&get("/body"), Some(&missing_path), &version, false);
+        let reply = handle_reply(&get("/body"), Some(&missing_path), &version, false);
         assert_eq!(reply.status, 200);
         assert_eq!(header(&reply, "X-Mdview-Title"), Some("gone.md"));
         let body = String::from_utf8(reply.body).unwrap();
@@ -785,7 +1366,7 @@ mod tests {
         std::fs::write(&file_path, "# Hi\n").expect("write markdown file");
         let version = AtomicU64::new(0);
 
-        let reply = handle(&get("/body"), Some(&file_path), &version, false);
+        let reply = handle_reply(&get("/body"), Some(&file_path), &version, false);
         assert_eq!(reply.status, 200);
         let title = header(&reply, "X-Mdview-Title").expect("title header present");
         assert!(title.is_ascii(), "header must be ASCII-safe: {title}");
@@ -793,7 +1374,7 @@ mod tests {
         assert!(title.ends_with(".md"), "{title}");
 
         std::fs::remove_file(&file_path).expect("delete file");
-        let failed = handle(&get("/body"), Some(&file_path), &version, false);
+        let failed = handle_reply(&get("/body"), Some(&file_path), &version, false);
         let body = String::from_utf8(failed.body).unwrap();
         assert!(body.contains("メモ.md"), "{body}");
     }
@@ -809,12 +1390,12 @@ mod tests {
         std::fs::write(&file_path, "# Hi\n").expect("write markdown file");
         let version = AtomicU64::new(0);
 
-        let reply = handle(&get("/body"), Some(&file_path), &version, false);
+        let reply = handle_reply(&get("/body"), Some(&file_path), &version, false);
         let title = header(&reply, "X-Mdview-Title").expect("title header present");
         assert!(title.ends_with("<1>.md"), "{title}");
 
         std::fs::remove_file(&file_path).expect("delete file");
-        let failed = handle(&get("/body"), Some(&file_path), &version, false);
+        let failed = handle_reply(&get("/body"), Some(&file_path), &version, false);
         let body = String::from_utf8(failed.body).unwrap();
         assert!(body.contains("メモ&lt;1&gt;.md"), "{body}");
     }
@@ -823,7 +1404,7 @@ mod tests {
     fn every_route_carries_common_security_headers() {
         let version = AtomicU64::new(0);
         for route in ["/", "/version", "/body", "/nope"] {
-            let reply = handle(&get(route), None, &version, false);
+            let reply = handle_reply(&get(route), None, &version, false);
             assert_eq!(header(&reply, "Cache-Control"), Some("no-store"), "{route}");
             assert_eq!(
                 header(&reply, "X-Content-Type-Options"),
@@ -845,17 +1426,17 @@ mod tests {
         std::fs::write(&file_path, "# Hi\n").expect("write markdown file");
         let version = AtomicU64::new(0);
 
-        let reply = handle(&get("/?x=1"), Some(&file_path), &version, false);
+        let reply = handle_reply(&get("/?x=1"), Some(&file_path), &version, false);
         assert_eq!(reply.status, 200);
 
-        let version_reply = handle(&get("/version?t=1"), Some(&file_path), &version, false);
+        let version_reply = handle_reply(&get("/version?t=1"), Some(&file_path), &version, false);
         assert_eq!(version_reply.status, 200);
     }
 
     #[test]
     fn unknown_path_is_404() {
         let version = AtomicU64::new(0);
-        let reply = handle(&get("/nope"), None, &version, false);
+        let reply = handle_reply(&get("/nope"), None, &version, false);
         assert_eq!(reply.status, 404);
     }
 
@@ -868,7 +1449,7 @@ mod tests {
         std::fs::write(&file_path, "# Hi\n").expect("write markdown file");
         let version = AtomicU64::new(0);
 
-        let reply = handle(&get("/review"), Some(&file_path), &version, false);
+        let reply = handle_reply(&get("/review"), Some(&file_path), &version, false);
         assert_eq!(reply.status, 200);
         assert_eq!(reply.content_type, "application/json; charset=utf-8");
         let value: serde_json::Value = serde_json::from_slice(&reply.body).unwrap();
@@ -914,7 +1495,7 @@ mod tests {
             }]
         });
         let body = serde_json::to_vec(&doc_json).unwrap();
-        let put_reply = handle(
+        let put_reply = handle_reply(
             &put_review(&body, &headers),
             Some(&file_path),
             &version,
@@ -922,7 +1503,7 @@ mod tests {
         );
         assert_eq!(put_reply.status, 200);
 
-        let get_reply = handle(&get("/review"), Some(&file_path), &version, false);
+        let get_reply = handle_reply(&get("/review"), Some(&file_path), &version, false);
         let value: serde_json::Value = serde_json::from_slice(&get_reply.body).unwrap();
         assert_eq!(value["unanchored"], serde_json::json!([]));
         assert_eq!(value["blocks"][0]["kind"], "item");
@@ -931,7 +1512,7 @@ mod tests {
     #[test]
     fn get_review_with_no_file_open_is_409() {
         let version = AtomicU64::new(0);
-        let reply = handle(&get("/review"), None, &version, false);
+        let reply = handle_reply(&get("/review"), None, &version, false);
         assert_eq!(reply.status, 409);
         let value: serde_json::Value = serde_json::from_slice(&reply.body).unwrap();
         assert_eq!(value["error"], "no file open");
@@ -943,7 +1524,7 @@ mod tests {
         let missing_path = dir.path().join("gone.md");
         let version = AtomicU64::new(0);
 
-        let reply = handle(&get("/review"), Some(&missing_path), &version, false);
+        let reply = handle_reply(&get("/review"), Some(&missing_path), &version, false);
         assert_eq!(reply.status, 500);
         let value: serde_json::Value = serde_json::from_slice(&reply.body).unwrap();
         assert_eq!(value["error"], "failed to read document");
@@ -959,7 +1540,7 @@ mod tests {
         let version = AtomicU64::new(0);
 
         let body = br#"{"version":1,"file":"notes.md","blocks":[]}"#;
-        let reply = handle(
+        let reply = handle_reply(
             &put_review(body, &REQUEST_HEADER_PAIR),
             Some(&file_path),
             &version,
@@ -976,7 +1557,7 @@ mod tests {
         let version = AtomicU64::new(0);
         let headers = with_request_header();
 
-        let reply = handle(
+        let reply = handle_reply(
             &put_review(b"not json", &headers),
             Some(&file_path),
             &version,
@@ -994,7 +1575,7 @@ mod tests {
         let version = AtomicU64::new(0);
         let headers = with_request_header();
         let body = br#"{"version":1,"file":"notes.md","blocks":[]}"#;
-        let reply = handle(&put_review(body, &headers), None, &version, false);
+        let reply = handle_reply(&put_review(body, &headers), None, &version, false);
         assert_eq!(reply.status, 409);
     }
 
@@ -1007,7 +1588,7 @@ mod tests {
         let headers = with_request_header();
 
         let body = br#"{"version":1,"file":"other.md","blocks":[]}"#;
-        let reply = handle(
+        let reply = handle_reply(
             &put_review(body, &headers),
             Some(&file_path),
             &version,
@@ -1027,7 +1608,7 @@ mod tests {
         let headers = with_request_header();
 
         let body = br#"{"version":1,"file":"","blocks":[]}"#;
-        let reply = handle(
+        let reply = handle_reply(
             &put_review(body, &headers),
             Some(&file_path),
             &version,
@@ -1047,7 +1628,7 @@ mod tests {
         let headers = with_request_header();
 
         let body = br#"{"version":1,"file":"notes.md","blocks":[]}"#;
-        let reply = handle(
+        let reply = handle_reply(
             &put_review(body, &headers),
             Some(&file_path),
             &version,
@@ -1082,7 +1663,7 @@ mod tests {
         });
         let body = serde_json::to_vec(&doc_json).unwrap();
 
-        let put_reply = handle(
+        let put_reply = handle_reply(
             &put_review(&body, &headers),
             Some(&file_path),
             &version,
@@ -1092,7 +1673,7 @@ mod tests {
         let put_value: serde_json::Value = serde_json::from_slice(&put_reply.body).unwrap();
         assert_eq!(put_value["ok"], true);
 
-        let get_reply = handle(&get("/review"), Some(&file_path), &version, false);
+        let get_reply = handle_reply(&get("/review"), Some(&file_path), &version, false);
         assert_eq!(get_reply.status, 200);
         let get_value: serde_json::Value = serde_json::from_slice(&get_reply.body).unwrap();
         assert_eq!(get_value["blocks"][0]["hash"], hash.as_str());
@@ -1121,7 +1702,7 @@ mod tests {
         });
         let body = serde_json::to_vec(&doc_json).unwrap();
 
-        let put_reply = handle(
+        let put_reply = handle_reply(
             &put_review(&body, &headers),
             Some(&file_path),
             &version,
@@ -1129,7 +1710,7 @@ mod tests {
         );
         assert_eq!(put_reply.status, 200);
 
-        let get_reply = handle(&get("/review"), Some(&file_path), &version, false);
+        let get_reply = handle_reply(&get("/review"), Some(&file_path), &version, false);
         assert_eq!(get_reply.status, 200);
         let get_value: serde_json::Value = serde_json::from_slice(&get_reply.body).unwrap();
         assert_eq!(
@@ -1146,7 +1727,7 @@ mod tests {
         std::fs::write(&file_path, "# Hi\n").expect("write markdown file");
         let version = AtomicU64::new(0);
 
-        let reply = handle(
+        let reply = handle_reply(
             &post_export(&REQUEST_HEADER_PAIR),
             Some(&file_path),
             &version,
@@ -1159,7 +1740,7 @@ mod tests {
     fn export_with_no_file_open_is_409() {
         let version = AtomicU64::new(0);
         let headers = with_request_header();
-        let reply = handle(&post_export(&headers), None, &version, false);
+        let reply = handle_reply(&post_export(&headers), None, &version, false);
         assert_eq!(reply.status, 409);
     }
 
@@ -1171,7 +1752,7 @@ mod tests {
         let version = AtomicU64::new(0);
         let headers = with_request_header();
 
-        let reply = handle(&post_export(&headers), Some(&file_path), &version, false);
+        let reply = handle_reply(&post_export(&headers), Some(&file_path), &version, false);
         assert_eq!(reply.status, 200);
         let value: serde_json::Value = serde_json::from_slice(&reply.body).unwrap();
         assert_eq!(value["path"], "notes.review.md");
@@ -1214,7 +1795,7 @@ mod tests {
         std::fs::write(dir.path().join("img.png"), b"not-really-a-png").expect("write image");
         let version = AtomicU64::new(0);
 
-        let reply = handle(&get("/asset?p=img.png"), Some(&file_path), &version, false);
+        let reply = handle_reply(&get("/asset?p=img.png"), Some(&file_path), &version, false);
 
         assert_eq!(reply.status, 200);
         assert_eq!(reply.content_type, "image/png");
@@ -1246,7 +1827,7 @@ mod tests {
         std::fs::write(dir.path().join("imgs").join("a.png"), b"sub-image").expect("write image");
         let version = AtomicU64::new(0);
 
-        let reply = handle(
+        let reply = handle_reply(
             &get("/asset?p=imgs/a.png"),
             Some(&file_path),
             &version,
@@ -1265,7 +1846,7 @@ mod tests {
         std::fs::write(&file_path, "# Hi\n").expect("write markdown file");
         let version = AtomicU64::new(0);
 
-        let reply = handle(
+        let reply = handle_reply(
             &get("/asset?p=../secret.txt"),
             Some(&file_path),
             &version,
@@ -1281,7 +1862,7 @@ mod tests {
         std::fs::write(&file_path, "# Hi\n").expect("write markdown file");
         let version = AtomicU64::new(0);
 
-        let reply = handle(
+        let reply = handle_reply(
             &get("/asset?p=/etc/hosts"),
             Some(&file_path),
             &version,
@@ -1299,7 +1880,7 @@ mod tests {
 
         // `%2e%2e%2fsecret` decodes to `../secret` — the rejection has to
         // happen on the *decoded* path, not the raw query text.
-        let reply = handle(
+        let reply = handle_reply(
             &get("/asset?p=%2e%2e%2fsecret"),
             Some(&file_path),
             &version,
@@ -1316,7 +1897,7 @@ mod tests {
         std::fs::write(dir.path().join("note.txt"), b"hello").expect("write file");
         let version = AtomicU64::new(0);
 
-        let reply = handle(&get("/asset?p=note.txt"), Some(&file_path), &version, false);
+        let reply = handle_reply(&get("/asset?p=note.txt"), Some(&file_path), &version, false);
         assert_eq!(reply.status, 404);
     }
 
@@ -1327,7 +1908,7 @@ mod tests {
         std::fs::write(&file_path, "# Hi\n").expect("write markdown file");
         let version = AtomicU64::new(0);
 
-        let reply = handle(
+        let reply = handle_reply(
             &get("/asset?p=missing.png"),
             Some(&file_path),
             &version,
@@ -1339,7 +1920,7 @@ mod tests {
     #[test]
     fn asset_with_no_file_open_is_409() {
         let version = AtomicU64::new(0);
-        let reply = handle(&get("/asset?p=img.png"), None, &version, false);
+        let reply = handle_reply(&get("/asset?p=img.png"), None, &version, false);
         assert_eq!(reply.status, 409);
     }
 
@@ -1358,7 +1939,7 @@ mod tests {
         std::os::unix::fs::symlink(&secret, &link_path).expect("create symlink");
 
         let version = AtomicU64::new(0);
-        let reply = handle(
+        let reply = handle_reply(
             &get("/asset?p=escape.png"),
             Some(&file_path),
             &version,
@@ -1376,7 +1957,7 @@ mod tests {
         std::fs::write(dir.path().join("big.png"), &big).expect("write big image");
         let version = AtomicU64::new(0);
 
-        let reply = handle(&get("/asset?p=big.png"), Some(&file_path), &version, false);
+        let reply = handle_reply(&get("/asset?p=big.png"), Some(&file_path), &version, false);
         assert_eq!(reply.status, 413);
     }
 
@@ -1400,7 +1981,7 @@ mod tests {
         ];
         for (name, expected_type) in cases {
             std::fs::write(dir.path().join(name), b"data").expect("write image");
-            let reply = handle(
+            let reply = handle_reply(
                 &get(&format!("/asset?p={name}")),
                 Some(&file_path),
                 &version,
@@ -1409,5 +1990,761 @@ mod tests {
             assert_eq!(reply.status, 200, "{name}");
             assert_eq!(reply.content_type, expected_type, "{name}");
         }
+    }
+
+    // -- /tree --------------------------------------------------------------
+
+    #[test]
+    fn tree_lists_files_and_dirs_dir_before_file_with_root_and_current() {
+        let outer = tempfile::tempdir().expect("create tempdir");
+        let root_dir = outer.path().join("imgdemo");
+        std::fs::create_dir(&root_dir).expect("create root dir");
+        let file_path = root_dir.join("doc.md");
+        std::fs::write(&file_path, "# Hi\n").expect("write markdown file");
+        std::fs::create_dir(root_dir.join("sub")).expect("create sub dir");
+        std::fs::write(root_dir.join("sub").join("a.md"), "# A\n")
+            .expect("write nested markdown file");
+        let version = AtomicU64::new(0);
+
+        let reply = handle_reply(&get("/tree"), Some(&file_path), &version, false);
+        assert_eq!(reply.status, 200);
+        assert_eq!(reply.content_type, "application/json; charset=utf-8");
+        let value: serde_json::Value = serde_json::from_slice(&reply.body).unwrap();
+        assert_eq!(value["root"], "imgdemo");
+        assert_eq!(value["current"], "doc.md");
+        assert!(value.get("truncated").is_none());
+
+        let entries = value["entries"].as_array().expect("entries array");
+        assert_eq!(entries.len(), 3);
+        // Each level lists directories before files: "sub" (dir) precedes
+        // "doc.md" (file) even though "doc.md" sorts first alphabetically.
+        // "sub"'s own contents (depth-first) immediately follow it.
+        assert_eq!(entries[0]["path"], "sub");
+        assert_eq!(entries[0]["name"], "sub");
+        assert_eq!(entries[0]["kind"], "dir");
+        assert_eq!(entries[1]["path"], "sub/a.md");
+        assert_eq!(entries[1]["name"], "a.md");
+        assert_eq!(entries[1]["kind"], "file");
+        assert_eq!(entries[2]["path"], "doc.md");
+        assert_eq!(entries[2]["name"], "doc.md");
+        assert_eq!(entries[2]["kind"], "file");
+    }
+
+    #[test]
+    fn tree_sorts_names_case_insensitively() {
+        let dir = tempfile::tempdir().expect("create tempdir");
+        let file_path = dir.path().join("doc.md");
+        std::fs::write(&file_path, "# Hi\n").expect("write markdown file");
+        std::fs::write(dir.path().join("B.md"), "# B\n").expect("write file");
+        std::fs::write(dir.path().join("a.md"), "# a\n").expect("write file");
+        std::fs::write(dir.path().join("C.md"), "# C\n").expect("write file");
+        let version = AtomicU64::new(0);
+
+        let reply = handle_reply(&get("/tree"), Some(&file_path), &version, false);
+        let value: serde_json::Value = serde_json::from_slice(&reply.body).unwrap();
+        let names: Vec<&str> = value["entries"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|entry| entry["name"].as_str().unwrap())
+            .collect();
+        assert_eq!(names, vec!["a.md", "B.md", "C.md", "doc.md"]);
+    }
+
+    #[test]
+    fn tree_stops_descending_past_max_depth() {
+        let dir = tempfile::tempdir().expect("create tempdir");
+        let file_path = dir.path().join("doc.md");
+        std::fs::write(&file_path, "# Hi\n").expect("write markdown file");
+        let deep = dir.path().join("a").join("b").join("c").join("d");
+        std::fs::create_dir_all(&deep).expect("create nested dirs");
+        std::fs::write(deep.join("shallow.md"), "# Shallow\n").expect("write file");
+        std::fs::create_dir(deep.join("e")).expect("create dir beyond max depth");
+        std::fs::write(deep.join("e").join("deep.md"), "# Deep\n").expect("write file");
+        let version = AtomicU64::new(0);
+
+        let reply = handle_reply(&get("/tree"), Some(&file_path), &version, false);
+        let value: serde_json::Value = serde_json::from_slice(&reply.body).unwrap();
+        let paths: Vec<&str> = value["entries"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|entry| entry["path"].as_str().unwrap())
+            .collect();
+        assert!(paths.contains(&"a/b/c/d/shallow.md"), "{paths:?}");
+        assert!(
+            !paths.iter().any(|path| path.contains("/e")),
+            "directory beyond max depth must not appear: {paths:?}"
+        );
+    }
+
+    #[test]
+    fn tree_truncates_past_the_entry_cap() {
+        let dir = tempfile::tempdir().expect("create tempdir");
+        let file_path = dir.path().join("doc.md");
+        std::fs::write(&file_path, "# Hi\n").expect("write markdown file");
+        for i in 0..(TREE_MAX_ENTRIES + 5) {
+            std::fs::write(dir.path().join(format!("f{i:05}.md")), "# x\n").expect("write file");
+        }
+        let version = AtomicU64::new(0);
+
+        let reply = handle_reply(&get("/tree"), Some(&file_path), &version, false);
+        let value: serde_json::Value = serde_json::from_slice(&reply.body).unwrap();
+        assert_eq!(value["truncated"], true);
+        assert_eq!(value["entries"].as_array().unwrap().len(), TREE_MAX_ENTRIES);
+    }
+
+    #[test]
+    fn tree_skips_hidden_and_excluded_directories() {
+        let dir = tempfile::tempdir().expect("create tempdir");
+        let file_path = dir.path().join("doc.md");
+        std::fs::write(&file_path, "# Hi\n").expect("write markdown file");
+        for name in [".hidden", "node_modules", "target", ".git"] {
+            let sub = dir.path().join(name);
+            std::fs::create_dir(&sub).expect("create excluded dir");
+            std::fs::write(sub.join("x.md"), "# x\n").expect("write file");
+        }
+        std::fs::create_dir(dir.path().join("visible")).expect("create visible dir");
+        std::fs::write(dir.path().join("visible").join("x.md"), "# x\n").expect("write file");
+        let version = AtomicU64::new(0);
+
+        let reply = handle_reply(&get("/tree"), Some(&file_path), &version, false);
+        let value: serde_json::Value = serde_json::from_slice(&reply.body).unwrap();
+        let names: Vec<&str> = value["entries"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|entry| entry["name"].as_str().unwrap())
+            .collect();
+        assert!(names.contains(&"visible"), "{names:?}");
+        for excluded in [".hidden", "node_modules", "target", ".git"] {
+            assert!(!names.contains(&excluded), "{excluded} in {names:?}");
+        }
+    }
+
+    #[test]
+    fn tree_omits_a_folder_with_no_markdown_inside() {
+        let dir = tempfile::tempdir().expect("create tempdir");
+        let file_path = dir.path().join("doc.md");
+        std::fs::write(&file_path, "# Hi\n").expect("write markdown file");
+        std::fs::create_dir(dir.path().join("assets")).expect("create dir");
+        std::fs::write(dir.path().join("assets").join("readme.txt"), "hi").expect("write file");
+        let version = AtomicU64::new(0);
+
+        let reply = handle_reply(&get("/tree"), Some(&file_path), &version, false);
+        let value: serde_json::Value = serde_json::from_slice(&reply.body).unwrap();
+        let names: Vec<&str> = value["entries"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|entry| entry["name"].as_str().unwrap())
+            .collect();
+        assert_eq!(names, vec!["doc.md"]);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn tree_does_not_follow_a_symlinked_directory() {
+        let dir = tempfile::tempdir().expect("create tempdir");
+        let file_path = dir.path().join("doc.md");
+        std::fs::write(&file_path, "# Hi\n").expect("write markdown file");
+
+        let outside = tempfile::tempdir().expect("create outside tempdir");
+        std::fs::write(outside.path().join("secret.md"), "# secret\n").expect("write outside file");
+        std::os::unix::fs::symlink(outside.path(), dir.path().join("linked"))
+            .expect("create symlink");
+
+        let version = AtomicU64::new(0);
+        let reply = handle_reply(&get("/tree"), Some(&file_path), &version, false);
+        let value: serde_json::Value = serde_json::from_slice(&reply.body).unwrap();
+        let names: Vec<&str> = value["entries"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|entry| entry["name"].as_str().unwrap())
+            .collect();
+        assert!(!names.contains(&"linked"), "{names:?}");
+    }
+
+    #[test]
+    fn tree_with_no_file_open_is_409() {
+        let version = AtomicU64::new(0);
+        let reply = handle_reply(&get("/tree"), None, &version, false);
+        assert_eq!(reply.status, 409);
+    }
+
+    // -- PUT /open ------------------------------------------------------
+
+    #[test]
+    fn open_in_browser_mode_is_501() {
+        let dir = tempfile::tempdir().expect("create tempdir");
+        let file_path = dir.path().join("doc.md");
+        std::fs::write(&file_path, "# Hi\n").expect("write markdown file");
+        std::fs::write(dir.path().join("b.md"), "# B\n").expect("write file");
+        let version = AtomicU64::new(0);
+        let headers = with_request_header();
+        let body = br#"{"path":"b.md"}"#;
+
+        // `allow_open: false` — what server.rs (`--browser`) always passes.
+        let (reply, action) = handle(
+            &put_open(body, &headers),
+            Some(&file_path),
+            &version,
+            false,
+            false,
+            None,
+        );
+        assert_eq!(reply.status, 501);
+        assert_eq!(action, Action::None);
+    }
+
+    #[test]
+    fn open_without_the_request_header_is_403() {
+        let dir = tempfile::tempdir().expect("create tempdir");
+        let file_path = dir.path().join("doc.md");
+        std::fs::write(&file_path, "# Hi\n").expect("write markdown file");
+        let version = AtomicU64::new(0);
+        let body = br#"{"path":"doc.md"}"#;
+
+        let (reply, action) = handle(
+            &put_open(body, &REQUEST_HEADER_PAIR),
+            Some(&file_path),
+            &version,
+            false,
+            true,
+            None,
+        );
+        assert_eq!(reply.status, 403);
+        assert_eq!(action, Action::None);
+    }
+
+    #[test]
+    fn open_with_no_file_open_is_409() {
+        let version = AtomicU64::new(0);
+        let headers = with_request_header();
+        let body = br#"{"path":"doc.md"}"#;
+
+        let (reply, action) = handle(&put_open(body, &headers), None, &version, false, true, None);
+        assert_eq!(reply.status, 409);
+        assert_eq!(action, Action::None);
+    }
+
+    #[test]
+    fn open_with_invalid_json_is_400() {
+        let dir = tempfile::tempdir().expect("create tempdir");
+        let file_path = dir.path().join("doc.md");
+        std::fs::write(&file_path, "# Hi\n").expect("write markdown file");
+        let version = AtomicU64::new(0);
+        let headers = with_request_header();
+
+        let (reply, action) = handle(
+            &put_open(b"not json", &headers),
+            Some(&file_path),
+            &version,
+            false,
+            true,
+            None,
+        );
+        assert_eq!(reply.status, 400);
+        assert_eq!(action, Action::None);
+    }
+
+    #[test]
+    fn open_rejects_a_parent_directory_escape() {
+        let dir = tempfile::tempdir().expect("create tempdir");
+        let file_path = dir.path().join("doc.md");
+        std::fs::write(&file_path, "# Hi\n").expect("write markdown file");
+        let version = AtomicU64::new(0);
+        let headers = with_request_header();
+        let body = br#"{"path":"../secret.md"}"#;
+
+        let (reply, action) = handle(
+            &put_open(body, &headers),
+            Some(&file_path),
+            &version,
+            false,
+            true,
+            None,
+        );
+        assert_eq!(reply.status, 400);
+        assert_eq!(action, Action::None);
+    }
+
+    #[test]
+    fn open_rejects_an_absolute_path() {
+        let dir = tempfile::tempdir().expect("create tempdir");
+        let file_path = dir.path().join("doc.md");
+        std::fs::write(&file_path, "# Hi\n").expect("write markdown file");
+        let version = AtomicU64::new(0);
+        let headers = with_request_header();
+        let body = br#"{"path":"/etc/hosts"}"#;
+
+        let (reply, action) = handle(
+            &put_open(body, &headers),
+            Some(&file_path),
+            &version,
+            false,
+            true,
+            None,
+        );
+        assert_eq!(reply.status, 400);
+        assert_eq!(action, Action::None);
+    }
+
+    #[test]
+    fn open_rejects_a_non_markdown_extension() {
+        let dir = tempfile::tempdir().expect("create tempdir");
+        let file_path = dir.path().join("doc.md");
+        std::fs::write(&file_path, "# Hi\n").expect("write markdown file");
+        std::fs::write(dir.path().join("notes.txt"), "hi").expect("write file");
+        let version = AtomicU64::new(0);
+        let headers = with_request_header();
+        let body = br#"{"path":"notes.txt"}"#;
+
+        let (reply, action) = handle(
+            &put_open(body, &headers),
+            Some(&file_path),
+            &version,
+            false,
+            true,
+            None,
+        );
+        assert_eq!(reply.status, 400);
+        assert_eq!(action, Action::None);
+    }
+
+    #[test]
+    fn open_for_a_nonexistent_file_is_404() {
+        let dir = tempfile::tempdir().expect("create tempdir");
+        let file_path = dir.path().join("doc.md");
+        std::fs::write(&file_path, "# Hi\n").expect("write markdown file");
+        let version = AtomicU64::new(0);
+        let headers = with_request_header();
+        let body = br#"{"path":"missing.md"}"#;
+
+        let (reply, action) = handle(
+            &put_open(body, &headers),
+            Some(&file_path),
+            &version,
+            false,
+            true,
+            None,
+        );
+        assert_eq!(reply.status, 404);
+        assert_eq!(action, Action::None);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn open_rejects_a_symlink_that_escapes_the_document_directory() {
+        let dir = tempfile::tempdir().expect("create tempdir");
+        let file_path = dir.path().join("doc.md");
+        std::fs::write(&file_path, "# Hi\n").expect("write markdown file");
+
+        let outside = tempfile::tempdir().expect("create outside tempdir");
+        let secret = outside.path().join("secret.md");
+        std::fs::write(&secret, "# secret\n").expect("write outside file");
+        std::os::unix::fs::symlink(&secret, dir.path().join("escape.md")).expect("create symlink");
+
+        let version = AtomicU64::new(0);
+        let headers = with_request_header();
+        let body = br#"{"path":"escape.md"}"#;
+
+        let (reply, action) = handle(
+            &put_open(body, &headers),
+            Some(&file_path),
+            &version,
+            false,
+            true,
+            None,
+        );
+        assert_eq!(reply.status, 404);
+        assert_eq!(action, Action::None);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn open_rejects_a_symlink_target_even_when_it_resolves_inside_the_root() {
+        // Advisory fix: `GET /tree` never lists a symlink at all
+        // (`scan_tree_dir` skips every one outright), so `PUT /open`
+        // shouldn't accept one via a hand-crafted `path` either — even one
+        // that resolves to a perfectly in-bounds target. This is a
+        // *stricter* check than the escape check above: an escaping
+        // symlink is already caught by the canonicalize+prefix check, but
+        // an in-bounds one wouldn't be without this dedicated
+        // `symlink_metadata` check on the un-canonicalized candidate.
+        let dir = tempfile::tempdir().expect("create tempdir");
+        let file_path = dir.path().join("doc.md");
+        std::fs::write(&file_path, "# Hi\n").expect("write markdown file");
+        std::fs::write(dir.path().join("real.md"), "# Real\n").expect("write real target");
+        std::os::unix::fs::symlink(dir.path().join("real.md"), dir.path().join("link.md"))
+            .expect("create symlink");
+
+        let version = AtomicU64::new(0);
+        let headers = with_request_header();
+        let (reply, action) = handle(
+            &put_open(br#"{"path":"link.md"}"#, &headers),
+            Some(&file_path),
+            &version,
+            false,
+            true,
+            None,
+        );
+        assert_eq!(reply.status, 404);
+        assert_eq!(action, Action::None);
+    }
+
+    #[test]
+    fn open_rejects_a_directory_target() {
+        // Advisory fix: a directory (or, in principle, a FIFO/device node)
+        // named with a `.md` extension must not be accepted — switching to
+        // it would later hang the WebView's protocol-handler thread trying
+        // to `fs::read_to_string` something that isn't a regular file.
+        let dir = tempfile::tempdir().expect("create tempdir");
+        let file_path = dir.path().join("doc.md");
+        std::fs::write(&file_path, "# Hi\n").expect("write markdown file");
+        std::fs::create_dir(dir.path().join("looks-like-a-file.md")).expect("create dir");
+
+        let version = AtomicU64::new(0);
+        let headers = with_request_header();
+        let (reply, action) = handle(
+            &put_open(br#"{"path":"looks-like-a-file.md"}"#, &headers),
+            Some(&file_path),
+            &version,
+            false,
+            true,
+            None,
+        );
+        assert_eq!(reply.status, 404);
+        assert_eq!(action, Action::None);
+    }
+
+    #[test]
+    fn open_succeeds_and_returns_an_open_file_action() {
+        let dir = tempfile::tempdir().expect("create tempdir");
+        let file_path = dir.path().join("doc.md");
+        std::fs::write(&file_path, "# Hi\n").expect("write markdown file");
+        let target = dir.path().join("b.md");
+        std::fs::write(&target, "# B\n").expect("write file");
+        let version = AtomicU64::new(0);
+        let headers = with_request_header();
+        let body = br#"{"path":"b.md"}"#;
+
+        let (reply, action) = handle(
+            &put_open(body, &headers),
+            Some(&file_path),
+            &version,
+            false,
+            true,
+            None,
+        );
+        assert_eq!(reply.status, 200);
+        let value: serde_json::Value = serde_json::from_slice(&reply.body).unwrap();
+        assert_eq!(value["ok"], true);
+        assert_eq!(value["reloaded"], true);
+        assert_eq!(
+            action,
+            Action::OpenFile(target.canonicalize().expect("canonicalize target"))
+        );
+    }
+
+    #[test]
+    fn open_succeeds_for_a_file_in_a_subdirectory() {
+        let dir = tempfile::tempdir().expect("create tempdir");
+        let file_path = dir.path().join("doc.md");
+        std::fs::write(&file_path, "# Hi\n").expect("write markdown file");
+        std::fs::create_dir(dir.path().join("sub")).expect("create sub dir");
+        let target = dir.path().join("sub").join("a.md");
+        std::fs::write(&target, "# A\n").expect("write file");
+        let version = AtomicU64::new(0);
+        let headers = with_request_header();
+        let body = br#"{"path":"sub/a.md"}"#;
+
+        let (reply, action) = handle(
+            &put_open(body, &headers),
+            Some(&file_path),
+            &version,
+            false,
+            true,
+            None,
+        );
+        assert_eq!(reply.status, 200);
+        assert!(value_reloaded(&reply));
+        assert_eq!(
+            action,
+            Action::OpenFile(target.canonicalize().expect("canonicalize target"))
+        );
+    }
+
+    fn value_reloaded(reply: &Reply) -> bool {
+        let value: serde_json::Value = serde_json::from_slice(&reply.body).unwrap();
+        value["reloaded"].as_bool().unwrap_or(false)
+    }
+
+    // -- root_dir: the window's fixed tree/switch root -------------------
+
+    #[test]
+    fn open_can_switch_back_to_a_file_in_the_fixed_window_root_after_descending_into_a_subdirectory(
+    ) {
+        // Regression test for the file-tree root-dir fix: before it, both
+        // `/tree` and `PUT /open` used `asset_parent_dir(file)` — the
+        // *current* file's own parent — as their scope. Switching from
+        // `a.md` into `sub/c.md` would then silently move that scope to
+        // `root/sub`, and switching back to `a.md` (which lives in `root`,
+        // not `root/sub`) would 404 — defeating the tree's whole point of
+        // moving freely between sibling files. Passing the *same*
+        // `root_dir` on every call (as `app.rs`'s `WindowCtx::root_dir`
+        // now does — fixed at the window's first file, never touched by a
+        // later switch) is what fixes this.
+        let dir = tempfile::tempdir().expect("create tempdir");
+        let root_dir = dir.path().canonicalize().expect("canonicalize root dir");
+        let a_path = dir.path().join("a.md");
+        std::fs::write(&a_path, "# A\n").expect("write a.md");
+        std::fs::create_dir(dir.path().join("sub")).expect("create sub dir");
+        let sub_c_path = dir.path().join("sub").join("c.md");
+        std::fs::write(&sub_c_path, "# C\n").expect("write sub/c.md");
+        let version = AtomicU64::new(0);
+        let headers = with_request_header();
+
+        let (reply1, action1) = handle(
+            &put_open(br#"{"path":"sub/c.md"}"#, &headers),
+            Some(&a_path),
+            &version,
+            false,
+            true,
+            Some(&root_dir),
+        );
+        assert_eq!(reply1.status, 200);
+        let sub_c_canonical = sub_c_path.canonicalize().expect("canonicalize sub/c.md");
+        assert_eq!(action1, Action::OpenFile(sub_c_canonical.clone()));
+
+        // Now "in" sub/c.md — switch back to a.md, against the *same*
+        // `root_dir` (never `asset_parent_dir(sub/c.md)`, which would be
+        // `root/sub`, under which "a.md" doesn't exist).
+        let (reply2, action2) = handle(
+            &put_open(br#"{"path":"a.md"}"#, &headers),
+            Some(&sub_c_canonical),
+            &version,
+            false,
+            true,
+            Some(&root_dir),
+        );
+        assert_eq!(reply2.status, 200, "must be able to switch back to a.md");
+        assert_eq!(
+            action2,
+            Action::OpenFile(a_path.canonicalize().expect("canonicalize a.md"))
+        );
+
+        // Root stays inside root_dir; escaping it (`../`) is still 404
+        // regardless of which file is currently open.
+        let (reply3, action3) = handle(
+            &put_open(br#"{"path":"../secret.md"}"#, &headers),
+            Some(&sub_c_canonical),
+            &version,
+            false,
+            true,
+            Some(&root_dir),
+        );
+        assert_eq!(reply3.status, 400);
+        assert_eq!(action3, Action::None);
+    }
+
+    #[test]
+    fn open_without_a_fixed_root_dir_cannot_switch_back_out_of_a_subdirectory() {
+        // Contrast with the fixed-root test above: `root_dir: None` falls
+        // back to `asset_parent_dir(file)` — the pre-fix behavior — which
+        // breaks switching back out of a subdirectory. Pinned here so a
+        // future change to that fallback is deliberate.
+        let dir = tempfile::tempdir().expect("create tempdir");
+        std::fs::write(dir.path().join("a.md"), "# A\n").expect("write a.md");
+        std::fs::create_dir(dir.path().join("sub")).expect("create sub dir");
+        let sub_c_path = dir.path().join("sub").join("c.md");
+        std::fs::write(&sub_c_path, "# C\n").expect("write sub/c.md");
+        let sub_c_canonical = sub_c_path.canonicalize().expect("canonicalize sub/c.md");
+        let version = AtomicU64::new(0);
+        let headers = with_request_header();
+
+        let (reply, action) = handle(
+            &put_open(br#"{"path":"a.md"}"#, &headers),
+            Some(&sub_c_canonical),
+            &version,
+            false,
+            true,
+            None,
+        );
+        assert_eq!(reply.status, 404);
+        assert_eq!(action, Action::None);
+    }
+
+    #[test]
+    fn tree_root_and_current_reflect_the_fixed_root_not_the_current_files_own_parent() {
+        let dir = tempfile::tempdir().expect("create tempdir");
+        let root_name = dir
+            .path()
+            .file_name()
+            .expect("tempdir has a name")
+            .to_string_lossy()
+            .into_owned();
+        std::fs::write(dir.path().join("a.md"), "# A\n").expect("write a.md");
+        std::fs::create_dir(dir.path().join("sub")).expect("create sub dir");
+        let sub_c_path = dir.path().join("sub").join("c.md");
+        std::fs::write(&sub_c_path, "# C\n").expect("write sub/c.md");
+        let root_dir = dir.path().canonicalize().expect("canonicalize root dir");
+        let sub_c_canonical = sub_c_path.canonicalize().expect("canonicalize sub/c.md");
+        let version = AtomicU64::new(0);
+
+        // As if the window's fixed root is `dir` (established from a.md)
+        // but the *current* file is now `sub/c.md` (after a tree switch) —
+        // without `root_dir`, this would use `asset_parent_dir(sub/c.md)`
+        // = `dir/sub` instead, breaking both `root` and `current`.
+        let (reply, _action) = handle(
+            &get("/tree"),
+            Some(&sub_c_canonical),
+            &version,
+            false,
+            true,
+            Some(&root_dir),
+        );
+        assert_eq!(reply.status, 200);
+        let value: serde_json::Value = serde_json::from_slice(&reply.body).unwrap();
+        assert_eq!(value["root"], root_name);
+        assert_eq!(value["current"], "sub/c.md");
+        let names: Vec<&str> = value["entries"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|entry| entry["name"].as_str().unwrap())
+            .collect();
+        assert!(names.contains(&"a.md"), "{names:?}");
+    }
+
+    #[test]
+    fn tree_relative_path_falls_back_to_empty_string_without_leaking_a_path() {
+        // `Path::file_name()` is `None` for a path with no proper
+        // file-name component (`..`, `/`, ...) — `file_title`'s own
+        // fallback would leak the full path there; this must not.
+        assert_eq!(
+            tree_relative_path(Path::new(".."), Path::new("/somewhere/else")),
+            ""
+        );
+    }
+
+    // -- PUT /review: residual cross-window risk (documented, not fixed
+    //    at this layer) ----------------------------------------------------
+
+    #[test]
+    fn put_review_matches_only_by_basename_not_by_directory() {
+        // Characterizes a known, accepted residual risk around switching
+        // files mid-session (see the file-tree design doc's "同名別ディ
+        // レクトリ" note and docs/SECURITY.md): `doc.file` only ever
+        // travels the wire as a bare basename (see `handle_get_review`/
+        // `handle_put_review`), so `handle()` alone can never distinguish
+        // `a/README.md` from `b/README.md` by that basename. What actually
+        // prevents a stale, in-flight PUT from an old page reaching this
+        // handler with a *newly switched* `file` is `app.rs`'s
+        // `open_file` calling `webview.load_url` (discarding the old page)
+        // *before* swapping the served file, not a check in this module.
+        // Pinned here so a future change to the basename-only comparison
+        // is deliberate.
+        let dir = tempfile::tempdir().expect("create tempdir");
+        let readme = dir.path().join("README.md");
+        std::fs::write(&readme, "# Hi\n").expect("write markdown file");
+        let version = AtomicU64::new(0);
+        let headers = with_request_header();
+
+        let body = br#"{"version":1,"file":"README.md","blocks":[]}"#;
+        let reply = handle_reply(&put_review(body, &headers), Some(&readme), &version, false);
+        assert_eq!(
+            reply.status, 200,
+            "handle() alone can't tell same-named files in different directories apart"
+        );
+    }
+
+    // -- scan_tree_dir budget/visited edge cases --------------------------
+
+    #[test]
+    fn tree_keeps_already_collected_entries_when_the_cap_is_hit_inside_a_subdirectory() {
+        // Regression test: hitting the entries cap while about to add a
+        // *subdirectory's own* row used to discard everything already
+        // collected inside it, not just the row that didn't fit.
+        let dir = tempfile::tempdir().expect("create tempdir");
+        std::fs::create_dir(dir.path().join("sub")).expect("create sub dir");
+        for i in 0..5 {
+            std::fs::write(dir.path().join("sub").join(format!("f{i}.md")), "# x\n")
+                .expect("write file");
+        }
+        let (entries, truncated) = collect_tree_entries(dir.path(), 2, 1_000);
+        assert!(truncated);
+        assert_eq!(
+            entries.len(),
+            2,
+            "already-collected entries must survive truncation instead of being discarded"
+        );
+    }
+
+    #[test]
+    fn tree_does_not_truncate_when_entries_exactly_fill_the_budget() {
+        let dir = tempfile::tempdir().expect("create tempdir");
+        for i in 0..4 {
+            std::fs::write(dir.path().join(format!("f{i}.md")), "# x\n").expect("write file");
+        }
+        let (entries, truncated) = collect_tree_entries(dir.path(), 4, 1_000);
+        assert!(
+            !truncated,
+            "exactly filling the budget must not falsely truncate"
+        );
+        assert_eq!(entries.len(), 4);
+    }
+
+    #[test]
+    fn tree_does_not_truncate_when_a_subdirectory_and_its_file_exactly_fill_the_budget() {
+        let dir = tempfile::tempdir().expect("create tempdir");
+        std::fs::create_dir(dir.path().join("sub")).expect("create sub dir");
+        std::fs::write(dir.path().join("sub").join("c.md"), "# C\n").expect("write file");
+        // budget=2: exactly enough for "sub" (dir row) + "sub/c.md" (file row).
+        let (entries, truncated) = collect_tree_entries(dir.path(), 2, 1_000);
+        assert!(!truncated);
+        assert_eq!(entries.len(), 2);
+        assert_eq!(entries[0].kind, "dir");
+        assert_eq!(entries[1].kind, "file");
+    }
+
+    #[test]
+    fn tree_stops_after_visiting_too_many_entries_even_if_none_qualify() {
+        let dir = tempfile::tempdir().expect("create tempdir");
+        std::fs::write(dir.path().join("doc.md"), "# Hi\n").expect("write markdown file");
+        for i in 0..10 {
+            std::fs::write(dir.path().join(format!("noise{i}.txt")), b"x")
+                .expect("write noise file");
+        }
+        let (entries, truncated) = collect_tree_entries(dir.path(), 1_000, 5);
+        assert!(truncated);
+        // Whatever *was* found (doc.md, if visited before the cap) is
+        // kept; the walk just stops looking at more entries once too many
+        // have been examined, regardless of whether they qualified.
+        assert!(entries.len() <= 1);
+    }
+
+    // Linux only: macOS's filesystems (APFS/HFS+) reject a non-UTF-8 file
+    // name outright at creation time (`Illegal byte sequence`), so there's
+    // no way to even construct this scenario there — unlike Linux, which
+    // treats file names as arbitrary byte sequences and happily creates
+    // one, which is exactly the case `scan_tree_dir`'s `to_str()` check
+    // guards against.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn tree_skips_a_non_utf8_file_name() {
+        use std::ffi::OsStr;
+        use std::os::unix::ffi::OsStrExt;
+
+        let dir = tempfile::tempdir().expect("create tempdir");
+        std::fs::write(dir.path().join("a.md"), "# A\n").expect("write a.md");
+        let bad_name = OsStr::from_bytes(b"bad-\xffname.md");
+        std::fs::write(dir.path().join(bad_name), "# Bad\n").expect("write non-utf8-named file");
+
+        let (entries, truncated) = collect_tree_entries(dir.path(), 1_000, 1_000);
+        assert!(!truncated);
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].name, "a.md");
     }
 }

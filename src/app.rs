@@ -194,6 +194,16 @@ enum UserEvent {
     /// Applies to the frontmost window, same as `PickFile`.
     #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
     Reload,
+    /// `PUT /open` (`assets/tree.js`'s file tree) asked to switch the given
+    /// window's file to `path` — posted by [`protocol_response`] whenever
+    /// `routes::handle` returns [`routes::Action::OpenFile`]. Unlike
+    /// [`UserEvent::OpenFile`], this deliberately bypasses
+    /// [`open_in_window_or_new`]'s dedup-and-focus-the-existing-window
+    /// behavior: the whole point of the tree pane is switching *this*
+    /// window's file in place, even if the target happens to already be
+    /// open in some other window (see the design doc's "同じウィンドウで
+    /// 切り替える" decision).
+    SwitchFile(PathBuf, WindowId),
 }
 
 /// One open window: its `tao` window/`wry` WebView pair, the file state and
@@ -223,6 +233,31 @@ struct WindowCtx {
     /// touch the filesystem for every other open window on every dedup
     /// check.
     canonical_file: Option<PathBuf>,
+    /// This window's *fixed* file-tree root: the canonicalized parent
+    /// directory of the first file this window ever opened — `Some` from
+    /// [`create_window`] if it was given a file, or set once by
+    /// [`open_file`] (`establish_root: true`) the first time a file lands
+    /// in a window that started empty. `None` only while the window truly
+    /// has no file yet.
+    ///
+    /// Deliberately never recomputed on a later switch (`open_file` with
+    /// `establish_root: false`, from `UserEvent::SwitchFile`): `GET
+    /// /tree`/`PUT /open` need a stable scope that survives descending
+    /// into a subdirectory, or switching back out of one would 404 (the
+    /// switch's new file's own parent might be a subdirectory of the real
+    /// root, or — after switching back — the root itself again; recomputing
+    /// it from "whatever's open right now" on every switch would make the
+    /// scope drift with it). See the file-tree design doc's "root_dir" /
+    /// `routes::handle`'s docs for the full rationale, and
+    /// `routes::tree_root_dir` for how a `None` here (only ever true for
+    /// `server.rs`, which has no `WindowCtx` at all) falls back to the
+    /// pre-fix `asset_parent_dir(file)` behavior.
+    ///
+    /// An `Arc<Mutex<_>>`, same as `file`, so [`protocol_response`] (run on
+    /// the WebView's own protocol-handler thread) can read the current
+    /// value through [`SharedRegistry`] without going through the event
+    /// loop.
+    root_dir: Arc<Mutex<Option<PathBuf>>>,
     version: Arc<AtomicU64>,
     watcher: Option<RecommendedWatcher>,
     /// When this window was created — used only to satisfy
@@ -231,15 +266,30 @@ struct WindowCtx {
     created_at: Instant,
 }
 
-/// WebView id → that window's file/version state. Populated by
-/// [`create_window`] once its WebView exists, cleared by `run` on
-/// `CloseRequested`. Every window's custom-protocol handler closure closes
-/// over a clone of the same `Arc`, so — although wry requires each
-/// `WebViewBuilder` to be given its own handler *value* — all of them defer
-/// to this one shared map and the same [`protocol_response`] logic, keyed
-/// by each request's `webview_id`. A `webview_id` with no entry (a request
-/// arriving for a window that's already been torn down) gets a 404.
-type SharedRegistry = Arc<Mutex<HashMap<String, (Arc<Mutex<Option<PathBuf>>>, Arc<AtomicU64>)>>>;
+/// WebView id → that window's file/version/root-dir state, plus the
+/// `WindowId` of the window it belongs to. Populated by [`create_window`]
+/// once its WebView exists, cleared by `run` on `CloseRequested`. Every
+/// window's custom-protocol handler closure closes over a clone of the same
+/// `Arc`, so — although wry requires each `WebViewBuilder` to be given its
+/// own handler *value* — all of them defer to this one shared map and the
+/// same [`protocol_response`] logic, keyed by each request's `webview_id`.
+/// A `webview_id` with no entry (a request arriving for a window that's
+/// already been torn down) gets a 404.
+///
+/// The `WindowId` exists purely so [`protocol_response`] can turn a
+/// successful `PUT /open` (`routes::Action::OpenFile`) into a
+/// [`UserEvent::SwitchFile`] addressed at the right window — the protocol
+/// handler only ever sees a `webview_id` (a string wry hands it), never the
+/// `tao::window::WindowId` `run`'s own event loop needs to look the window
+/// back up.
+struct WindowRegistryEntry {
+    file: Arc<Mutex<Option<PathBuf>>>,
+    version: Arc<AtomicU64>,
+    window_id: WindowId,
+    root_dir: Arc<Mutex<Option<PathBuf>>>,
+}
+
+type SharedRegistry = Arc<Mutex<HashMap<String, WindowRegistryEntry>>>;
 
 /// Everything creating a new window needs beyond the file to open and the
 /// live `windows` map — bundled so the several places a new window can be
@@ -502,6 +552,41 @@ pub fn run(initial: Vec<PathBuf>, allow_remote_images: bool) -> Result<()> {
                     }
                 }
             }
+            Event::UserEvent(UserEvent::SwitchFile(path, window_id)) => {
+                // Not `open_in_window_or_new` (its cascade-a-new-window
+                // fallback doesn't apply here), but its dedup check
+                // (`find_window_with_file`) *does* still apply: two windows
+                // silently ending up open on the same file would race to
+                // clobber each other's review sidecar on save (the sidecar
+                // isn't watched for external changes) — exactly the
+                // invariant `open_in_window_or_new`/`find_window_with_file`
+                // protect everywhere else a file can be opened. If some
+                // *other* window already has `path` open, that window is
+                // focused instead and this one (`window_id`, the one whose
+                // tree pane requested the switch) is left showing whatever
+                // it already had. If `path` is already *this* window's own
+                // file (clicking the tree's own highlighted row), there's
+                // nothing to do either way. A window that's since closed
+                // (a race between the request and `CloseRequested`) is
+                // silently a no-op, same treatment every other best-effort
+                // post-startup action in this module gets.
+                match find_window_with_file(&windows, &path) {
+                    Some(existing_id) if existing_id != window_id => {
+                        if let Some(ctx) = windows.get(&existing_id) {
+                            ctx.window.set_focus();
+                        }
+                    }
+                    Some(_) => {}
+                    None => {
+                        if let Some(ctx) = windows.get_mut(&window_id) {
+                            // `establish_root: false` — a switch never
+                            // moves this window's fixed file-tree root, see
+                            // `WindowCtx::root_dir`'s docs.
+                            open_file(ctx, path, false);
+                        }
+                    }
+                }
+            }
             _ => {}
         }
 
@@ -568,6 +653,19 @@ fn create_window(
     let webview_id = format!("w{}", next_webview_id.fetch_add(1, Ordering::SeqCst));
     let file_state: Arc<Mutex<Option<PathBuf>>> = Arc::new(Mutex::new(file.clone()));
     let version: Arc<AtomicU64> = Arc::new(AtomicU64::new(0));
+    // The window's fixed file-tree root — established right away from
+    // `file` if one was given at creation time (the common case: startup,
+    // a new cascaded window, `Event::Opened`, ...), or left `None` for an
+    // empty window until `open_file(_, _, establish_root: true)` sets it
+    // the first time a file lands in it. See `WindowCtx::root_dir`'s docs.
+    let root_dir_state: Arc<Mutex<Option<PathBuf>>> = Arc::new(Mutex::new(
+        file.as_deref()
+            .map(|path| canonical_or_given(routes::asset_parent_dir(path))),
+    ));
+    // `window` already exists at this point (built above), so its id is
+    // available to register alongside the file/version/root-dir state —
+    // see `SharedRegistry`'s docs for why `protocol_response` needs it.
+    let window_id = window.id();
 
     // Published *before* the WebView is even built, not after — on some
     // platforms (notably Windows' WebView2) the underlying view can start
@@ -582,17 +680,23 @@ fn create_window(
         .expect("webview registry mutex poisoned")
         .insert(
             webview_id.clone(),
-            (Arc::clone(&file_state), Arc::clone(&version)),
+            WindowRegistryEntry {
+                file: Arc::clone(&file_state),
+                version: Arc::clone(&version),
+                window_id,
+                root_dir: Arc::clone(&root_dir_state),
+            },
         );
 
-    let window_id = window.id();
     let drop_proxy = proxy.clone();
     let protocol_registry = Arc::clone(registry);
+    let protocol_proxy = proxy.clone();
     let builder = WebViewBuilder::new()
         .with_id(webview_id.as_str())
         .with_custom_protocol(PROTOCOL.into(), move |webview_id, request| {
             protocol_response(
                 &protocol_registry,
+                &protocol_proxy,
                 webview_id,
                 request,
                 debug,
@@ -664,6 +768,7 @@ fn create_window(
         webview_id,
         file: file_state,
         canonical_file,
+        root_dir: root_dir_state,
         version,
         watcher,
         created_at: Instant::now(),
@@ -733,7 +838,10 @@ fn open_in_window_or_new(
     });
     if target_is_empty {
         if let Some(ctx) = windows.get_mut(&target.expect("checked by target_is_empty")) {
-            open_file(ctx, path);
+            // `establish_root: true` — this is the *first* file this
+            // (previously empty) window has ever shown, so its file-tree
+            // root gets fixed here — see `WindowCtx::root_dir`.
+            open_file(ctx, path, true);
         }
         return;
     }
@@ -744,8 +852,41 @@ fn open_in_window_or_new(
 /// updates its window title, and reloads its WebView. The reload (rather
 /// than relying on the live-reload poll alone) is what makes opening a file
 /// recover a view that's stuck on an error page whose script has died.
-fn open_file(ctx: &mut WindowCtx, path: PathBuf) {
+///
+/// The WebView is reloaded *first*, before any of `ctx`'s shared state
+/// (`file`, `root_dir`, `version`) changes — not last, as an earlier
+/// revision of this function did. Reloading last left a window open to a
+/// race: the *old* page can have an in-flight request (most notably an
+/// autosave `PUT /review`) still in flight when this function runs; if
+/// `file` had already been swapped to the *new* path by the time that
+/// request reaches `routes::handle_put_review`, its basename-only `doc.file`
+/// check (see that function's docs) could pass against the *new* file's
+/// name — e.g. switching from `a/README.md` to `b/README.md`, both named
+/// `README.md` — silently overwriting the new file's review sidecar with
+/// the old page's stale data. Discarding the old page *first* means any
+/// request it manages to still get in before it's actually torn down is
+/// still served against the (unchanged, at that point) old `file`, and no
+/// such request can reach this handler with a mismatched *new* `file`
+/// underneath it. See `routes.rs`'s
+/// `put_review_matches_only_by_basename_not_by_directory` test for what
+/// this doesn't (and doesn't need to) additionally guard at the routing
+/// layer.
+///
+/// `establish_root` is `true` only when `path` is the *first* file this
+/// window has ever shown (an empty window being filled — see
+/// [`open_in_window_or_new`]): only then is [`WindowCtx::root_dir`] set,
+/// from `path`'s own parent. `false` for every other switch (in
+/// particular, the file tree's `UserEvent::SwitchFile`), which must leave
+/// `root_dir` exactly as it was — see that field's docs for why.
+fn open_file(ctx: &mut WindowCtx, path: PathBuf, establish_root: bool) {
+    if let Err(err) = ctx.webview.load_url(INITIAL_URL) {
+        eprintln!("warning: failed to reload the view: {err}");
+    }
     ctx.canonical_file = Some(canonical_or_given(&path));
+    if establish_root {
+        let root = canonical_or_given(routes::asset_parent_dir(&path));
+        *ctx.root_dir.lock().expect("root dir mutex poisoned") = Some(root);
+    }
     *ctx.file.lock().expect("file state mutex poisoned") = Some(path.clone());
     // Drop the old watcher *before* creating the new one so the two never
     // overlap (they'd double-count a save when both files share a directory).
@@ -753,9 +894,6 @@ fn open_file(ctx: &mut WindowCtx, path: PathBuf) {
     ctx.watcher = start_watch(&path, &ctx.version);
     ctx.version.fetch_add(1, Ordering::SeqCst);
     ctx.window.set_title(&window_title(Some(&path)));
-    if let Err(err) = ctx.webview.load_url(INITIAL_URL) {
-        eprintln!("warning: failed to reload the view: {err}");
-    }
 }
 
 /// `path.canonicalize()`, or `path` itself if that fails (most likely
@@ -925,22 +1063,35 @@ fn request_path(request: &Request<Vec<u8>>) -> &str {
 /// `webview_id` in `registry` (populated by [`create_window`], cleared by
 /// `run` on `CloseRequested`) for that window's current file/version state
 /// and routes the request through `routes::handle`, same as the browser
-/// server does for an HTTP request. A `webview_id` with no entry — a
-/// request arriving for a window that's already been torn down, or
-/// (shouldn't happen) one that was never registered — gets a plain 404
-/// instead of a panic.
+/// server does for an HTTP request — with `allow_open: true`, since every
+/// native window can switch its own file (see `routes::handle_open`'s
+/// docs). If that returns [`routes::Action::OpenFile`], this posts a
+/// [`UserEvent::SwitchFile`] back to the event loop via `proxy` rather than
+/// touching any window state directly — this function runs on the WebView's
+/// own protocol-handler thread, not the event loop's. A `webview_id` with
+/// no entry — a request arriving for a window that's already been torn
+/// down, or (shouldn't happen) one that was never registered — gets a
+/// plain 404 instead of a panic.
 fn protocol_response(
     registry: &SharedRegistry,
+    proxy: &EventLoopProxy<UserEvent>,
     webview_id: WebViewId<'_>,
     request: Request<Vec<u8>>,
     debug: bool,
     allow_remote_images: bool,
 ) -> Response<Cow<'static, [u8]>> {
-    let Some((file_state, version)) = registry
+    let Some((file_state, version, window_id, root_dir_state)) = registry
         .lock()
         .expect("webview registry mutex poisoned")
         .get(webview_id)
-        .map(|(file, version)| (Arc::clone(file), Arc::clone(version)))
+        .map(|entry| {
+            (
+                Arc::clone(&entry.file),
+                Arc::clone(&entry.version),
+                entry.window_id,
+                Arc::clone(&entry.root_dir),
+            )
+        })
     else {
         if debug {
             eprintln!("[mdview] request for unknown webview id {webview_id:?}");
@@ -984,12 +1135,28 @@ fn protocol_response(
         .lock()
         .expect("file state mutex poisoned")
         .clone();
-    let reply = routes::handle(
+    // Same "clone and release the lock immediately" reasoning as `file`
+    // above — `root_dir` is only ever *written* once (`open_file`
+    // establishing it for a previously-empty window), but reading it
+    // through the same short-lived guard pattern keeps this uniform rather
+    // than special-cased.
+    let root_dir = root_dir_state
+        .lock()
+        .expect("root dir mutex poisoned")
+        .clone();
+    let (reply, action) = routes::handle(
         &route_request,
         file.as_deref(),
         &version,
         allow_remote_images,
+        true,
+        root_dir.as_deref(),
     );
+    if let routes::Action::OpenFile(path) = action {
+        // If the event loop has already shut down, there's nothing useful
+        // to do with the error — the process is exiting anyway.
+        let _ = proxy.send_event(UserEvent::SwitchFile(path, window_id));
+    }
     if debug {
         // The body byte count is only interesting for state-changing
         // requests (PUT/POST) — that's how the body reaches this handler

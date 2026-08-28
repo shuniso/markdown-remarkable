@@ -43,6 +43,13 @@ const LIVE_JS: &str = include_str!("../assets/live.js");
 /// has nowhere to `PUT` comments to).
 const REVIEW_JS: &str = include_str!("../assets/review.js");
 
+/// The bundled file-tree client script, embedded at compile time. Injected
+/// alongside [`LIVE_JS`]/[`REVIEW_JS`] whenever live-reload is requested —
+/// the tree pane only makes sense on a live view (it fetches `GET /tree`
+/// and `PUT`s `/open`, neither of which exists behind `--export`'s static
+/// HTML).
+const TREE_JS: &str = include_str!("../assets/tree.js");
+
 /// Content-Security-Policy applied to every rendered page. There is no
 /// external network access at all (everything is inlined at compile time),
 /// so this is deliberately as strict as `default-src 'none'` plus the exact
@@ -1213,8 +1220,9 @@ fn rewrite_local_image_target(dest_url: CowStr<'_>) -> CowStr<'_> {
 
 /// Wraps a rendered body in the full HTML page: doctype, embedded
 /// stylesheet, a strict Content-Security-Policy, and — when `live` is
-/// `Some(version)` — the embedded live-reload script plus a two-pane
-/// layout with the review-comments sidebar (`assets/review.js`).
+/// `Some(version)` — the embedded live-reload script plus a three-pane
+/// layout: the file tree (`assets/tree.js`), the document, and the
+/// review-comments sidebar (`assets/review.js`).
 ///
 /// `title` is HTML-escaped before being placed in `<title>`. `body_html` is
 /// assumed to already be safe HTML (i.e. the output of [`to_html`]) and is
@@ -1238,6 +1246,8 @@ pub fn page(title: &str, body_html: &str, live: Option<u64>, allow_remote_images
     let body_section = match live {
         Some(version) => format!(
             "<div class=\"layout\">\n\
+             <aside class=\"tree\" id=\"tree\"></aside>\n\
+             <div class=\"splitter tree-splitter\" id=\"tree-splitter\"></div>\n\
              <main class=\"markdown-body doc\">\n\
              {body_html}\n\
              </main>\n\
@@ -1247,7 +1257,8 @@ pub fn page(title: &str, body_html: &str, live: Option<u64>, allow_remote_images
              <script>window.__mdviewVersion=\"{version}\";</script>\n\
              <script>\n{VIEWER_JS}\n</script>\n\
              <script>\n{LIVE_JS}\n</script>\n\
-             <script>\n{REVIEW_JS}\n</script>"
+             <script>\n{REVIEW_JS}\n</script>\n\
+             <script>\n{TREE_JS}\n</script>"
         ),
         None => format!("<main class=\"markdown-body\">\n{body_html}\n</main>"),
     };
@@ -1628,13 +1639,55 @@ mod tests {
     }
 
     #[test]
+    fn page_with_live_includes_the_tree_pane_and_script() {
+        let html = page("Doc", "<p>hi</p>", Some(1), false);
+        assert!(html.contains(r#"<aside class="tree" id="tree"></aside>"#));
+        assert!(html.contains(r#"id="tree-splitter""#));
+        // tree.js content (a distinctive, stable identifier from it).
+        assert!(html.contains("__mdviewTree"));
+    }
+
+    #[test]
+    fn page_with_live_orders_tree_before_doc_before_review() {
+        let html = page("Doc", "<p>hi</p>", Some(1), false);
+        let tree_idx = html
+            .find(r#"<aside class="tree""#)
+            .expect("tree aside present");
+        let tree_splitter_idx = html
+            .find("id=\"tree-splitter\"")
+            .expect("tree splitter present");
+        let doc_idx = html.find("markdown-body doc").expect("doc pane present");
+        let review_splitter_idx = html
+            .find("id=\"splitter\"")
+            .expect("review splitter present");
+        let review_aside_idx = html
+            .find(r#"<aside class="review""#)
+            .expect("review aside present");
+        assert!(tree_idx < tree_splitter_idx);
+        assert!(tree_splitter_idx < doc_idx);
+        assert!(doc_idx < review_splitter_idx);
+        assert!(review_splitter_idx < review_aside_idx);
+    }
+
+    #[test]
+    fn page_without_live_has_no_tree_pane_or_script() {
+        let html = page("Doc", "<p>hi</p>", None, false);
+        assert!(!html.contains("class=\"tree\""));
+        assert!(!html.contains("__mdviewTree"));
+    }
+
+    #[test]
     fn page_with_live_includes_the_pane_splitter() {
         let html = page("Doc", "<p>hi</p>", Some(1), false);
         assert!(html.contains(r#"class="splitter" id="splitter""#));
-        // The splitter must sit between the doc pane and the review aside.
+        // The splitter must sit between the doc pane and the review aside
+        // (not just *an* aside — the tree pane is also an `<aside>` now,
+        // and sits before the doc pane, so the search has to be specific).
         let splitter_idx = html.find("id=\"splitter\"").expect("splitter present");
         let doc_idx = html.find("markdown-body doc").expect("doc pane present");
-        let aside_idx = html.find("<aside").expect("review aside present");
+        let aside_idx = html
+            .find(r#"<aside class="review""#)
+            .expect("review aside present");
         assert!(doc_idx < splitter_idx && splitter_idx < aside_idx);
     }
 

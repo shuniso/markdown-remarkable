@@ -49,6 +49,9 @@
           if (window.__mdviewReview) {
             window.__mdviewReview.onBodyReplaced();
           }
+          if (window.__mdviewTree) {
+            window.__mdviewTree.onBodyReplaced();
+          }
         });
       })
       .catch(function () {
