@@ -608,6 +608,73 @@ fn count_newlines_before(markdown: &str, byte_pos: usize) -> usize {
     markdown[..byte_pos].bytes().filter(|&b| b == b'\n').count()
 }
 
+/// Returns the byte length of a YAML frontmatter block at the very start of
+/// `markdown`, or `0` if there is none.
+///
+/// A leading UTF-8 BOM (`\u{FEFF}`), if present, is skipped before looking
+/// for the opening `---` — editors on Windows routinely write one — but its
+/// byte length is folded into the returned offset, since it's part of the
+/// frontmatter block that callers strip from the body.
+///
+/// The rule mirrors what Jekyll/Obsidian/most static-site generators treat
+/// as frontmatter: the *first line of the file* (no leading blank line
+/// allowed — a document that merely happens to open a `---`-delimited
+/// section a line or two in is not frontmatter) must be `---` once
+/// trailing whitespace (`\r`, spaces, tabs — anything `str::trim_end`
+/// strips) is removed. The block then runs until the first following line
+/// that is, by the same trailing-whitespace-tolerant comparison, `---` or
+/// `...` (frontmatter's YAML-standard "end of document" marker, also
+/// accepted by Jekyll/Obsidian). Tolerating trailing whitespace on the
+/// delimiter lines matches Jekyll/goldmark/remark-frontmatter, which all
+/// accept a trailing space or tab there. If no such closing line exists,
+/// this isn't frontmatter after all — `0` is returned and the text is left
+/// to render as normal Markdown (so the opening `---` falls back to being
+/// a horizontal rule/setext heading, whatever pulldown-cmark would
+/// otherwise make of it).
+///
+/// The returned length includes the closing line's own trailing newline
+/// (`\n`, plus the `\r` right before it if present), so callers can slice
+/// `&markdown[frontmatter_len(markdown)..]` to get exactly the document
+/// body with no leading blank line. A closing line at the very end of the
+/// file with no trailing newline is included up to the end of the file.
+///
+/// This never looks past the first closing line, so a `---` appearing
+/// later in the document body (e.g. as a horizontal rule) is untouched —
+/// it's not part of what this function scans. Every byte offset this
+/// returns is measured against the *original* `markdown`, so callers that
+/// use it to shift other offsets (see [`parsed_blocks`]) keep line numbers
+/// anchored to the original file.
+///
+/// Trade-off: because only the first line is checked, a non-frontmatter
+/// document that happens to open with a horizontal rule (`---`) followed
+/// later by another `---`/`...` line has that whole span swallowed and
+/// left unrendered. This is the same rule Jekyll and Obsidian apply, so it
+/// was adopted deliberately rather than accepted as an edge case.
+fn frontmatter_len(markdown: &str) -> usize {
+    let bom_len = markdown.len() - markdown.strip_prefix('\u{FEFF}').unwrap_or(markdown).len();
+    let body = &markdown[bom_len..];
+
+    let mut lines = body.split_inclusive('\n');
+
+    let Some(first_line) = lines.next() else {
+        return 0;
+    };
+    if first_line.trim_end() != "---" {
+        return 0;
+    }
+
+    let mut offset = first_line.len();
+    for line in lines {
+        let trimmed = line.trim_end();
+        offset += line.len();
+        if trimmed == "---" || trimmed == "..." {
+            return bom_len + offset;
+        }
+    }
+
+    0
+}
+
 fn markdown_options() -> Options {
     let mut options = Options::empty();
     options.insert(Options::ENABLE_TABLES);
@@ -632,10 +699,20 @@ type RangedEvent<'a> = (Event<'a>, Range<usize>);
 /// blockquote, etc. is one block) or, at depth 0, a single event that is
 /// neither `Start` nor `End` (e.g. `Event::Rule`, or a stray depth-0
 /// `Event::Html`).
+///
+/// Any [`frontmatter_len`] prefix is stripped before parsing — the parser
+/// never sees it, so it never becomes a block — and every byte range this
+/// returns (both the block's own range and its events') is shifted back by
+/// that same length before returning, so callers keep working against
+/// offsets (and, via [`line_range`], line numbers) in the *original*
+/// `markdown`, frontmatter included.
 fn parsed_blocks(markdown: &str) -> Vec<(Range<usize>, Vec<RangedEvent<'_>>)> {
-    let events: Vec<(Event<'_>, Range<usize>)> = Parser::new_ext(markdown, markdown_options())
-        .into_offset_iter()
-        .collect();
+    let body_start = frontmatter_len(markdown);
+    let events: Vec<(Event<'_>, Range<usize>)> =
+        Parser::new_ext(&markdown[body_start..], markdown_options())
+            .into_offset_iter()
+            .map(|(event, range)| (event, range.start + body_start..range.end + body_start))
+            .collect();
 
     let mut result = Vec::new();
     let mut depth: i32 = 0;
@@ -2642,5 +2719,137 @@ final paragraph
             item_count as u32 <= MAX_ANCHOR_DEPTH,
             "item_count = {item_count}"
         );
+    }
+
+    // -- frontmatter ---------------------------------------------------
+
+    #[test]
+    fn frontmatter_is_excluded_from_to_html_output() {
+        let md = "---\ntitle: foo\n---\n# body\n";
+        let html = to_html(md, false);
+        assert!(!html.contains("title:"));
+        assert!(!html.contains("<h2>"));
+        assert!(!html.contains("<hr"));
+        assert!(html.contains("<h1>body</h1>"));
+    }
+
+    #[test]
+    fn frontmatter_body_line_start_counts_from_the_original_file() {
+        let md = "---\ntitle: foo\n---\nbody\n";
+        let html = to_html(md, false);
+        assert!(html.contains("data-line-start=\"4\""));
+
+        let found = blocks(md);
+        assert_eq!(found[0].line_start, 4);
+    }
+
+    #[test]
+    fn frontmatter_without_a_closing_line_is_rendered_as_is() {
+        let md = "---\ntitle: x\n\n# body\n";
+        assert_eq!(frontmatter_len(md), 0);
+        assert!(to_html(md, false).contains("<hr"));
+    }
+
+    #[test]
+    fn frontmatter_can_be_closed_with_an_ellipsis_line() {
+        let md = "---\ntitle: x\n...\n# body\n";
+        let html = to_html(md, false);
+        assert!(!html.contains("title:"));
+        assert!(html.contains("<h1>body</h1>"));
+    }
+
+    #[test]
+    fn frontmatter_is_excluded_with_crlf_line_endings() {
+        let md = "---\r\ntitle: x\r\n---\r\n# body\r\n";
+        let html = to_html(md, false);
+        assert!(!html.contains("title:"));
+        assert!(html.contains("data-line-start=\"4\""));
+    }
+
+    #[test]
+    fn a_horizontal_rule_in_the_body_is_still_rendered() {
+        let md = "# a\n\n---\n\n# b\n";
+        assert!(to_html(md, false).contains("<hr"));
+    }
+
+    #[test]
+    fn a_leading_blank_line_disqualifies_frontmatter() {
+        let md = "\n---\ntitle: x\n---\n";
+        assert_eq!(frontmatter_len(md), 0);
+    }
+
+    #[test]
+    fn frontmatter_block_count_matches_between_blocks_and_to_html() {
+        let md = "---\ntitle: x\n---\n# a\n\npara\n";
+        let html = to_html(md, false);
+        assert_eq!(blocks(md).len(), block_level_hashes(&html).len());
+    }
+
+    #[test]
+    fn a_document_that_is_only_frontmatter_renders_as_empty_without_panicking() {
+        assert_eq!(to_html("---\ntitle: x\n---\n", false), "");
+    }
+
+    #[test]
+    fn a_document_that_is_only_frontmatter_with_no_trailing_newline_renders_as_empty_without_panicking(
+    ) {
+        assert_eq!(to_html("---\ntitle: x\n---", false), "");
+    }
+
+    #[test]
+    fn a_leading_bom_is_skipped_and_included_in_the_frontmatter_length() {
+        let md = "\u{FEFF}---\ntitle: x\n---\n# body\n";
+        let html = to_html(md, false);
+        assert!(html.contains("<h1>"));
+        assert!(!html.contains("title:"));
+        assert!(html.contains("data-line-start=\"4\""));
+    }
+
+    #[test]
+    fn frontmatter_delimiter_lines_tolerate_trailing_whitespace() {
+        let md = "---  \ntitle: x\n---\t\n# body\n";
+        let html = to_html(md, false);
+        assert!(!html.contains("title:"));
+        assert!(html.contains("<h1>body</h1>"));
+    }
+
+    #[test]
+    fn frontmatter_len_boundary_cases() {
+        assert_eq!(frontmatter_len(""), 0);
+        assert_eq!(frontmatter_len("---"), 0);
+        assert_eq!(frontmatter_len("----\nx\n----\n"), 0);
+
+        let md = "---\ntitle: 日本語タイトル\n---\n# 本文\n";
+        let html = to_html(md, false);
+        assert!(!html.contains("日本語タイトル"));
+        assert!(html.contains("<h1>本文</h1>"));
+    }
+
+    #[test]
+    fn frontmatter_does_not_change_anchors_other_than_shifting_line_numbers() {
+        let body = "- outer\n  - inner\n- two\n\n| a | b |\n|---|---|\n| 1 | 2 |\n| 3 | 4 |\n";
+        let with_frontmatter = format!("---\ntitle: x\n---\n{body}");
+
+        let without = anchors(body);
+        let with = anchors(&with_frontmatter);
+
+        // Guard the guard: the point of this test is the *nested* anchors
+        // (items/rows are the ones whose inner event ranges slice
+        // `markdown` directly), so make sure `body` still produces some
+        // before comparing — otherwise a future edit to `body` could turn
+        // this into a block-only check that passes vacuously.
+        assert!(without.iter().any(|a| a.kind == AnchorKind::Item));
+        assert!(without.iter().any(|a| a.kind == AnchorKind::Row));
+
+        assert_eq!(without.len(), with.len());
+        for (a, b) in without.iter().zip(with.iter()) {
+            assert_eq!(a.kind, b.kind);
+            assert_eq!(a.parent, b.parent);
+            assert_eq!(a.hash, b.hash);
+            assert_eq!(a.source, b.source);
+            assert_eq!(a.excerpt, b.excerpt);
+            assert_eq!(b.line_start, a.line_start + 3);
+            assert_eq!(b.line_end, a.line_end + 3);
+        }
     }
 }

@@ -1,8 +1,14 @@
+---
+title: mdview sample
+tags: [sample, markdown]
+---
 # mdview sample
 
 A sample file exercising every Markdown feature `mdview` supports. Open it
 with `mdview examples/sample.md` (or render it with `--export`) and check
-that everything below looks right.
+that everything below looks right. The YAML frontmatter at the very top of
+this file (`title:` / `tags:`) is intentionally *not* rendered — if you can
+see it on the page, that's a bug.
 
 ## Headings
 

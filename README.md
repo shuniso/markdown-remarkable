@@ -108,6 +108,12 @@ mdview notes.md --export notes.html
   "local" and the size/extension limits.
 - HTML comments (`<!-- ... -->`), block-level or inline, are discarded
   entirely rather than shown as text.
+- Leading YAML frontmatter — a block starting with a `---` line and closed
+  by the next `---` or `...` line — is stripped and not rendered. Only the
+  first line is checked, so a document that happens to open with a
+  horizontal rule is treated the same way and loses everything up to that
+  closing line; review comments previously anchored inside the stripped
+  span become unanchored rather than disappearing.
 - **Inline review comments**: in the live view (native window or
   `--browser`, not `--export`), every top-level block — a paragraph,
   heading, list, code block, table, blockquote, etc. — gets a right-hand
