@@ -222,7 +222,10 @@ fn export(file: &Path, markdown: &str, out: &Path, allow_remote_images: bool) ->
         .file_name()
         .map(|name| name.to_string_lossy().into_owned())
         .unwrap_or_else(|| file.display().to_string());
-    let html = page(&title, &body_html, None, allow_remote_images);
+    // `browser_mode: false` — meaningless for `--export`'s standalone page
+    // (`live: None` means no doc-header/scripts read it at all), kept
+    // `false` for uniformity with the native window's own default.
+    let html = page(&title, &body_html, None, allow_remote_images, false);
 
     // Same tmp-file-plus-rename, symlink-race-safe write `review::save`/
     // `review::export` use for the sidecar/review-export files — `out` is a

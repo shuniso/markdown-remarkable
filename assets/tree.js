@@ -546,7 +546,21 @@
     loadTree();
   }
 
-  window.__mdviewTree = { onBodyReplaced: onBodyReplaced };
+  window.__mdviewTree = {
+    onBodyReplaced: onBodyReplaced,
+    // Exposed so assets/viewer.js's relative-link click handler can reuse
+    // this exact PUT /open logic instead of duplicating it — see its
+    // module docs.
+    openFile: openFile,
+    // The currently-open file's root-relative path (`GET /tree`'s
+    // `"current"`), or `null` before the first successful `GET /tree`
+    // resolves (or if none is open). Also consumed by viewer.js, to
+    // resolve a relative link's target directory and to populate the doc
+    // header's path label.
+    getCurrent: function () {
+      return state.current;
+    },
+  };
 
   function init() {
     treeEl = document.getElementById("tree");

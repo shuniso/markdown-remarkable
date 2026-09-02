@@ -6,6 +6,7 @@
 //! exercise them directly.
 
 pub mod app;
+pub mod nav_history;
 pub mod render;
 pub mod review;
 pub mod routes;

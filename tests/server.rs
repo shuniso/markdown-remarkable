@@ -588,6 +588,25 @@ fn put_open_is_501_in_browser_mode() {
 }
 
 #[test]
+fn put_nav_is_501_in_browser_mode() {
+    let harness = start_test_server("# Hi\n");
+    let body = br#"{"dir":"back"}"#;
+
+    let response = raw_request_with_body(
+        harness.addr,
+        "PUT",
+        "/nav",
+        &[("X-Mdview-Request", "1")],
+        body,
+    );
+    let response = String::from_utf8_lossy(&response);
+    assert!(
+        response.starts_with("HTTP/1.1 501"),
+        "expected 501 for PUT /nav in --browser mode, got: {response}"
+    );
+}
+
+#[test]
 fn put_review_body_over_1_mib_is_413_over_raw_http() {
     let harness = start_test_server("# Hi\n");
     // A JSON body comfortably over the 1 MiB limit.

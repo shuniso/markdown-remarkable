@@ -1317,17 +1317,45 @@ fn rewrite_local_image_target(dest_url: CowStr<'_>) -> CowStr<'_> {
 /// [`content_security_policy`]. Threaded through from the CLI's
 /// `--allow-remote-images` flag by every caller (the native window,
 /// `--browser`, and `--export` alike).
-pub fn page(title: &str, body_html: &str, live: Option<u64>, allow_remote_images: bool) -> String {
+///
+/// `browser_mode` is `true` only for `--browser` (`server.rs`); the native
+/// window and `--export` both pass `false`. Stamped onto `<body
+/// data-mode="browser"|"native">` so `assets/viewer.js` can tell, without a
+/// round-trip, whether the doc header's back/forward buttons have anything
+/// to drive (`--browser` has no per-window history at all — `GET`/`PUT
+/// /nav` always answer accordingly, see `routes::handle`'s docs) or whether
+/// an `http(s)` link should be handed to `window.open` (`--browser`, whose
+/// clicks stay inside the same OS browser tab that's already showing the
+/// page) instead of left to the native `navigation_policy`/OS-browser path.
+/// Meaningless when `live` is `None` (`--export`'s standalone page has no
+/// scripts to read it), but still stamped for uniformity.
+pub fn page(
+    title: &str,
+    body_html: &str,
+    live: Option<u64>,
+    allow_remote_images: bool,
+    browser_mode: bool,
+) -> String {
     let content_security_policy = content_security_policy(allow_remote_images);
     let title = escape_html_text(title);
+    let mode_attr = if browser_mode { "browser" } else { "native" };
     let body_section = match live {
         Some(version) => format!(
             "<div class=\"layout\">\n\
              <aside class=\"tree\" id=\"tree\"></aside>\n\
              <div class=\"splitter tree-splitter\" id=\"tree-splitter\"></div>\n\
+             <div class=\"doc-column\">\n\
+             <header class=\"doc-header\">\n\
+             <button type=\"button\" class=\"doc-nav-btn\" id=\"doc-back\" \
+             aria-label=\"戻る\" title=\"戻る (⌘[)\" disabled>◀</button>\n\
+             <button type=\"button\" class=\"doc-nav-btn\" id=\"doc-forward\" \
+             aria-label=\"進む\" title=\"進む (⌘])\" disabled>▶</button>\n\
+             <span class=\"doc-header-path\" id=\"doc-header-path\"></span>\n\
+             </header>\n\
              <main class=\"markdown-body doc\">\n\
              {body_html}\n\
              </main>\n\
+             </div>\n\
              <div class=\"splitter\" id=\"splitter\"></div>\n\
              <aside class=\"review\" id=\"review\"></aside>\n\
              </div>\n\
@@ -1350,7 +1378,7 @@ pub fn page(title: &str, body_html: &str, live: Option<u64>, allow_remote_images
 <title>{title}</title>
 <style>{STYLE_CSS}</style>
 </head>
-<body>
+<body data-mode="{mode_attr}">
 {body_section}
 </body>
 </html>
@@ -1680,7 +1708,7 @@ mod tests {
 
     #[test]
     fn page_with_live_includes_version_baseline_and_polling() {
-        let html = page("Doc", "<p>hi</p>", Some(7), false);
+        let html = page("Doc", "<p>hi</p>", Some(7), false, false);
         assert!(html.contains(r#"__mdviewVersion="7""#));
         assert!(html.contains("/version"));
         assert!(html.contains("<script>"));
@@ -1692,14 +1720,14 @@ mod tests {
         // AbortController-based timeout rather than letting a stalled
         // fetch hold `requestInFlight` (and so the in-flight guard) open
         // forever.
-        let html = page("Doc", "<p>hi</p>", Some(1), false);
+        let html = page("Doc", "<p>hi</p>", Some(1), false, false);
         assert!(html.contains("AbortController"));
         assert!(html.contains("signal"));
     }
 
     #[test]
     fn page_without_live_excludes_version_polling() {
-        let html = page("Doc", "<p>hi</p>", None, false);
+        let html = page("Doc", "<p>hi</p>", None, false, false);
         assert!(!html.contains("__mdviewVersion"));
         assert!(!html.contains("/version"));
         assert!(!html.contains("<script>"));
@@ -1707,7 +1735,7 @@ mod tests {
 
     #[test]
     fn page_with_live_includes_a_two_pane_layout_and_review_script() {
-        let html = page("Doc", "<p>hi</p>", Some(1), false);
+        let html = page("Doc", "<p>hi</p>", Some(1), false, false);
         assert!(html.contains(r#"<div class="layout">"#));
         assert!(html.contains(r#"class="markdown-body doc""#));
         assert!(html.contains(r#"<aside class="review" id="review"></aside>"#));
@@ -1717,7 +1745,7 @@ mod tests {
 
     #[test]
     fn page_with_live_includes_the_tree_pane_and_script() {
-        let html = page("Doc", "<p>hi</p>", Some(1), false);
+        let html = page("Doc", "<p>hi</p>", Some(1), false, false);
         assert!(html.contains(r#"<aside class="tree" id="tree"></aside>"#));
         assert!(html.contains(r#"id="tree-splitter""#));
         // tree.js content (a distinctive, stable identifier from it).
@@ -1726,7 +1754,7 @@ mod tests {
 
     #[test]
     fn page_with_live_orders_tree_before_doc_before_review() {
-        let html = page("Doc", "<p>hi</p>", Some(1), false);
+        let html = page("Doc", "<p>hi</p>", Some(1), false, false);
         let tree_idx = html
             .find(r#"<aside class="tree""#)
             .expect("tree aside present");
@@ -1747,15 +1775,53 @@ mod tests {
     }
 
     #[test]
+    fn page_with_live_includes_the_doc_header_between_the_tree_splitter_and_main() {
+        let html = page("Doc", "<p>hi</p>", Some(1), false, false);
+        assert!(html.contains(r#"<header class="doc-header">"#));
+        assert!(html.contains(r#"id="doc-back""#));
+        assert!(html.contains(r#"id="doc-forward""#));
+        assert!(html.contains(r#"id="doc-header-path""#));
+        let tree_splitter_idx = html
+            .find("id=\"tree-splitter\"")
+            .expect("tree splitter present");
+        let header_idx = html.find(r#"<header class="doc-header">"#).unwrap();
+        let doc_idx = html.find("markdown-body doc").expect("doc pane present");
+        assert!(tree_splitter_idx < header_idx);
+        assert!(header_idx < doc_idx);
+    }
+
+    #[test]
+    fn page_without_live_has_no_doc_header() {
+        let html = page("Doc", "<p>hi</p>", None, false, false);
+        // Not a bare `!html.contains("doc-header")`: the embedded
+        // stylesheet always defines `.doc-header`'s CSS rules regardless of
+        // `live` (same reasoning as the `#splitter` check above) — only
+        // the *element* itself is telling.
+        assert!(!html.contains("<header class=\"doc-header\">"));
+    }
+
+    #[test]
+    fn page_defaults_to_native_mode() {
+        let html = page("Doc", "<p>hi</p>", Some(1), false, false);
+        assert!(html.contains(r#"<body data-mode="native">"#));
+    }
+
+    #[test]
+    fn page_stamps_browser_mode_when_requested() {
+        let html = page("Doc", "<p>hi</p>", Some(1), false, true);
+        assert!(html.contains(r#"<body data-mode="browser">"#));
+    }
+
+    #[test]
     fn page_without_live_has_no_tree_pane_or_script() {
-        let html = page("Doc", "<p>hi</p>", None, false);
+        let html = page("Doc", "<p>hi</p>", None, false, false);
         assert!(!html.contains("class=\"tree\""));
         assert!(!html.contains("__mdviewTree"));
     }
 
     #[test]
     fn page_with_live_includes_the_pane_splitter() {
-        let html = page("Doc", "<p>hi</p>", Some(1), false);
+        let html = page("Doc", "<p>hi</p>", Some(1), false, false);
         assert!(html.contains(r#"class="splitter" id="splitter""#));
         // The splitter must sit between the doc pane and the review aside
         // (not just *an* aside — the tree pane is also an `<aside>` now,
@@ -1770,7 +1836,7 @@ mod tests {
 
     #[test]
     fn page_with_live_embeds_the_viewer_script_before_live_js() {
-        let html = page("Doc", "<p>hi</p>", Some(1), false);
+        let html = page("Doc", "<p>hi</p>", Some(1), false, false);
         // viewer.js content (a distinctive, stable identifier from it).
         assert!(html.contains("__mdviewViewer"));
         let viewer_idx = html.find("__mdviewViewer").expect("viewer script present");
@@ -1783,7 +1849,7 @@ mod tests {
 
     #[test]
     fn page_without_live_has_no_layout_aside_splitter_or_scripts() {
-        let html = page("Doc", "<p>hi</p>", None, false);
+        let html = page("Doc", "<p>hi</p>", None, false, false);
         assert!(!html.contains("class=\"layout\""));
         assert!(!html.contains("<aside"));
         // Not a bare `!html.contains("splitter")`: the embedded stylesheet
@@ -1796,14 +1862,14 @@ mod tests {
 
     #[test]
     fn page_includes_content_security_policy() {
-        let html = page("Doc", "<p>hi</p>", None, false);
+        let html = page("Doc", "<p>hi</p>", None, false, false);
         assert!(html.contains("Content-Security-Policy"));
         assert!(html.contains("default-src 'none'"));
     }
 
     #[test]
     fn page_blocks_remote_images_by_default() {
-        let html = page("Doc", "<p>hi</p>", None, false);
+        let html = page("Doc", "<p>hi</p>", None, false, false);
         assert!(html.contains("img-src data: 'self';"));
         assert!(!html.contains("img-src data: 'self' http: https:"));
     }
@@ -1812,26 +1878,26 @@ mod tests {
     fn page_img_src_includes_self_by_default_for_local_asset_images() {
         // `/asset?p=...` (see routes::handle_asset) is same-origin, so
         // img-src must allow 'self' even when remote images are blocked.
-        let html = page("Doc", "<p>hi</p>", None, false);
+        let html = page("Doc", "<p>hi</p>", None, false, false);
         assert!(html.contains("img-src data: 'self';"));
     }
 
     #[test]
     fn page_allows_remote_images_when_opted_in() {
-        let html = page("Doc", "<p>hi</p>", None, true);
+        let html = page("Doc", "<p>hi</p>", None, true, false);
         assert!(html.contains("img-src data: 'self' http: https:"));
     }
 
     #[test]
     fn page_escapes_title() {
-        let html = page("<script>alert(1)</script>", "<p>hi</p>", None, false);
+        let html = page("<script>alert(1)</script>", "<p>hi</p>", None, false, false);
         assert!(html.contains("&lt;script&gt;alert(1)&lt;/script&gt;"));
         assert!(!html.contains("<title><script>"));
     }
 
     #[test]
     fn page_embeds_body_unescaped() {
-        let html = page("Doc", "<p>hi</p>", None, false);
+        let html = page("Doc", "<p>hi</p>", None, false, false);
         assert!(html.contains("<p>hi</p>"));
     }
 

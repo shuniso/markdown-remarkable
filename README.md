@@ -106,6 +106,46 @@ mdview notes.md --export notes.html
 - Local images next to the Markdown file display in the live view (native
   window or `--browser`) — see Limitations below for exactly what counts as
   "local" and the size/extension limits.
+- **Relative-link navigation (native window only)**: clicking a relative
+  link to another `.md`/`.markdown` file (e.g.
+  `[see also](../notes/other.md)`) switches the current window to it in
+  place — *unless* that file is already open in a different window, in
+  which case that other window is simply brought to the front instead (see
+  the "one file, one window" bullet below); either way it's resolved
+  against the currently open file's own directory (not the app's fixed
+  serving URL) — the same scope `PUT /open` (the file tree) already
+  enforces, so a link can't switch to a file outside that boundary. A
+  `#fragment` on the link (`other.md#section`) is discarded — headings
+  don't get an `id`, so there's nothing to scroll to; only the file switch
+  itself happens. A query string (`other.md?x=1`) is discarded the same
+  way. Cmd/Ctrl/Shift/Alt-clicking a relative `.md` link, clicking a
+  relative link to anything *other* than `.md`/`.markdown`, or clicking a
+  root-relative link (`/other.md` or `//host/other.md` — this app only
+  ever resolves a link against the currently open file's own directory,
+  never against a fixed root), is inert: no navigation, and the click
+  doesn't fall through to the WebView's own default behavior either — that
+  would otherwise land on a bare 404 page inside the app, since the
+  WebView resolves it against the app's own internal URL. Middle-clicking
+  one of those same links is also caught, but the guarantee there is
+  narrower — no new tab/window opens (on Windows, WebView2's middle-button
+  autoscroll gesture is outside what a click handler can suppress, so it
+  may still trigger). A doc header above the document shows the current
+  file's path plus **◀**/**▶** buttons (also `⌘[`/`⌘]`, Windows/Linux:
+  `Ctrl+[`/`Ctrl+]` — not available on keyboard layouts where `[`/`]`
+  require AltGr, e.g. many European layouts, since `event.altKey` is
+  deliberately excluded from every shortcut here to avoid misfiring on
+  AltGr-typed punctuation) for per-window back/forward history — not shared
+  across windows, and not persisted across restarts. `--browser` mode has
+  none of this: there's no per-window history there at all (`PUT
+  /open`/`PUT /nav` both always answer `501`), so a relative link, `⌘[`/`⌘]`,
+  and the (hidden) doc header buttons are all left to do nothing beyond
+  whatever the browser's own default click/shortcut behavior already does.
+  `http(s)`/`mailto:` links are unaffected by any of this: in the native
+  window they still open in your default browser (see Limitations below); in
+  `--browser` mode, an unmodified `http(s)` link click opens in a new
+  browser tab instead of navigating the tab mdview is already showing in
+  (a modified click — e.g. Ctrl/Cmd-click for a new tab — is left to the
+  browser's own default behavior).
 - HTML comments (`<!-- ... -->`), block-level or inline, are discarded
   entirely rather than shown as text.
 - Leading YAML frontmatter — a block starting with a `---` line and closed
@@ -178,8 +218,8 @@ mdview notes.md --export notes.html
   and is at most 20 MiB — served through `GET /asset` on the same origin.
   Anything outside that (parent-directory traversal, an absolute path, a
   disallowed extension, an oversized file) renders a broken `<img>` instead.
-  Relative *links* to other files still render as plain `<a>` tags that
-  don't resolve to anything — only images are served this way.
+  A relative *link* (as opposed to an image) is handled differently — see
+  the Features section above, and the `http(s)`/`mailto:` bullet below.
 - `--export`'s standalone HTML file has no server behind it once written, so
   a local/relative-path image still won't display there — the page is
   rendered without the `/asset` rewrite in the first place, same as before
@@ -198,12 +238,26 @@ mdview notes.md --export notes.html
   exception: if the file is already open in some *other* window, that window
   is brought to the front instead of a new one opening on the same file —
   true across every route that can open a file (a drop, ⌘O, a repeated
-  `FILE` on the command line, Finder/"Open With"/`open -a`, and startup
-  itself). There's no tabs, no window list menu, and no combined export
-  across windows.
-- Links in a native window never navigate the window itself: `http(s)`
-  and `mailto:` links open in your default browser, and relative links to
-  other files are ignored (there's no back button to return from them).
+  `FILE` on the command line, Finder/"Open With"/`open -a`, startup itself,
+  a relative-link click, and a ◀/▶ back/forward navigation) — this is what
+  keeps two windows from ever unknowingly opening on the same file and
+  racing to clobber each other's review-comment sidecar. For the
+  relative-link/◀/▶ case specifically: the window whose link/history you
+  clicked is left showing whatever it already had (not switched, not
+  closed), and its own back/forward history's cursor doesn't move either —
+  a relative-link click that resolves to an already-open-elsewhere file
+  never pushes a new history entry in the first place, and a ◀/▶ step onto
+  one has its cursor move undone right back to where it started — so
+  ◀/▶'s enabled/disabled state after the click is exactly what it was
+  before it, in both cases. There's no tabs, no window list menu, and no
+  combined export across windows.
+- `http(s)`/`mailto:` links in a native window never navigate the window
+  itself — they open in your default browser instead. A relative link to
+  another `.md`/`.markdown` file navigates the window in place, but only in
+  the native window (see the Features section above); a relative link to
+  anything else, or any relative link at all in `--browser` mode, is inert
+  in the native window and a same-tab 404 in `--browser` (recoverable with
+  the browser's own back button) — same as before this feature existed.
 - The native windows share a single minimal menu bar on macOS only (Quit,
   Copy, Select All, Close Window, with the usual Cmd shortcuts) — menu
   actions like Zoom/Reload/Open… apply to whichever window is currently

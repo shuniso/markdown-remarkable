@@ -105,11 +105,27 @@ fn error_json(status: u16, message: &str) -> Reply {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Action {
     /// Nothing beyond the `Reply` itself — every route except a successful
-    /// `PUT /open`.
+    /// `PUT /open`/`PUT /nav`.
     None,
     /// Switch the current window's file to this (already canonicalized)
     /// path.
     OpenFile(PathBuf),
+    /// Move the current window's back/forward history one step in the given
+    /// direction and switch to whatever that lands on. Unlike
+    /// [`Action::OpenFile`], this carries no path — the history itself
+    /// (which `handle` never touches, see [`handle_nav_put`]'s docs) is what
+    /// decides the target, and only the caller (`app.rs`) has mutable access
+    /// to it.
+    Navigate(NavDirection),
+}
+
+/// Which way a `PUT /nav` request asks the current window to move through
+/// its back/forward history — see [`Action::Navigate`], [`handle_nav_put`],
+/// and `app.rs`'s `UserEvent::Navigate`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum NavDirection {
+    Back,
+    Forward,
 }
 
 /// A routing request: transport-agnostic method/path/headers/body, built by
@@ -191,6 +207,13 @@ fn has_request_header(req: &RouteRequest) -> bool {
 ///   of the process. `true` (the native app, `app.rs`) applies the switch
 ///   to *this* WebView's window via the returned [`Action::OpenFile`]. See
 ///   [`handle_open`].
+/// - `GET /nav` — `{"back": bool, "forward": bool}`, whether the current
+///   window's history has anything to go back/forward to. Always
+///   `{"back": false, "forward": false}` when `allow_open` is `false` or
+///   `nav` is `None` — see [`handle_nav_get`].
+/// - `PUT /nav` — moves the current window's history one step per a JSON
+///   body `{"dir": "back"|"forward"}`, gated by `allow_open` the same way
+///   `PUT /open` is (`501` under `--browser`). See [`handle_nav_put`].
 /// - anything else — `404`.
 ///
 /// `root_dir`, when `Some`, is the directory `GET /tree`/`PUT /open` treat
@@ -223,8 +246,16 @@ fn has_request_header(req: &RouteRequest) -> bool {
 ///
 /// Returns `(Reply, Action)` rather than a bare `Reply`: routing never
 /// mutates any window/server state itself (see the module docs), so a
-/// route that needs to (only `PUT /open` today) hands its request back as
+/// route that needs to (`PUT /open`, `PUT /nav`) hands its request back as
 /// an [`Action`] for the caller to apply in its own way instead.
+///
+/// `nav`, when `Some`, is `(can_back, can_forward)` — a snapshot of the
+/// current window's back/forward history state, read (like `file`/
+/// `root_dir`) by the caller before this call rather than mutated by it;
+/// `GET /nav`/`PUT /nav` only ever read this snapshot, never the history
+/// itself (which `handle` has no access to — see [`Action::Navigate`]'s
+/// docs). `None` (always passed by `server.rs`, which has no window/history
+/// concept of its own) behaves like `(false, false)`.
 pub fn handle(
     req: &RouteRequest,
     file: Option<&Path>,
@@ -232,6 +263,7 @@ pub fn handle(
     allow_remote_images: bool,
     allow_open: bool,
     root_dir: Option<&Path>,
+    nav: Option<(bool, bool)>,
 ) -> (Reply, Action) {
     let route = req.path.split('?').next().unwrap_or("/");
     if route == "/asset" && matches!(req.method, "GET" | "HEAD") {
@@ -249,7 +281,7 @@ pub fn handle(
     }
     let (reply, action) = match (req.method, route) {
         ("GET", "/") | ("HEAD", "/") => (
-            handle_root(file, version, allow_remote_images),
+            handle_root(file, version, allow_remote_images, !allow_open),
             Action::None,
         ),
         ("GET", "/version") | ("HEAD", "/version") => (handle_version(version), Action::None),
@@ -259,6 +291,8 @@ pub fn handle(
         ("POST", "/export") => (handle_export(req, file), Action::None),
         ("GET", "/tree") => (handle_tree(file, root_dir), Action::None),
         ("PUT", "/open") => handle_open(req, file, allow_open, root_dir),
+        ("GET", "/nav") => (handle_nav_get(nav, allow_open), Action::None),
+        ("PUT", "/nav") => handle_nav_put(req, nav, allow_open),
         _ => (Reply::text(404, "404 Not Found"), Action::None),
     };
     (
@@ -270,7 +304,12 @@ pub fn handle(
     )
 }
 
-fn handle_root(file: Option<&Path>, version: &AtomicU64, allow_remote_images: bool) -> Reply {
+fn handle_root(
+    file: Option<&Path>,
+    version: &AtomicU64,
+    allow_remote_images: bool,
+    browser_mode: bool,
+) -> Reply {
     // Read the live-reload baseline *before* reading the file: if a save
     // lands in between, the version embedded here is guaranteed to be no
     // newer than the content about to be rendered, so the client's first
@@ -284,12 +323,19 @@ fn handle_root(file: Option<&Path>, version: &AtomicU64, allow_remote_images: bo
                 EMPTY_BODY_HTML,
                 Some(baseline),
                 allow_remote_images,
+                browser_mode,
             ),
         ),
         Some(path) => match read_and_render(path) {
             Ok((title, body_html)) => Reply::html(
                 200,
-                page(&title, &body_html, Some(baseline), allow_remote_images),
+                page(
+                    &title,
+                    &body_html,
+                    Some(baseline),
+                    allow_remote_images,
+                    browser_mode,
+                ),
             ),
             // Still a full page (live script included) so the view can
             // recover by itself once the file is back — a bare 500 would
@@ -301,6 +347,7 @@ fn handle_root(file: Option<&Path>, version: &AtomicU64, allow_remote_images: bo
                     &error_fragment(&title),
                     Some(baseline),
                     allow_remote_images,
+                    browser_mode,
                 ),
             ),
         },
@@ -814,7 +861,21 @@ struct OpenRequest {
 ///   `PUT /review`/`POST /export`).
 /// - `file` is `Some` — `409` otherwise (nothing to resolve a relative
 ///   path against).
-/// - The body parses as [`OpenRequest`] — `400` otherwise.
+/// - The body parses as [`OpenRequest`] — `400` otherwise. `path` is taken
+///   as a literal, already-decoded relative path — a JSON string carries
+///   its bytes directly, with no percent-encoding layer of its own. Every
+///   caller is expected to have decoded any percent-encoding *before*
+///   putting a segment in this field: `assets/tree.js`'s `GET /tree`
+///   response is already plain text, and `assets/viewer.js`'s relative-link
+///   click handler explicitly `decodeURIComponent`s each `href` path
+///   segment first (`render::to_html`'s `escape_href` percent-encodes
+///   spaces/non-ASCII characters into a rendered `<a href>`, so a link to a
+///   file whose name isn't plain ASCII would otherwise arrive here still
+///   percent-encoded and fail every check below against the real file
+///   name). A caller that sends a still-encoded segment doesn't reach
+///   anything unintended — it simply fails to resolve, the same as any
+///   other nonexistent `path` — but won't successfully switch to the file
+///   it meant either.
 /// - `path`, parsed as a [`Path`], is made up *only* of
 ///   [`Component::Normal`] segments (see [`is_plain_relative_path`], the
 ///   same check [`handle_asset`] applies to its own `p` query value) and
@@ -929,6 +990,100 @@ fn handle_open(
     (
         Reply::json(200, serde_json::json!({ "ok": true, "reloaded": true })),
         Action::OpenFile(candidate_canonical),
+    )
+}
+
+/// `GET /nav`: `{"back": bool, "forward": bool}`, read straight off the
+/// `nav` snapshot [`handle`] was given — `(false, false)` whenever
+/// `allow_open` is `false` (there's no per-window history under
+/// `--browser`, same reasoning as `PUT /open`'s `501`) or `nav` is `None`
+/// (no window/history yet — e.g. an empty native window with no file open).
+/// Never fails: unlike `GET /tree`, there's nothing here that needs a file
+/// to be open to answer meaningfully — "nothing to go back/forward to" is
+/// itself a valid, `200` answer.
+fn handle_nav_get(nav: Option<(bool, bool)>, allow_open: bool) -> Reply {
+    let (can_back, can_forward) = if allow_open {
+        nav.unwrap_or((false, false))
+    } else {
+        (false, false)
+    };
+    Reply::json(
+        200,
+        serde_json::json!({ "back": can_back, "forward": can_forward }),
+    )
+}
+
+/// The JSON body `PUT /nav` expects: `{"dir": "back"|"forward"}`.
+#[derive(Deserialize)]
+struct NavRequest {
+    dir: String,
+}
+
+/// `PUT /nav`: moves the current window's back/forward history one step, per
+/// a JSON body `{"dir": "back"|"forward"}`. Gated by `allow_open` exactly
+/// like [`handle_open`] — `false` (the browser server) always answers `501`
+/// first, before checking anything else, since `--browser` has no
+/// per-window history to move through at all.
+///
+/// With `allow_open: true`, checked in this order:
+/// - [`REQUEST_HEADER`] is present — `403` otherwise (same CSRF defense as
+///   every other state-changing route in this module).
+/// - `nav` is `Some` — `409` otherwise (no window/history yet, e.g. an
+///   empty window with no file open — nothing to navigate).
+/// - The body parses as [`NavRequest`] and `dir` is exactly `"back"` or
+///   `"forward"` — `400` otherwise.
+/// - The requested direction is actually available, per the `nav` snapshot
+///   (`can_back`/`can_forward`) — `409` otherwise (asking to go back with
+///   nothing behind it, or forward with nothing ahead — a stale client, or
+///   a race with another request that already moved the cursor).
+///
+/// On success: `200` `{"ok": true, "reloaded": true}` (same "the caller
+/// always ends up reloading some window" contract [`handle_open`]'s own
+/// `"reloaded"` documents), plus [`Action::Navigate`] for the caller to
+/// actually move its history and switch the window's file — this function
+/// never touches the history itself, only the `nav` snapshot it was handed
+/// (see [`Action::Navigate`]'s docs for why: `handle` has no mutable access
+/// to it, only the caller does).
+fn handle_nav_put(
+    req: &RouteRequest,
+    nav: Option<(bool, bool)>,
+    allow_open: bool,
+) -> (Reply, Action) {
+    if !allow_open {
+        return (
+            error_json(501, "navigation is not supported in --browser mode"),
+            Action::None,
+        );
+    }
+    if !has_request_header(req) {
+        return (
+            error_json(403, "missing X-Mdview-Request header"),
+            Action::None,
+        );
+    }
+    let Some((can_back, can_forward)) = nav else {
+        return (no_file_open(), Action::None);
+    };
+
+    let Ok(nav_request) = serde_json::from_slice::<NavRequest>(req.body) else {
+        return (error_json(400, "invalid request body"), Action::None);
+    };
+    let direction = match nav_request.dir.as_str() {
+        "back" => NavDirection::Back,
+        "forward" => NavDirection::Forward,
+        _ => return (error_json(400, "invalid direction"), Action::None),
+    };
+    let available = match direction {
+        NavDirection::Back => can_back,
+        NavDirection::Forward => can_forward,
+    };
+    if !available {
+        return (error_json(409, "no further history"), Action::None);
+    }
+
+    (
+        Reply::json(200, serde_json::json!({ "ok": true, "reloaded": true })),
+        Action::Navigate(direction),
     )
 }
 
@@ -1193,7 +1348,7 @@ mod tests {
         version: &AtomicU64,
         allow_remote_images: bool,
     ) -> Reply {
-        handle(req, file, version, allow_remote_images, false, None).0
+        handle(req, file, version, allow_remote_images, false, None, None).0
     }
 
     /// A `GET` request with no headers/body — what nearly every test that
@@ -1260,6 +1415,48 @@ mod tests {
         let body = String::from_utf8(reply.body).expect("utf8 body");
         assert!(body.contains("<h1>Hello</h1>"));
         assert!(body.contains("__mdviewVersion=\"3\""));
+    }
+
+    #[test]
+    fn root_stamps_browser_mode_when_allow_open_is_false() {
+        let dir = tempfile::tempdir().expect("create tempdir");
+        let file_path = dir.path().join("doc.md");
+        std::fs::write(&file_path, "# Hi\n").expect("write markdown file");
+        let version = AtomicU64::new(0);
+
+        let (reply, _action) = handle(
+            &get("/"),
+            Some(&file_path),
+            &version,
+            false,
+            false,
+            None,
+            None,
+        );
+
+        let body = String::from_utf8(reply.body).expect("utf8 body");
+        assert!(body.contains(r#"<body data-mode="browser">"#));
+    }
+
+    #[test]
+    fn root_stamps_native_mode_when_allow_open_is_true() {
+        let dir = tempfile::tempdir().expect("create tempdir");
+        let file_path = dir.path().join("doc.md");
+        std::fs::write(&file_path, "# Hi\n").expect("write markdown file");
+        let version = AtomicU64::new(0);
+
+        let (reply, _action) = handle(
+            &get("/"),
+            Some(&file_path),
+            &version,
+            false,
+            true,
+            None,
+            None,
+        );
+
+        let body = String::from_utf8(reply.body).expect("utf8 body");
+        assert!(body.contains(r#"<body data-mode="native">"#));
     }
 
     #[test]
@@ -2193,6 +2390,7 @@ mod tests {
             false,
             false,
             None,
+            None,
         );
         assert_eq!(reply.status, 501);
         assert_eq!(action, Action::None);
@@ -2213,6 +2411,7 @@ mod tests {
             false,
             true,
             None,
+            None,
         );
         assert_eq!(reply.status, 403);
         assert_eq!(action, Action::None);
@@ -2224,7 +2423,15 @@ mod tests {
         let headers = with_request_header();
         let body = br#"{"path":"doc.md"}"#;
 
-        let (reply, action) = handle(&put_open(body, &headers), None, &version, false, true, None);
+        let (reply, action) = handle(
+            &put_open(body, &headers),
+            None,
+            &version,
+            false,
+            true,
+            None,
+            None,
+        );
         assert_eq!(reply.status, 409);
         assert_eq!(action, Action::None);
     }
@@ -2243,6 +2450,7 @@ mod tests {
             &version,
             false,
             true,
+            None,
             None,
         );
         assert_eq!(reply.status, 400);
@@ -2265,6 +2473,7 @@ mod tests {
             false,
             true,
             None,
+            None,
         );
         assert_eq!(reply.status, 400);
         assert_eq!(action, Action::None);
@@ -2285,6 +2494,7 @@ mod tests {
             &version,
             false,
             true,
+            None,
             None,
         );
         assert_eq!(reply.status, 400);
@@ -2308,6 +2518,7 @@ mod tests {
             false,
             true,
             None,
+            None,
         );
         assert_eq!(reply.status, 400);
         assert_eq!(action, Action::None);
@@ -2328,6 +2539,7 @@ mod tests {
             &version,
             false,
             true,
+            None,
             None,
         );
         assert_eq!(reply.status, 404);
@@ -2356,6 +2568,7 @@ mod tests {
             &version,
             false,
             true,
+            None,
             None,
         );
         assert_eq!(reply.status, 404);
@@ -2389,6 +2602,7 @@ mod tests {
             false,
             true,
             None,
+            None,
         );
         assert_eq!(reply.status, 404);
         assert_eq!(action, Action::None);
@@ -2414,6 +2628,7 @@ mod tests {
             false,
             true,
             None,
+            None,
         );
         assert_eq!(reply.status, 404);
         assert_eq!(action, Action::None);
@@ -2436,6 +2651,7 @@ mod tests {
             &version,
             false,
             true,
+            None,
             None,
         );
         assert_eq!(reply.status, 200);
@@ -2467,6 +2683,7 @@ mod tests {
             false,
             true,
             None,
+            None,
         );
         assert_eq!(reply.status, 200);
         assert!(value_reloaded(&reply));
@@ -2479,6 +2696,227 @@ mod tests {
     fn value_reloaded(reply: &Reply) -> bool {
         let value: serde_json::Value = serde_json::from_slice(&reply.body).unwrap();
         value["reloaded"].as_bool().unwrap_or(false)
+    }
+
+    // -- GET/PUT /nav -----------------------------------------------------
+
+    fn put_nav<'a>(body: &'a [u8], headers: &'a [(String, String)]) -> RouteRequest<'a> {
+        RouteRequest {
+            method: "PUT",
+            path: "/nav",
+            headers,
+            body,
+        }
+    }
+
+    #[test]
+    fn nav_get_with_no_history_reports_false_false() {
+        let version = AtomicU64::new(0);
+        let (reply, action) = handle(&get("/nav"), None, &version, false, true, None, None);
+        assert_eq!(reply.status, 200);
+        assert_eq!(action, Action::None);
+        let value: serde_json::Value = serde_json::from_slice(&reply.body).unwrap();
+        assert_eq!(value["back"], false);
+        assert_eq!(value["forward"], false);
+    }
+
+    #[test]
+    fn nav_get_reports_the_given_snapshot() {
+        let version = AtomicU64::new(0);
+        let (reply, _action) = handle(
+            &get("/nav"),
+            None,
+            &version,
+            false,
+            true,
+            None,
+            Some((true, false)),
+        );
+        let value: serde_json::Value = serde_json::from_slice(&reply.body).unwrap();
+        assert_eq!(value["back"], true);
+        assert_eq!(value["forward"], false);
+    }
+
+    #[test]
+    fn nav_get_in_browser_mode_is_always_false_false_even_with_a_snapshot() {
+        // `allow_open: false` (server.rs/`--browser`) always answers
+        // false/false, regardless of what `nav` says — there's no
+        // per-window history under `--browser` at all.
+        let version = AtomicU64::new(0);
+        let (reply, _action) = handle(
+            &get("/nav"),
+            None,
+            &version,
+            false,
+            false,
+            None,
+            Some((true, true)),
+        );
+        let value: serde_json::Value = serde_json::from_slice(&reply.body).unwrap();
+        assert_eq!(value["back"], false);
+        assert_eq!(value["forward"], false);
+    }
+
+    #[test]
+    fn nav_put_in_browser_mode_is_501() {
+        let version = AtomicU64::new(0);
+        let headers = with_request_header();
+        let body = br#"{"dir":"back"}"#;
+        let (reply, action) = handle(
+            &put_nav(body, &headers),
+            None,
+            &version,
+            false,
+            false,
+            None,
+            Some((true, true)),
+        );
+        assert_eq!(reply.status, 501);
+        assert_eq!(action, Action::None);
+    }
+
+    #[test]
+    fn nav_put_without_the_request_header_is_403() {
+        let version = AtomicU64::new(0);
+        let body = br#"{"dir":"back"}"#;
+        let (reply, action) = handle(
+            &put_nav(body, &REQUEST_HEADER_PAIR),
+            None,
+            &version,
+            false,
+            true,
+            None,
+            Some((true, true)),
+        );
+        assert_eq!(reply.status, 403);
+        assert_eq!(action, Action::None);
+    }
+
+    #[test]
+    fn nav_put_with_no_history_is_409() {
+        let version = AtomicU64::new(0);
+        let headers = with_request_header();
+        let body = br#"{"dir":"back"}"#;
+        let (reply, action) = handle(
+            &put_nav(body, &headers),
+            None,
+            &version,
+            false,
+            true,
+            None,
+            None,
+        );
+        assert_eq!(reply.status, 409);
+        assert_eq!(action, Action::None);
+    }
+
+    #[test]
+    fn nav_put_with_invalid_json_is_400() {
+        let version = AtomicU64::new(0);
+        let headers = with_request_header();
+        let (reply, action) = handle(
+            &put_nav(b"not json", &headers),
+            None,
+            &version,
+            false,
+            true,
+            None,
+            Some((true, true)),
+        );
+        assert_eq!(reply.status, 400);
+        assert_eq!(action, Action::None);
+    }
+
+    #[test]
+    fn nav_put_with_an_invalid_direction_is_400() {
+        let version = AtomicU64::new(0);
+        let headers = with_request_header();
+        let body = br#"{"dir":"sideways"}"#;
+        let (reply, action) = handle(
+            &put_nav(body, &headers),
+            None,
+            &version,
+            false,
+            true,
+            None,
+            Some((true, true)),
+        );
+        assert_eq!(reply.status, 400);
+        assert_eq!(action, Action::None);
+    }
+
+    #[test]
+    fn nav_put_back_when_unavailable_is_409() {
+        let version = AtomicU64::new(0);
+        let headers = with_request_header();
+        let body = br#"{"dir":"back"}"#;
+        let (reply, action) = handle(
+            &put_nav(body, &headers),
+            None,
+            &version,
+            false,
+            true,
+            None,
+            Some((false, true)),
+        );
+        assert_eq!(reply.status, 409);
+        assert_eq!(action, Action::None);
+    }
+
+    #[test]
+    fn nav_put_forward_when_unavailable_is_409() {
+        let version = AtomicU64::new(0);
+        let headers = with_request_header();
+        let body = br#"{"dir":"forward"}"#;
+        let (reply, action) = handle(
+            &put_nav(body, &headers),
+            None,
+            &version,
+            false,
+            true,
+            None,
+            Some((true, false)),
+        );
+        assert_eq!(reply.status, 409);
+        assert_eq!(action, Action::None);
+    }
+
+    #[test]
+    fn nav_put_back_succeeds_and_returns_a_navigate_action() {
+        let version = AtomicU64::new(0);
+        let headers = with_request_header();
+        let body = br#"{"dir":"back"}"#;
+        let (reply, action) = handle(
+            &put_nav(body, &headers),
+            None,
+            &version,
+            false,
+            true,
+            None,
+            Some((true, false)),
+        );
+        assert_eq!(reply.status, 200);
+        assert!(value_reloaded(&reply));
+        assert_eq!(action, Action::Navigate(NavDirection::Back));
+    }
+
+    #[test]
+    fn nav_put_forward_succeeds_and_returns_a_navigate_action() {
+        let version = AtomicU64::new(0);
+        let headers = with_request_header();
+        let body = br#"{"dir":"forward"}"#;
+        let (reply, action) = handle(
+            &put_nav(body, &headers),
+            None,
+            &version,
+            false,
+            true,
+            None,
+            Some((false, true)),
+        );
+        assert_eq!(reply.status, 200);
+        assert!(value_reloaded(&reply));
+        assert_eq!(action, Action::Navigate(NavDirection::Forward));
     }
 
     // -- root_dir: the window's fixed tree/switch root -------------------
@@ -2513,6 +2951,7 @@ mod tests {
             false,
             true,
             Some(&root_dir),
+            None,
         );
         assert_eq!(reply1.status, 200);
         let sub_c_canonical = sub_c_path.canonicalize().expect("canonicalize sub/c.md");
@@ -2528,6 +2967,7 @@ mod tests {
             false,
             true,
             Some(&root_dir),
+            None,
         );
         assert_eq!(reply2.status, 200, "must be able to switch back to a.md");
         assert_eq!(
@@ -2544,6 +2984,7 @@ mod tests {
             false,
             true,
             Some(&root_dir),
+            None,
         );
         assert_eq!(reply3.status, 400);
         assert_eq!(action3, Action::None);
@@ -2570,6 +3011,7 @@ mod tests {
             &version,
             false,
             true,
+            None,
             None,
         );
         assert_eq!(reply.status, 404);
@@ -2604,6 +3046,7 @@ mod tests {
             false,
             true,
             Some(&root_dir),
+            None,
         );
         assert_eq!(reply.status, 200);
         let value: serde_json::Value = serde_json::from_slice(&reply.body).unwrap();

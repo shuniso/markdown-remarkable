@@ -103,13 +103,17 @@ fn handle_request(
             // `routes::handle_open`'s docs. `root_dir: None` — `--browser`
             // has no window/root concept of its own, so `GET /tree` falls
             // back to `asset_parent_dir(path)`, which never changes anyway
-            // since `path` is fixed for this process's whole run.
+            // since `path` is fixed for this process's whole run. `nav:
+            // None` — same reasoning: `--browser` has no per-window history
+            // either, so `GET /nav` always answers `{"back":false,
+            // "forward":false}` and `PUT /nav` always `501` regardless.
             let (reply, action) = routes::handle(
                 &route_request,
                 Some(path),
                 version,
                 allow_remote_images,
                 false,
+                None,
                 None,
             );
             debug_assert!(

@@ -13,6 +13,7 @@
 //! log every request every WebView makes through the custom protocol, which
 //! is how the live-reload path gets verified by hand.
 
+use crate::nav_history::NavHistory;
 use crate::routes;
 use crate::util::file_title;
 use crate::watch;
@@ -204,6 +205,15 @@ enum UserEvent {
     /// open in some other window (see the design doc's "同じウィンドウで
     /// 切り替える" decision).
     SwitchFile(PathBuf, WindowId),
+    /// `PUT /nav` (the doc header's back/forward buttons, or ⌘[/⌘]) asked to
+    /// move the given window's history one step — posted by
+    /// [`protocol_response`] whenever `routes::handle` returns
+    /// [`routes::Action::Navigate`]. `run`'s handler is the only place that
+    /// actually pops from a window's [`NavHistory`] (`protocol_response`
+    /// only ever reads a snapshot of it — see `routes::handle`'s `nav`
+    /// parameter docs), same division of labor as [`UserEvent::SwitchFile`]
+    /// vs. `open_file`.
+    Navigate(routes::NavDirection, WindowId),
 }
 
 /// One open window: its `tao` window/`wry` WebView pair, the file state and
@@ -258,6 +268,22 @@ struct WindowCtx {
     /// value through [`SharedRegistry`] without going through the event
     /// loop.
     root_dir: Arc<Mutex<Option<PathBuf>>>,
+    /// This window's back/forward navigation history — `None` until a file
+    /// first lands in it (same "not yet established" moment as
+    /// [`WindowCtx::root_dir`]), `Some` from then on. Unlike `root_dir`,
+    /// every subsequent switch touches this: `open_file`'s `push_history`
+    /// argument decides whether a switch pushes a new entry (a link click,
+    /// the tree pane, a drop, ⌘O — anything that isn't itself a back/
+    /// forward navigation) or leaves it alone (the `PUT /nav`-driven switch
+    /// itself, whose caller — `run`'s `UserEvent::Navigate` handler — has
+    /// already moved the cursor before calling `open_file`).
+    ///
+    /// An `Arc<Mutex<_>>`, same as `root_dir`, so [`protocol_response`] can
+    /// read a `(can_back, can_forward)` snapshot for `GET`/`PUT /nav`
+    /// without going through the event loop, and so `run`'s
+    /// `UserEvent::Navigate` handler can mutate it (via [`NavHistory::back`]/
+    /// [`NavHistory::forward`]) from the event loop's own thread.
+    history: Arc<Mutex<Option<NavHistory>>>,
     version: Arc<AtomicU64>,
     watcher: Option<RecommendedWatcher>,
     /// When this window was created — used only to satisfy
@@ -287,6 +313,8 @@ struct WindowRegistryEntry {
     version: Arc<AtomicU64>,
     window_id: WindowId,
     root_dir: Arc<Mutex<Option<PathBuf>>>,
+    /// See [`WindowCtx::history`]'s docs.
+    history: Arc<Mutex<Option<NavHistory>>>,
 }
 
 type SharedRegistry = Arc<Mutex<HashMap<String, WindowRegistryEntry>>>;
@@ -581,8 +609,85 @@ pub fn run(initial: Vec<PathBuf>, allow_remote_images: bool) -> Result<()> {
                         if let Some(ctx) = windows.get_mut(&window_id) {
                             // `establish_root: false` — a switch never
                             // moves this window's fixed file-tree root, see
-                            // `WindowCtx::root_dir`'s docs.
-                            open_file(ctx, path, false);
+                            // `WindowCtx::root_dir`'s docs. `push_history:
+                            // true` — the tree pane (like a link click or a
+                            // drop) is an ordinary navigation, not a back/
+                            // forward step.
+                            open_file(ctx, path, false, true);
+                        }
+                    }
+                }
+            }
+            Event::UserEvent(UserEvent::Navigate(direction, window_id)) => {
+                // The history `Arc` is cloned out from under a short-lived
+                // immutable borrow of `windows` first, then locked and
+                // mutated independently of the map — `find_window_with_file`
+                // below needs its own immutable borrow of `windows`, which
+                // would conflict with holding a `get_mut` across it. See
+                // `protocol_response`'s matching "clone and release the
+                // lock immediately" comment for the same pattern applied to
+                // `file`/`root_dir`.
+                let history_arc = windows.get(&window_id).map(|ctx| Arc::clone(&ctx.history));
+                let moved = history_arc.as_ref().and_then(|history| {
+                    let mut guard = history.lock().expect("history mutex poisoned");
+                    match guard.as_mut() {
+                        Some(history) => match direction {
+                            routes::NavDirection::Back => history.back(),
+                            routes::NavDirection::Forward => history.forward(),
+                        },
+                        // No history yet (shouldn't happen — `PUT /nav`
+                        // only ever returns `Action::Navigate` once `nav`
+                        // was `Some`, i.e. history already exists) or the
+                        // cursor was already at that end by the time this
+                        // event arrived (a race with another `PUT /nav`
+                        // request) — either way, nothing to switch to.
+                        None => None,
+                    }
+                });
+                if let Some(path) = moved {
+                    // Same dedup rule `UserEvent::SwitchFile` applies: two
+                    // windows unknowingly open on the same file would race
+                    // to clobber each other's review sidecar. If some
+                    // *other* window already has this history entry's file
+                    // open, that window is focused instead — and, unlike
+                    // `SwitchFile` (which never moves anything), the cursor
+                    // move above is undone (the opposite of `direction`) so
+                    // it keeps pointing at whatever this window still
+                    // actually displays. Every window's history cursor
+                    // otherwise always names its *own* currently-displayed
+                    // file; leaving it advanced here would violate that for
+                    // a navigation that, from this window's own point of
+                    // view, never actually happened.
+                    match find_window_with_file(&windows, &path) {
+                        Some(existing_id) if existing_id != window_id => {
+                            if let Some(history) = &history_arc {
+                                let mut guard = history.lock().expect("history mutex poisoned");
+                                if let Some(history) = guard.as_mut() {
+                                    match direction {
+                                        routes::NavDirection::Back => {
+                                            history.forward();
+                                        }
+                                        routes::NavDirection::Forward => {
+                                            history.back();
+                                        }
+                                    }
+                                }
+                            }
+                            if let Some(ctx) = windows.get(&existing_id) {
+                                ctx.window.set_focus();
+                            }
+                        }
+                        Some(_) => {}
+                        None => {
+                            if let Some(ctx) = windows.get_mut(&window_id) {
+                                // `establish_root: false` — never moves the
+                                // fixed root. `push_history: false` — the
+                                // cursor was already moved above; pushing
+                                // here too would immediately overwrite the
+                                // "forward"/"back" entries this navigation
+                                // just made reachable.
+                                open_file(ctx, path, false, false);
+                            }
                         }
                     }
                 }
@@ -662,6 +767,15 @@ fn create_window(
         file.as_deref()
             .map(|path| canonical_or_given(routes::asset_parent_dir(path))),
     ));
+    // The window's back/forward history — seeded with `file` right away if
+    // one was given (same "established from the get-go" case as
+    // `root_dir_state` above), or left `None` for an empty window until
+    // `open_file` sets it the first time a file lands in it. See
+    // `WindowCtx::history`'s docs.
+    let history_state: Arc<Mutex<Option<NavHistory>>> = Arc::new(Mutex::new(
+        file.as_deref()
+            .map(|path| NavHistory::new(canonical_or_given(path))),
+    ));
     // `window` already exists at this point (built above), so its id is
     // available to register alongside the file/version/root-dir state —
     // see `SharedRegistry`'s docs for why `protocol_response` needs it.
@@ -685,6 +799,7 @@ fn create_window(
                 version: Arc::clone(&version),
                 window_id,
                 root_dir: Arc::clone(&root_dir_state),
+                history: Arc::clone(&history_state),
             },
         );
 
@@ -769,6 +884,7 @@ fn create_window(
         file: file_state,
         canonical_file,
         root_dir: root_dir_state,
+        history: history_state,
         version,
         watcher,
         created_at: Instant::now(),
@@ -840,8 +956,9 @@ fn open_in_window_or_new(
         if let Some(ctx) = windows.get_mut(&target.expect("checked by target_is_empty")) {
             // `establish_root: true` — this is the *first* file this
             // (previously empty) window has ever shown, so its file-tree
-            // root gets fixed here — see `WindowCtx::root_dir`.
-            open_file(ctx, path, true);
+            // root gets fixed here — see `WindowCtx::root_dir`. `push_history:
+            // true` — an ordinary open, not a back/forward navigation.
+            open_file(ctx, path, true, true);
         }
         return;
     }
@@ -878,14 +995,31 @@ fn open_in_window_or_new(
 /// from `path`'s own parent. `false` for every other switch (in
 /// particular, the file tree's `UserEvent::SwitchFile`), which must leave
 /// `root_dir` exactly as it was — see that field's docs for why.
-fn open_file(ctx: &mut WindowCtx, path: PathBuf, establish_root: bool) {
+///
+/// `push_history` is `true` for every switch except the one driven by
+/// `UserEvent::Navigate` itself — a back/forward step already moved
+/// [`WindowCtx::history`]'s cursor before `open_file` was ever called (see
+/// that field's docs), so pushing here too would immediately clobber the
+/// "forward" entries a `back()` just made reachable again. When `true` and
+/// `ctx.history` is still `None` (this is also the first file this window
+/// has ever shown), history is established the same way `root_dir` is
+/// above, from `path` alone rather than from any actual "previous" entry.
+fn open_file(ctx: &mut WindowCtx, path: PathBuf, establish_root: bool, push_history: bool) {
     if let Err(err) = ctx.webview.load_url(INITIAL_URL) {
         eprintln!("warning: failed to reload the view: {err}");
     }
-    ctx.canonical_file = Some(canonical_or_given(&path));
+    let canonical = canonical_or_given(&path);
+    ctx.canonical_file = Some(canonical.clone());
     if establish_root {
         let root = canonical_or_given(routes::asset_parent_dir(&path));
         *ctx.root_dir.lock().expect("root dir mutex poisoned") = Some(root);
+    }
+    if push_history {
+        let mut history = ctx.history.lock().expect("history mutex poisoned");
+        match history.as_mut() {
+            Some(existing) => existing.push(canonical),
+            None => *history = Some(NavHistory::new(canonical)),
+        }
     }
     *ctx.file.lock().expect("file state mutex poisoned") = Some(path.clone());
     // Drop the old watcher *before* creating the new one so the two never
@@ -1080,7 +1214,7 @@ fn protocol_response(
     debug: bool,
     allow_remote_images: bool,
 ) -> Response<Cow<'static, [u8]>> {
-    let Some((file_state, version, window_id, root_dir_state)) = registry
+    let Some((file_state, version, window_id, root_dir_state, history_state)) = registry
         .lock()
         .expect("webview registry mutex poisoned")
         .get(webview_id)
@@ -1090,6 +1224,7 @@ fn protocol_response(
                 Arc::clone(&entry.version),
                 entry.window_id,
                 Arc::clone(&entry.root_dir),
+                Arc::clone(&entry.history),
             )
         })
     else {
@@ -1144,6 +1279,15 @@ fn protocol_response(
         .lock()
         .expect("root dir mutex poisoned")
         .clone();
+    // Same "clone and release the lock immediately" reasoning as `file`/
+    // `root_dir` above — this only reads a `(can_back, can_forward)`
+    // snapshot, never mutates the history itself (see `routes::handle`'s
+    // `nav` parameter docs for why that split exists at all).
+    let nav = history_state
+        .lock()
+        .expect("history mutex poisoned")
+        .as_ref()
+        .map(|history| (history.can_back(), history.can_forward()));
     let (reply, action) = routes::handle(
         &route_request,
         file.as_deref(),
@@ -1151,11 +1295,18 @@ fn protocol_response(
         allow_remote_images,
         true,
         root_dir.as_deref(),
+        nav,
     );
-    if let routes::Action::OpenFile(path) = action {
-        // If the event loop has already shut down, there's nothing useful
-        // to do with the error — the process is exiting anyway.
-        let _ = proxy.send_event(UserEvent::SwitchFile(path, window_id));
+    match action {
+        routes::Action::OpenFile(path) => {
+            // If the event loop has already shut down, there's nothing
+            // useful to do with the error — the process is exiting anyway.
+            let _ = proxy.send_event(UserEvent::SwitchFile(path, window_id));
+        }
+        routes::Action::Navigate(direction) => {
+            let _ = proxy.send_event(UserEvent::Navigate(direction, window_id));
+        }
+        routes::Action::None => {}
     }
     if debug {
         // The body byte count is only interesting for state-changing
@@ -1205,8 +1356,14 @@ fn protocol_response(
 
 /// Decides whether a WebView may navigate to `url`. Only the app's own
 /// protocol stays inside the window; web links open in the default browser
-/// (no window has a back button or URL bar to get home from), and anything
-/// else is simply ignored.
+/// instead, and anything else is simply ignored. This isn't because the
+/// window has no way back — it has a doc header with back/forward buttons
+/// now (see `nav_history`) — but a deliberate design boundary: this
+/// WebView's whole purpose is to render the currently open document (and,
+/// via a relative link, other `.md`/`.markdown` files inside its
+/// `root_dir` — see `routes::handle_open`), never to load arbitrary
+/// external web content as its own top-level page. See
+/// `docs/SECURITY.md`'s exception 1 for the user-facing version of this.
 fn navigation_policy(url: String) -> bool {
     if is_internal_url(&url) {
         return true;
