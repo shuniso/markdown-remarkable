@@ -34,10 +34,9 @@ cargo build --release
 ```
 
 This opens a native window showing the rendered file, and updates it in
-place every time you save. Tagged releases build zips for macOS (Apple
-Silicon) and Windows (x86_64) via GitHub Actions and publish them on the
-[Releases](../../releases) page; there is no tagged release yet, so build
-from source for now. Linux and Intel Macs always build from source.
+place every time you save. Prebuilt zips for macOS (Apple Silicon) and
+Windows (x86_64) are published on the [Releases](../../releases) page for
+each tagged version. Linux and Intel Macs build from source.
 
 Prefer a browser tab over a native window?
 

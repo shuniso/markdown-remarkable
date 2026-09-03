@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.1.0] - 2026-09-03
+
 ### Added
 
 - Native Markdown viewer window (macOS, Linux, and Windows, built on
@@ -66,4 +68,5 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   cross-file navigation, and atomic writes for all files the app saves —
   in `docs/SECURITY.md`, and fixed the issues found during that audit.
 
-[Unreleased]: https://github.com/shuniso/markdown-remarkable/commits/main
+[Unreleased]: https://github.com/shuniso/markdown-remarkable/compare/v0.1.0...HEAD
+[0.1.0]: https://github.com/shuniso/markdown-remarkable/releases/tag/v0.1.0
