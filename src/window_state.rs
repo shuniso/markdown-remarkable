@@ -19,9 +19,9 @@ use std::path::{Path, PathBuf};
 pub const MIN_WIDTH: f64 = 480.0;
 pub const MIN_HEIGHT: f64 = 320.0;
 
-/// `~/Library/Application Support/mdview/window.json` (macOS) /
-/// `$XDG_CONFIG_HOME/mdview/window.json` (Linux, falling back to
-/// `~/.config`) / `%APPDATA%\mdview\window.json` (Windows), read on startup
+/// `~/Library/Application Support/markdown-remarkable/window.json` (macOS) /
+/// `$XDG_CONFIG_HOME/markdown-remarkable/window.json` (Linux, falling back to
+/// `~/.config`) / `%APPDATA%\markdown-remarkable\window.json` (Windows), read on startup
 /// and written on close/move/resize by `app.rs`.
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
 pub struct WindowState {
@@ -68,11 +68,11 @@ const CURRENT_PLATFORM: Platform = Platform::Other;
 /// can be tested from any host — see [`config_path`] for the real,
 /// environment-reading entry point `app.rs` actually calls.
 ///
-/// - macOS: `<home>/Library/Application Support/mdview/window.json`.
+/// - macOS: `<home>/Library/Application Support/markdown-remarkable/window.json`.
 ///   `None` if `home` is `None` (no `HOME` in the environment).
-/// - Windows: `<appdata>\mdview\window.json`. `None` if `appdata` is `None`.
-/// - Other (Linux etc.): `<xdg_config_home>/mdview/window.json`, or
-///   `<home>/.config/mdview/window.json` if `xdg_config_home` is `None`.
+/// - Windows: `<appdata>\markdown-remarkable\window.json`. `None` if `appdata` is `None`.
+/// - Other (Linux etc.): `<xdg_config_home>/markdown-remarkable/window.json`, or
+///   `<home>/.config/markdown-remarkable/window.json` if `xdg_config_home` is `None`.
 ///   `None` if both are `None`.
 pub fn config_path_for(
     platform: Platform,
@@ -81,14 +81,13 @@ pub fn config_path_for(
     appdata: Option<&Path>,
 ) -> Option<PathBuf> {
     match platform {
-        Platform::Macos => {
-            home.map(|home| home.join("Library/Application Support/mdview/window.json"))
-        }
-        Platform::Windows => appdata.map(|appdata| appdata.join("mdview/window.json")),
+        Platform::Macos => home
+            .map(|home| home.join("Library/Application Support/markdown-remarkable/window.json")),
+        Platform::Windows => appdata.map(|appdata| appdata.join("markdown-remarkable/window.json")),
         Platform::Other => xdg_config_home
             .map(Path::to_path_buf)
             .or_else(|| home.map(|home| home.join(".config")))
-            .map(|base| base.join("mdview/window.json")),
+            .map(|base| base.join("markdown-remarkable/window.json")),
     }
 }
 
@@ -186,7 +185,7 @@ static TMP_COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64:
 /// sibling created with `create_new` (fails rather than following a
 /// symlink an attacker planted at that exact name), then renamed into
 /// place — so a reader (this process's own next `load`, or a concurrently
-/// running `mdview`) never observes a half-written file, and a crash
+/// running `markdown-remarkable`) never observes a half-written file, and a crash
 /// mid-write leaves the previous, still-valid `window.json` in place
 /// rather than a corrupted one.
 pub fn save(path: &Path, state: &WindowState) -> std::io::Result<()> {
@@ -234,7 +233,7 @@ mod tests {
         assert_eq!(
             path,
             Some(PathBuf::from(
-                "/Users/alice/Library/Application Support/mdview/window.json"
+                "/Users/alice/Library/Application Support/markdown-remarkable/window.json"
             ))
         );
     }
@@ -255,7 +254,7 @@ mod tests {
         assert_eq!(
             path,
             Some(PathBuf::from(
-                r"C:\Users\alice\AppData\Roaming/mdview/window.json"
+                r"C:\Users\alice\AppData\Roaming/markdown-remarkable/window.json"
             ))
         );
     }
@@ -283,7 +282,9 @@ mod tests {
         );
         assert_eq!(
             path,
-            Some(PathBuf::from("/custom/config/mdview/window.json"))
+            Some(PathBuf::from(
+                "/custom/config/markdown-remarkable/window.json"
+            ))
         );
     }
 
@@ -292,7 +293,9 @@ mod tests {
         let path = config_path_for(Platform::Other, Some(Path::new("/home/alice")), None, None);
         assert_eq!(
             path,
-            Some(PathBuf::from("/home/alice/.config/mdview/window.json"))
+            Some(PathBuf::from(
+                "/home/alice/.config/markdown-remarkable/window.json"
+            ))
         );
     }
 

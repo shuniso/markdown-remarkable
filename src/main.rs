@@ -1,11 +1,11 @@
-//! `mdview` CLI entry point.
+//! `markdown-remarkable` CLI entry point.
 //!
 //! This file only parses arguments and wires the library modules together
 //! (rendering, the native app, the HTTP server, and file watching); the
 //! actual logic lives in `markdown_remarkable::{app, render, server,
 //! watch}`.
 //!
-//! On Windows, `windows_subsystem = "windows"` below builds `mdview.exe`
+//! On Windows, `windows_subsystem = "windows"` below builds `markdown-remarkable.exe`
 //! as a GUI subsystem binary — this suppresses the console window that
 //! would otherwise flash open when the app is launched from Explorer/a
 //! file association (there being no console to attach to in that case).
@@ -40,7 +40,7 @@ use std::sync::Arc;
 /// serves a single file to a browser tab (`--browser`), reloading in place
 /// whenever a file is saved.
 #[derive(Parser, Debug)]
-#[command(name = "mdview", version, about)]
+#[command(name = "markdown-remarkable", version, about)]
 struct Cli {
     /// Markdown file(s) to view — each gets its own native window. If
     /// omitted entirely, one native window opens a file-picker dialog on

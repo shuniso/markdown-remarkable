@@ -331,8 +331,8 @@ fn normalize_excerpt(excerpt: &mut String) {
 /// The hashes in `doc` that have no matching entry in `anchors` — i.e.
 /// review blocks whose original source is no longer found anywhere in the
 /// current document (edited or deleted). `anchors` is `render::anchors`'
-/// full result (blocks *and* nested items/rows — see the nested-anchors
-/// design doc), so a comment on a list item or table row is correctly
+/// full result (blocks *and* nested items/rows), so a comment on a list
+/// item or table row is correctly
 /// recognized as anchored even though it never appears in `render::blocks`.
 /// Order follows `doc.blocks`.
 pub fn unanchored<'a>(doc: &'a ReviewDoc, anchors: &[Anchor]) -> Vec<&'a str> {
@@ -370,7 +370,7 @@ fn now_rfc3339() -> String {
 /// bullet list, where a comment's second and later lines are indented two
 /// spaces as continuation lines rather than starting new top-level
 /// bullets. A list item or table row's line additionally carries a
-/// `（in list Lstart-Lend）`/`（in table Lstart-Lend）` suffix naming its
+/// `(in list Lstart-Lend)`/`(in table Lstart-Lend)` suffix naming its
 /// enclosing block's line range (see [`nested_suffix`]) — a plain block's
 /// line does not. The anchor's full source is deliberately *not* quoted —
 /// for handing this off to an AI agent, the line range plus a short
@@ -499,14 +499,14 @@ pub fn export_markdown(md_name: &str, markdown: &str, doc: &ReviewDoc, now: &str
     out
 }
 
-/// For an item/row anchor, the `（in list Lstart-Lend）`/`（in table
-/// Lstart-Lend）`/`（in block Lstart-Lend）` suffix naming its enclosing
+/// For an item/row anchor, the `(in list Lstart-Lend)`/`(in table
+/// Lstart-Lend)`/`(in block Lstart-Lend)` suffix naming its enclosing
 /// block's line range — `None` for a block-kind anchor, which gets no
 /// suffix (unchanged format). Walks `anchor.parent` up through `anchors`
 /// until it reaches the block-kind ancestor: for a nested list item this is
-/// *not* its immediately enclosing item, but the top-level block (the whole
-/// list) — deliberate, per the nested-anchors design doc: a nested item's
-/// own position is already pinpointed by its own line range in the quote
+/// *not* its immediately enclosing item, but the top-level block (the
+/// whole list) — deliberate: a nested item's own position is already
+/// pinpointed by its own line range in the quote
 /// line itself, so the suffix's job is just to say which block to look in,
 /// and "the whole list" locates that reliably regardless of nesting depth.
 ///
@@ -514,7 +514,7 @@ pub fn export_markdown(md_name: &str, markdown: &str, doc: &ReviewDoc, now: &str
 /// (see [`block_kind_label`]), not by `anchor.kind` — an item nested inside
 /// a blockquote (`> - quoted item`) has `anchor.kind == Item`, but its
 /// enclosing top-level block is a blockquote, not literally a list, so its
-/// suffix reads `（in block …）` rather than the misleading `（in list …）`.
+/// suffix reads `(in block …)` rather than the misleading `(in list …)`.
 fn nested_suffix(anchors: &[Anchor], anchor: &Anchor) -> Option<String> {
     if anchor.kind == AnchorKind::Block {
         return None;
@@ -525,7 +525,7 @@ fn nested_suffix(anchors: &[Anchor], anchor: &Anchor) -> Option<String> {
     }
     let label = block_kind_label(&ancestor.source);
     Some(format!(
-        "（in {label} {}）",
+        "(in {label} {})",
         line_label(ancestor.line_start, ancestor.line_end)
     ))
 }
@@ -775,7 +775,7 @@ mod tests {
 
     #[test]
     fn loading_a_sidecar_written_before_kind_existed_defaults_to_block() {
-        // A sidecar written by an older version of mdview (before nested
+        // A sidecar written by an older version of markdown-remarkable (before nested
         // item/row anchors existed) has no "kind" field on its blocks at
         // all — `#[serde(default)]` on `ReviewBlock::kind` must fill that
         // in as `AnchorKindDto::Block`, not fail to parse.
@@ -1479,7 +1479,7 @@ mod tests {
         let out = export_markdown("notes.md", markdown, &doc, "2026-08-22T07:10:00Z");
 
         let expected_quote = format!(
-            "> {}: 三番目の項目 （in list {}）\n\n- コメント\n",
+            "> {}: 三番目の項目 (in list {})\n\n- コメント\n",
             line_label(third_item.line_start, third_item.line_end),
             line_label(block.line_start, block.line_end),
         );
@@ -1514,7 +1514,7 @@ mod tests {
         let out = export_markdown("notes.md", markdown, &doc, "2026-08-22T07:10:00Z");
 
         let expected_quote = format!(
-            "> {}: d | e | f （in table {}）\n\n- 確認\n",
+            "> {}: d | e | f (in table {})\n\n- 確認\n",
             line_label(second_row.line_start, second_row.line_end),
             line_label(block.line_start, block.line_end),
         );
@@ -1577,10 +1577,7 @@ mod tests {
             file_comments: Vec::new(),
         };
         let out = export_markdown("notes.md", markdown, &doc, "2026-08-22T07:10:00Z");
-        let expected_suffix = format!(
-            "（in list {}）",
-            line_label(block.line_start, block.line_end)
-        );
+        let expected_suffix = format!("(in list {})", line_label(block.line_start, block.line_end));
         assert!(
             out.contains(&expected_suffix),
             "expected {expected_suffix:?} in {out:?}"
@@ -1616,7 +1613,7 @@ mod tests {
         let out = export_markdown("notes.md", markdown, &doc, "2026-08-22T07:10:00Z");
 
         let expected_suffix = format!(
-            "（in block {}）",
+            "(in block {})",
             line_label(block.line_start, block.line_end)
         );
         assert!(

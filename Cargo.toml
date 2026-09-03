@@ -4,9 +4,14 @@ version = "0.1.0"
 edition = "2021"
 rust-version = "1.88"
 license = "MIT"
+description = "A tiny native Markdown viewer with live reload and inline review comments"
+repository = "https://github.com/shuniso/markdown-remarkable"
+readme = "README.md"
+keywords = ["markdown", "viewer", "gui"]
+categories = ["gui", "command-line-utilities"]
 
 [[bin]]
-name = "mdview"
+name = "markdown-remarkable"
 path = "src/main.rs"
 
 [dependencies]

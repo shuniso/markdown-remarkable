@@ -3,9 +3,9 @@
 //! custom protocol instead of an HTTP server (`server.rs`/`--browser`).
 //!
 //! Not covered by automated tests — GUI startup/event-loop code isn't
-//! practical to exercise the way `routes`, `server`, and `watch` are; see
-//! the design doc's "含まない" section. The routing logic it calls into
-//! (`routes::handle`) is fully unit-tested on its own. The one exception is
+//! practical to exercise the way `routes`, `server`, and `watch` are. The
+//! routing logic it calls into (`routes::handle`) is fully unit-tested on
+//! its own. The one exception is
 //! [`is_internal_url`]/[`is_windows_internal_url`] (the navigation-policy
 //! check deciding whether a URL stays inside the app) — a pure function
 //! with no window/event-loop dependency, so it's unit-tested directly; see
@@ -202,8 +202,8 @@ enum UserEvent {
     /// [`open_in_window_or_new`]'s dedup-and-focus-the-existing-window
     /// behavior: the whole point of the tree pane is switching *this*
     /// window's file in place, even if the target happens to already be
-    /// open in some other window (see the design doc's "同じウィンドウで
-    /// 切り替える" decision).
+    /// open in some other window — switching stays within the same window
+    /// by design.
     SwitchFile(PathBuf, WindowId),
     /// `PUT /nav` (the doc header's back/forward buttons, or ⌘[/⌘]) asked to
     /// move the given window's history one step — posted by
@@ -257,11 +257,10 @@ struct WindowCtx {
     /// switch's new file's own parent might be a subdirectory of the real
     /// root, or — after switching back — the root itself again; recomputing
     /// it from "whatever's open right now" on every switch would make the
-    /// scope drift with it). See the file-tree design doc's "root_dir" /
-    /// `routes::handle`'s docs for the full rationale, and
-    /// `routes::tree_root_dir` for how a `None` here (only ever true for
-    /// `server.rs`, which has no `WindowCtx` at all) falls back to the
-    /// pre-fix `asset_parent_dir(file)` behavior.
+    /// scope drift with it). See `routes::handle`'s docs for the full
+    /// rationale, and `routes::tree_root_dir` for how a `None` here (only
+    /// ever true for `server.rs`, which has no `WindowCtx` at all) falls
+    /// back to the pre-fix `asset_parent_dir(file)` behavior.
     ///
     /// An `Arc<Mutex<_>>`, same as `file`, so [`protocol_response`] (run on
     /// the WebView's own protocol-handler thread) can read the current
@@ -404,7 +403,7 @@ pub fn run(initial: Vec<PathBuf>, allow_remote_images: bool) -> Result<()> {
         monitors: &monitors,
     };
     for file in files {
-        // A duplicate FILE on the command line (`mdview a.md a.md`) gets
+        // A duplicate FILE on the command line (`markdown-remarkable a.md a.md`) gets
         // focused instead of a second window on the same file — the same
         // dedup rule every other open path applies via
         // `open_in_window_or_new`/`find_window_with_file`, just inlined
@@ -834,7 +833,7 @@ fn create_window(
             // to `window.ipc` in the future also just lands here, logged
             // the same way.
             if debug {
-                eprintln!("[mdview:js] {}", request.body());
+                eprintln!("[markdown-remarkable:js] {}", request.body());
             }
         })
         .with_url(INITIAL_URL);
@@ -849,7 +848,7 @@ fn create_window(
                 .remove(&webview_id);
         })
         .context(
-            "failed to create the WebView (try `mdview --browser` to use the browser version instead)",
+            "failed to create the WebView (try `markdown-remarkable --browser` to use the browser version instead)",
         )?;
     #[cfg(target_os = "linux")]
     let webview = {
@@ -870,7 +869,7 @@ fn create_window(
             })
             .context(
                 "failed to create the WebView — is webkit2gtk installed? \
-                 try `mdview --browser` to use the browser version instead",
+                 try `markdown-remarkable --browser` to use the browser version instead",
             )?
     };
 
@@ -1229,7 +1228,7 @@ fn protocol_response(
         })
     else {
         if debug {
-            eprintln!("[mdview] request for unknown webview id {webview_id:?}");
+            eprintln!("[markdown-remarkable] request for unknown webview id {webview_id:?}");
         }
         return Response::builder()
             .status(StatusCode::NOT_FOUND)
@@ -1319,7 +1318,7 @@ fn protocol_response(
             _ => String::new(),
         };
         eprintln!(
-            "[mdview] {webview_id} {method} {path} -> {}{body_suffix}",
+            "[markdown-remarkable] {webview_id} {method} {path} -> {}{body_suffix}",
             reply.status
         );
     }
@@ -1426,12 +1425,12 @@ fn pick_file_dialog() -> Option<PathBuf> {
         .pick_file()
 }
 
-/// A native window's title bar text: `<file name> — mdview`, or just
-/// `mdview` before any file has been opened in it.
+/// A native window's title bar text: `<file name> — markdown-remarkable`, or
+/// just `markdown-remarkable` before any file has been opened in it.
 fn window_title(file: Option<&Path>) -> String {
     match file {
-        Some(path) => format!("{} — mdview", file_title(path)),
-        None => "mdview".to_string(),
+        Some(path) => format!("{} — markdown-remarkable", file_title(path)),
+        None => "markdown-remarkable".to_string(),
     }
 }
 
@@ -1461,7 +1460,11 @@ fn install_menu(proxy: &EventLoopProxy<UserEvent>) -> Result<muda::Menu> {
     const RELOAD_ITEM_ID: &str = "reload";
 
     let menu = Menu::new();
-    let app = Submenu::with_items("mdview", true, &[&PredefinedMenuItem::quit(None)])?;
+    let app = Submenu::with_items(
+        "markdown-remarkable",
+        true,
+        &[&PredefinedMenuItem::quit(None)],
+    )?;
     let open = MenuItem::with_id(
         OPEN_ITEM_ID,
         "Open…",

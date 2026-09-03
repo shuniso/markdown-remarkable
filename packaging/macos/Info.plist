@@ -3,17 +3,17 @@
 <plist version="1.0">
 <dict>
   <key>CFBundleName</key>
-  <string>mdview</string>
+  <string>markdown-remarkable</string>
   <key>CFBundleDisplayName</key>
-  <string>mdview</string>
+  <string>markdown-remarkable</string>
   <key>CFBundleIdentifier</key>
-  <string>com.shuniso.mdview</string>
+  <string>com.shuniso.markdown-remarkable</string>
   <key>CFBundleVersion</key>
   <string>__VERSION__</string>
   <key>CFBundleShortVersionString</key>
   <string>__VERSION__</string>
   <key>CFBundleExecutable</key>
-  <string>mdview</string>
+  <string>markdown-remarkable</string>
   <key>CFBundlePackageType</key>
   <string>APPL</string>
   <key>CFBundleIconFile</key>

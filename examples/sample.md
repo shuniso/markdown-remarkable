@@ -1,11 +1,11 @@
 ---
-title: mdview sample
+title: markdown-remarkable sample
 tags: [sample, markdown]
 ---
-# mdview sample
+# markdown-remarkable sample
 
-A sample file exercising every Markdown feature `mdview` supports. Open it
-with `mdview examples/sample.md` (or render it with `--export`) and check
+A sample file exercising every Markdown feature `markdown-remarkable` supports. Open it
+with `markdown-remarkable examples/sample.md` (or render it with `--export`) and check
 that everything below looks right. The YAML frontmatter at the very top of
 this file (`title:` / `tags:`) is intentionally *not* rendered — if you can
 see it on the page, that's a bug.

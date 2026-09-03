@@ -1,5 +1,5 @@
 //! CLI-level integration tests for `--export`, run against the actual
-//! compiled `mdview` binary (`CARGO_BIN_EXE_mdview`) rather than calling
+//! compiled `markdown-remarkable` binary (`CARGO_BIN_EXE_markdown-remarkable`) rather than calling
 //! library functions directly, since the self-overwrite guard and the
 //! `--export`/`--port`/`--no-open` conflict are both `main.rs` concerns.
 
@@ -12,12 +12,12 @@ fn refuses_to_export_over_the_input_file() {
     let original_content = "# Original\n";
     std::fs::write(&file_path, original_content).expect("write markdown file");
 
-    let output = Command::new(env!("CARGO_BIN_EXE_mdview"))
+    let output = Command::new(env!("CARGO_BIN_EXE_markdown-remarkable"))
         .arg(&file_path)
         .arg("--export")
         .arg(&file_path)
         .output()
-        .expect("run mdview");
+        .expect("run markdown-remarkable");
 
     assert!(
         !output.status.success(),
@@ -44,12 +44,12 @@ fn refuses_to_export_over_a_symlink_to_the_input_file() {
     let symlink_path = dir.path().join("alias.md");
     std::os::unix::fs::symlink(&file_path, &symlink_path).expect("create symlink to input file");
 
-    let output = Command::new(env!("CARGO_BIN_EXE_mdview"))
+    let output = Command::new(env!("CARGO_BIN_EXE_markdown-remarkable"))
         .arg(&file_path)
         .arg("--export")
         .arg(&symlink_path)
         .output()
-        .expect("run mdview");
+        .expect("run markdown-remarkable");
 
     assert!(
         !output.status.success(),
@@ -79,12 +79,12 @@ fn refuses_to_export_over_a_hard_link_to_the_input_file() {
     let hardlink_path = dir.path().join("hardlink.md");
     std::fs::hard_link(&file_path, &hardlink_path).expect("create hard link to input file");
 
-    let output = Command::new(env!("CARGO_BIN_EXE_mdview"))
+    let output = Command::new(env!("CARGO_BIN_EXE_markdown-remarkable"))
         .arg(&file_path)
         .arg("--export")
         .arg(&hardlink_path)
         .output()
-        .expect("run mdview");
+        .expect("run markdown-remarkable");
 
     assert!(
         !output.status.success(),
@@ -108,12 +108,12 @@ fn refuses_to_export_when_the_output_directory_does_not_exist() {
 
     let output_path = dir.path().join("no-such-subdir").join("out.html");
 
-    let output = Command::new(env!("CARGO_BIN_EXE_mdview"))
+    let output = Command::new(env!("CARGO_BIN_EXE_markdown-remarkable"))
         .arg(&input_path)
         .arg("--export")
         .arg(&output_path)
         .output()
-        .expect("run mdview");
+        .expect("run markdown-remarkable");
 
     assert!(
         !output.status.success(),
@@ -133,12 +133,12 @@ fn exports_a_standalone_non_live_html_file() {
     let output_path = dir.path().join("out.html");
     std::fs::write(&input_path, "# Hello\n").expect("write markdown file");
 
-    let status = Command::new(env!("CARGO_BIN_EXE_mdview"))
+    let status = Command::new(env!("CARGO_BIN_EXE_markdown-remarkable"))
         .arg(&input_path)
         .arg("--export")
         .arg(&output_path)
         .status()
-        .expect("run mdview");
+        .expect("run markdown-remarkable");
 
     assert!(status.success(), "expected a successful export");
 
@@ -156,13 +156,13 @@ fn export_rejects_more_than_one_file() {
     std::fs::write(&file_b, "# B\n").expect("write b.md");
     let output_path = dir.path().join("out.html");
 
-    let output = Command::new(env!("CARGO_BIN_EXE_mdview"))
+    let output = Command::new(env!("CARGO_BIN_EXE_markdown-remarkable"))
         .arg(&file_a)
         .arg(&file_b)
         .arg("--export")
         .arg(&output_path)
         .output()
-        .expect("run mdview");
+        .expect("run markdown-remarkable");
 
     assert!(
         !output.status.success(),
@@ -181,11 +181,11 @@ fn export_rejects_zero_files() {
     let dir = tempfile::tempdir().expect("create tempdir");
     let output_path = dir.path().join("out.html");
 
-    let output = Command::new(env!("CARGO_BIN_EXE_mdview"))
+    let output = Command::new(env!("CARGO_BIN_EXE_markdown-remarkable"))
         .arg("--export")
         .arg(&output_path)
         .output()
-        .expect("run mdview");
+        .expect("run markdown-remarkable");
 
     assert!(
         !output.status.success(),
@@ -200,12 +200,12 @@ fn export_of_a_nonexistent_file_is_a_non_zero_exit() {
     let missing_path = dir.path().join("does-not-exist.md");
     let output_path = dir.path().join("out.html");
 
-    let output = Command::new(env!("CARGO_BIN_EXE_mdview"))
+    let output = Command::new(env!("CARGO_BIN_EXE_markdown-remarkable"))
         .arg(&missing_path)
         .arg("--export")
         .arg(&output_path)
         .output()
-        .expect("run mdview");
+        .expect("run markdown-remarkable");
 
     assert!(
         !output.status.success(),
@@ -221,26 +221,26 @@ fn export_conflicts_with_port_and_no_open() {
     let output_path = dir.path().join("out.html");
     std::fs::write(&input_path, "# Hello\n").expect("write markdown file");
 
-    let with_port = Command::new(env!("CARGO_BIN_EXE_mdview"))
+    let with_port = Command::new(env!("CARGO_BIN_EXE_markdown-remarkable"))
         .arg(&input_path)
         .arg("--export")
         .arg(&output_path)
         .arg("--port")
         .arg("1234")
         .output()
-        .expect("run mdview");
+        .expect("run markdown-remarkable");
     assert!(
         !with_port.status.success(),
         "expected --export and --port to be rejected together"
     );
 
-    let with_no_open = Command::new(env!("CARGO_BIN_EXE_mdview"))
+    let with_no_open = Command::new(env!("CARGO_BIN_EXE_markdown-remarkable"))
         .arg(&input_path)
         .arg("--export")
         .arg(&output_path)
         .arg("--no-open")
         .output()
-        .expect("run mdview");
+        .expect("run markdown-remarkable");
     assert!(
         !with_no_open.status.success(),
         "expected --export and --no-open to be rejected together"

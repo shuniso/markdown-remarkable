@@ -30,7 +30,7 @@ const TITLE_HEADER_ENCODE_SET: &AsciiSet = &CONTROLS.add(b'%');
 /// Title/body shown before any file has been opened (`file == None`) — the
 /// app was launched with no `FILE` argument and the user either hasn't
 /// picked one yet or cancelled the file-picker dialog.
-const EMPTY_TITLE: &str = "mdview";
+const EMPTY_TITLE: &str = "markdown-remarkable";
 const EMPTY_BODY_HTML: &str = "<p>Drop a Markdown file here.</p>";
 
 /// Header that every state-changing request (`PUT /review`, `POST
@@ -196,9 +196,8 @@ fn has_request_header(req: &RouteRequest) -> bool {
 ///   is unaffected: `sandbox` only restricts a response when it's
 ///   navigated to/rendered as its own document.
 /// - `GET /tree` — the file tree rooted at `root_dir` (the *window's own*
-///   fixed root — see [`handle_tree`] and the "root_dir" section of the
-///   file-tree design doc for why this is not simply `asset_parent_dir(file)`
-///   any more).
+///   fixed root — see [`handle_tree`] for why this is not simply
+///   `asset_parent_dir(file)` any more).
 /// - `PUT /open` — switches the currently-viewed file to a `.md`/
 ///   `.markdown` file named by a JSON body, within `root_dir`'s scope.
 ///   `allow_open` gates this entirely: `false` (the browser server,
@@ -221,8 +220,8 @@ fn has_request_header(req: &RouteRequest) -> bool {
 /// first file's parent, established once and never moved by a later
 /// switch — see `app.rs`'s `WindowCtx::root_dir`), not
 /// `asset_parent_dir(file)` (which would drift every time the current file
-/// changes, making "switch to a subfolder, then switch back" impossible —
-/// see the file-tree design doc). `None` (always passed by `server.rs`,
+/// changes, making "switch to a subfolder, then switch back" impossible).
+/// `None` (always passed by `server.rs`,
 /// which has no window/root concept of its own) falls back to
 /// `asset_parent_dir(file)` for both routes, same as before `root_dir`
 /// existed. `GET`/`HEAD /asset` deliberately keeps using
@@ -1107,12 +1106,12 @@ const ASSET_MAX_BYTES: u64 = 20 * 1024 * 1024;
 /// The directory `GET /asset` resolves its `p` query value against —
 /// `md_path`'s parent, falling back to `.` (the current directory) when
 /// that parent is empty. `Path::parent()` on a bare relative file name
-/// with no directory components at all (e.g. `doc.md`, from `mdview
+/// with no directory components at all (e.g. `doc.md`, from `markdown-remarkable
 /// doc.md` run in that file's own directory) returns `Some("")`, not
 /// `None` and not `.` — and `Path::new("").canonicalize()` fails with
 /// `ENOENT` rather than resolving to the current directory the way a
 /// shell would treat a bare file name. Left unhandled, that used to make
-/// every `/asset` request `404` whenever mdview was opened this way. Same
+/// every `/asset` request `404` whenever markdown-remarkable was opened this way. Same
 /// fallback `main::ensure_not_same_file` uses, for the same reason.
 pub(crate) fn asset_parent_dir(md_path: &Path) -> &Path {
     md_path
@@ -1124,7 +1123,7 @@ pub(crate) fn asset_parent_dir(md_path: &Path) -> &Path {
 /// `GET /asset?p=<percent-encoded relative path>`: serves a local image
 /// file from next to the currently-open Markdown document. The one route
 /// in this module that reads a file other than the document itself or its
-/// review sidecar — see `docs/SECURITY.md`'s "読み取りの範囲" for the
+/// review sidecar — see `docs/SECURITY.md`'s "Files read" section for the
 /// resulting guarantee this has to uphold.
 ///
 /// Every one of the following must hold, checked in this order, before any
@@ -1966,8 +1965,8 @@ mod tests {
     fn asset_parent_dir_falls_back_to_current_dir_for_a_bare_relative_file_name() {
         // `Path::new("doc.md").parent()` is `Some("")`, not `None` and not
         // `.` — `"".canonicalize()` fails with `ENOENT`, which used to make
-        // every `/asset` request 404 whenever mdview was opened with a bare
-        // relative file name (e.g. `mdview doc.md` from that file's own
+        // every `/asset` request 404 whenever markdown-remarkable was opened with a bare
+        // relative file name (e.g. `markdown-remarkable doc.md` from that file's own
         // directory) instead of an absolute/directory-qualified path.
         assert_eq!(asset_parent_dir(Path::new("doc.md")), Path::new("."));
     }
@@ -3078,8 +3077,8 @@ mod tests {
     #[test]
     fn put_review_matches_only_by_basename_not_by_directory() {
         // Characterizes a known, accepted residual risk around switching
-        // files mid-session (see the file-tree design doc's "同名別ディ
-        // レクトリ" note and docs/SECURITY.md): `doc.file` only ever
+        // files mid-session with the same basename but a different
+        // directory (see docs/SECURITY.md): `doc.file` only ever
         // travels the wire as a bare basename (see `handle_get_review`/
         // `handle_put_review`), so `handle()` alone can never distinguish
         // `a/README.md` from `b/README.md` by that basename. What actually

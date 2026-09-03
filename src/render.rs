@@ -90,7 +90,7 @@ pub struct Block {
     /// First 16 hex characters of `sha256(source)` — a stable identifier
     /// for this block's content, used to anchor review comments across
     /// re-renders. Two blocks with identical (trimmed) source hash the
-    /// same; that's by design (see the review design doc).
+    /// same; that's by design.
     pub hash: String,
     /// The block's Markdown source, trimmed of leading/trailing whitespace.
     pub source: String,
@@ -108,9 +108,7 @@ pub struct Block {
     pub line_end: usize,
 }
 
-/// Which of the three kinds of source range an [`Anchor`] identifies. See
-/// the nested-anchors design doc
-/// (`docs/superpowers/specs/2026-08-23-nested-anchors-design.md`).
+/// Which of the three kinds of source range an [`Anchor`] identifies.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AnchorKind {
     /// A top-level Markdown block — the same granularity as [`Block`].
@@ -133,7 +131,7 @@ pub struct Anchor {
     /// First 16 hex characters of `sha256(source)` — see [`Block::hash`].
     /// Computed by the same function regardless of `kind`, so identical
     /// (trimmed) source hashes the same whether it came from a block, an
-    /// item, or a row (by design — see the nested-anchors design doc).
+    /// item, or a row, by design.
     pub hash: String,
     /// The anchor's Markdown source, trimmed of leading/trailing
     /// whitespace. For `Item`, this includes the list marker (`- `, `1. `,
@@ -155,8 +153,7 @@ pub struct Anchor {
     /// enclosing anchor: the containing `Block` for a top-level item/row,
     /// or the containing `Item` for a nested list item (nesting is
     /// transparent through non-anchor wrappers like `BlockQuote`/`List`/
-    /// `Table` — see the nested-anchors design doc). `None` only for a
-    /// `Block`-kind anchor, which has no parent.
+    /// `Table`). `None` only for a `Block`-kind anchor, which has no parent.
     pub parent: Option<usize>,
 }
 
@@ -490,7 +487,7 @@ const MAX_ANCHOR_DEPTH: u32 = 64;
 /// `depth + 1`) with the new anchor as the parent — so a nested list item's
 /// parent is its immediately enclosing item, not the top-level block
 /// (nesting is transparent through non-anchor wrappers like `BlockQuote`/
-/// `List`/`Table` — see the nested-anchors design doc). `depth` starts at 0
+/// `List`/`Table`). `depth` starts at 0
 /// for a top-level block's own direct children; once it reaches
 /// [`MAX_ANCHOR_DEPTH`] this returns immediately without scanning `events`
 /// at all, so nothing at or beyond that depth becomes an anchor.
@@ -535,9 +532,7 @@ fn walk_anchors(
 /// Every review-comment anchor in `markdown`, in document order: each
 /// top-level block ([`Block`]/[`blocks`]'s granularity), immediately
 /// followed by its nested list items and table rows (any depth, in
-/// document order), before moving on to the next block. See the
-/// nested-anchors design doc
-/// (`docs/superpowers/specs/2026-08-23-nested-anchors-design.md`).
+/// document order), before moving on to the next block.
 ///
 /// [`blocks`] is a thin filter over this: `anchors(markdown)` restricted to
 /// `kind == AnchorKind::Block`.
@@ -1347,9 +1342,9 @@ pub fn page(
              <div class=\"doc-column\">\n\
              <header class=\"doc-header\">\n\
              <button type=\"button\" class=\"doc-nav-btn\" id=\"doc-back\" \
-             aria-label=\"戻る\" title=\"戻る (⌘[)\" disabled>◀</button>\n\
+             aria-label=\"Back\" title=\"Back (⌘[)\" disabled>◀</button>\n\
              <button type=\"button\" class=\"doc-nav-btn\" id=\"doc-forward\" \
-             aria-label=\"進む\" title=\"進む (⌘])\" disabled>▶</button>\n\
+             aria-label=\"Forward\" title=\"Forward (⌘])\" disabled>▶</button>\n\
              <span class=\"doc-header-path\" id=\"doc-header-path\"></span>\n\
              </header>\n\
              <main class=\"markdown-body doc\">\n\
@@ -2445,8 +2440,8 @@ final paragraph
 
     #[test]
     fn to_html_table_cells_keep_column_alignment_styling_in_body_rows() {
-        // A regression check for the exact bug the design doc warns about:
-        // rendering a body row's cells through a *fresh* `push_html` call
+        // A regression check for a specific bug: rendering a body row's
+        // cells through a *fresh* `push_html` call
         // (rather than replicating pulldown-cmark's own TableCell handling
         // by hand) would default to head state (`<th>` instead of `<td>`)
         // and lose column alignment entirely.

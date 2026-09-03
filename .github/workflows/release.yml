@@ -39,14 +39,14 @@ jobs:
         run: |
           $enabled = ($env:WINDOWS_CERT_PFX_BASE64 -ne '' -and $null -ne $env:WINDOWS_CERT_PFX_BASE64 -and $env:WINDOWS_CERT_PASSWORD -ne '' -and $null -ne $env:WINDOWS_CERT_PASSWORD)
           "enabled=$($enabled.ToString().ToLower())" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
-      - name: Sign mdview.exe
+      - name: Sign markdown-remarkable.exe
         if: steps.signing.outputs.enabled == 'true'
         shell: pwsh
         env:
           WINDOWS_CERT_PFX_BASE64: ${{ secrets.WINDOWS_CERT_PFX_BASE64 }}
           WINDOWS_CERT_PASSWORD: ${{ secrets.WINDOWS_CERT_PASSWORD }}
         run: |
-          $pfxPath = Join-Path $env:RUNNER_TEMP "mdview-cert.pfx"
+          $pfxPath = Join-Path $env:RUNNER_TEMP "markdown-remarkable-cert.pfx"
           try {
             [IO.File]::WriteAllBytes($pfxPath, [Convert]::FromBase64String($env:WINDOWS_CERT_PFX_BASE64))
 
@@ -59,7 +59,7 @@ jobs:
             }
             Write-Host "using $($signtool.FullName)"
 
-            & $signtool.FullName sign /fd SHA256 /tr http://timestamp.digicert.com /td SHA256 /f $pfxPath /p $env:WINDOWS_CERT_PASSWORD target/release/mdview.exe
+            & $signtool.FullName sign /fd SHA256 /tr http://timestamp.digicert.com /td SHA256 /f $pfxPath /p $env:WINDOWS_CERT_PASSWORD target/release/markdown-remarkable.exe
             if ($LASTEXITCODE -ne 0) {
               throw "signtool exited with code $LASTEXITCODE"
             }
@@ -73,12 +73,12 @@ jobs:
       - name: Package
         shell: pwsh
         run: |
-          Compress-Archive -Path target/release/mdview.exe -DestinationPath mdview-windows-x86_64.zip
+          Compress-Archive -Path target/release/markdown-remarkable.exe -DestinationPath markdown-remarkable-windows-x86_64.zip
 
       - uses: actions/upload-artifact@v4
         with:
-          name: mdview-windows-x86_64
-          path: mdview-windows-x86_64.zip
+          name: markdown-remarkable-windows-x86_64
+          path: markdown-remarkable-windows-x86_64.zip
 
   macos:
     runs-on: macos-latest
@@ -107,12 +107,12 @@ jobs:
 
       - name: Package
         shell: bash
-        run: ditto -c -k --keepParent target/bundle/mdview.app mdview-macos-arm64.zip
+        run: ditto -c -k --keepParent target/bundle/markdown-remarkable.app markdown-remarkable-macos-arm64.zip
 
       - uses: actions/upload-artifact@v4
         with:
-          name: mdview-macos-arm64
-          path: mdview-macos-arm64.zip
+          name: markdown-remarkable-macos-arm64
+          path: markdown-remarkable-macos-arm64.zip
 
   release:
     needs: [windows, macos]
@@ -130,5 +130,5 @@ jobs:
         with:
           files: dist/*.zip
           body: |
-            The Windows build (`mdview-windows-x86_64.zip`) requires the Microsoft Edge WebView2 Runtime — preinstalled on Windows 11; if missing, install the [Evergreen Bootstrapper](https://developer.microsoft.com/microsoft-edge/webview2/).
-            The macOS build (`mdview-macos-arm64.zip`, Apple Silicon only) is ad-hoc signed, not notarized: on first launch, right-click the app and choose "Open" (or run `xattr -dr com.apple.quarantine mdview.app` after unzipping) to get past Gatekeeper.
+            The Windows build (`markdown-remarkable-windows-x86_64.zip`) requires the Microsoft Edge WebView2 Runtime — preinstalled on Windows 11; if missing, install the [Evergreen Bootstrapper](https://developer.microsoft.com/microsoft-edge/webview2/).
+            The macOS build (`markdown-remarkable-macos-arm64.zip`, Apple Silicon only) is ad-hoc signed, not notarized: on first launch, right-click the app and choose "Open" (or run `xattr -dr com.apple.quarantine markdown-remarkable.app` after unzipping) to get past Gatekeeper.
