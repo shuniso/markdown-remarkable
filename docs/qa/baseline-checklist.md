@@ -1,300 +1,308 @@
-# QA チェックリスト: ベースライン UX
+# QA checklist: baseline UX
 
-`docs/superpowers/specs/2026-08-23-baseline-ux-design.md` の手動確認項目。
-ネイティブウィンドウ（`mdview FILE`）と `--browser` モードの両方、OS のライト/
-ダークいずれでも一度は通すこと。
+Manual verification items for the app's baseline UX (pane resize/collapse, zoom,
+keyboard shortcuts, window state, light/dark).
+Run through this at least once on both the native window (`markdown-remarkable FILE`)
+and `--browser` mode, and in both light and dark OS themes.
 
-自動化できる部分（`.splitter` の埋め込み、`viewer.js`/`review.js` のスクリプト
-挿入順、`window_state` の純関数、routes/render の応答）は `cargo test` に移して
-あるので、ここでは実機・ブラウザでしか確認できない項目だけを挙げる。
+Anything automatable (`.splitter` being embedded, the `viewer.js`/`review.js` script
+insertion order, `window_state`'s pure functions, routes/render responses) has already
+been moved into `cargo test`; only what can only be verified on a real device/browser
+is listed here.
 
-## 1. ペインのリサイズと折り畳み
+## 1. Pane resize and collapse
 
-- [ ] `.doc` と `.review` の間のスプリッタをドラッグすると右ペイン幅が変わる。
-- [ ] スプリッタは `cursor: col-resize` になっている（既定ズームで幅 6px 相当、
-      `0.375rem` なのでズームすると太さも一緒に大きくなる）。
-- [ ] ドラッグ中カーソルがスプリッタから外れて `.doc`/`.review` の上を通っても
-      ドラッグが途切れない（`setPointerCapture` を使っている）。
-- [ ] ドラッグ中にウィンドウの外までポインタを出してからボタンを離しても、ドラッグが
-      「固着」せず正しく終了する（次にクリックしただけで幅が動いたりしない）。
-- [ ] ドラッグ中は本文やペインのテキストが選択されない（`user-select: none`）。
-- [ ] 幅を目一杯左に振っても 240px 以下にはならない。
-- [ ] 幅を目一杯右に振ってもウィンドウ幅の 60% を超えない。
-- [ ] ペインヘッダの「⟩」ボタンで折り畳める。
-- [ ] 折り畳み中は画面右端に縦タブ（既定ズームで幅 28px 相当、`1.75rem`）が出て
-      「Review · N」（N はコメント数）と表示される。
-- [ ] 折り畳み中でもブロックのマーカー（コメント数バッジ）とクリック選択は効く。
-- [ ] 折り畳み中にブロックをクリックすると自動でペインが展開する。
-- [ ] `⌘\`（Windows/Linux は `Ctrl+\`）で開閉がトグルする。
-- [ ] `⌘J`（Windows/Linux は `Ctrl+J`）でも同様に開閉がトグルする（JIS 配列など
-      バックスラッシュが打ちにくい配列向けの代替バインド）。
-- [ ] AltGr のある配列（例: ドイツ語配列）で AltGr を含む通常の文字入力をしても、
-      折り畳みやリロードのショートカットが誤発火しない。
-- [ ] 幅を狭くしてから折り畳み、その状態でウィンドウを広げてから展開すると、幅が
-      元の広い値のまま残らず、現在のウィンドウ幅の 60% 以内に収まる。
-- [ ] 幅・開閉状態を変えてリロード（`⌘R`）しても同じ状態が復元される。
-- [ ] `localStorage` を無効化した状態（プライベートウィンドウ等）でもエラーにならず
-      既定値（320px・展開）で動く。
-- [ ] ウィンドウ幅を 720px 未満まで狭めると、既に広めに設定していた幅が自動的に
-      収まる（コンソールに横スクロールやレイアウト崩れが出ない）。
+- [ ] Dragging the splitter between `.doc` and `.review` changes the right pane's width.
+- [ ] The splitter shows `cursor: col-resize` (equivalent to a 6px width at the
+      default zoom level — it's `0.375rem`, so it gets thicker along with everything
+      else as you zoom).
+- [ ] Dragging doesn't break off even if the cursor leaves the splitter and passes
+      over `.doc`/`.review` (uses `setPointerCapture`).
+- [ ] Releasing the button after the pointer has left the window entirely during a
+      drag still ends the drag cleanly instead of leaving it "stuck" (a later click
+      shouldn't move the width on its own).
+- [ ] Body/pane text isn't selectable while dragging (`user-select: none`).
+- [ ] Dragging the width all the way left never goes below 240px.
+- [ ] Dragging the width all the way right never exceeds 60% of the window width.
+- [ ] The pane header's "⟩" button collapses it.
+- [ ] While collapsed, a vertical tab appears at the right edge of the screen
+      (equivalent to a 28px width at the default zoom level — it's `1.75rem`) reading
+      "Review · N" (N being the comment count).
+- [ ] Block markers (comment-count badges) and click-to-select still work while
+      collapsed.
+- [ ] Clicking a block while collapsed automatically expands the pane.
+- [ ] `⌘\` (`Ctrl+\` on Windows/Linux) toggles open/closed.
+- [ ] `⌘J` (`Ctrl+J` on Windows/Linux) toggles it the same way (an alternate binding
+      for layouts, like JIS, where backslash is awkward to type).
+- [ ] On a layout with an AltGr key (e.g. a German layout), typing ordinary characters
+      that involve AltGr doesn't misfire the collapse/reload shortcuts.
+- [ ] Narrowing the pane, collapsing it, widening the window, then expanding it again:
+      the width doesn't stay at its old wide value — it fits within 60% of the current
+      window width.
+- [ ] Reloading (`⌘R`) after changing the width/collapsed state restores the same
+      state.
+- [ ] With `localStorage` disabled (e.g. a private window), nothing errors and it
+      falls back to the defaults (320px, expanded).
+- [ ] Narrowing the window below 720px automatically fits a width that had been set
+      wider (no horizontal scrolling or broken layout shows up in the console).
 
-## 2. ズーム
+## 2. Zoom
 
-- [ ] `⌘+` / `⌘=`（Windows/Linux は `Ctrl`）で本文とレビューペインの文字が拡大する。
-- [ ] `⌘-` で縮小する。
-- [ ] `⌘0` で等倍（100%）に戻る。
-- [ ] 0.5 倍未満・2.0 倍超には振り切れない。
-- [ ] リロード後も直前のズーム率が復元される（`localStorage` キー `mdview.zoom`）。
-- [ ] ライブ更新（ファイル保存 → 本文差し替え）を挟んでもズーム率が維持される。
-- [ ] ネイティブウィンドウ（macOS）: View メニューの Zoom In / Zoom Out /
-      Actual Size / Reload がそれぞれ動く。
-- [ ] macOS ネイティブウィンドウでメニュー操作とキーボードショートカットを
-      連打しても二重に効かない（1 回の操作で 1 段階だけ変わる）。
-- [ ] `--browser` モード（Safari/Chrome 等）でもキーボードショートカットでズーム
-      できる（メニューは無いのでキー操作のみ）。
-- [ ] AltGr のある配列で AltGr を含む通常の文字入力をしても、ズームが誤発火しない
-      （`event.altKey` が立っている間はズームショートカットを無視する）。
+- [ ] `⌘+` / `⌘=` (`Ctrl` on Windows/Linux) enlarges the body and review pane text.
+- [ ] `⌘-` shrinks it.
+- [ ] `⌘0` resets to 100%.
+- [ ] It never goes below 0.5x or above 2.0x.
+- [ ] The zoom level from before a reload is restored after reloading (`localStorage`
+      key `mdview.zoom`).
+- [ ] The zoom level survives a live update (saving the file → body replacement).
+- [ ] Native window (macOS): the View menu's Zoom In / Zoom Out / Actual Size / Reload
+      all work.
+- [ ] On the macOS native window, mashing both the menu action and its keyboard
+      shortcut doesn't double up (one action still only moves it one step).
+- [ ] Zoom via the keyboard shortcuts also works in `--browser` mode (Safari/Chrome,
+      etc. — there's no menu, so only the key shortcuts apply).
+- [ ] On a layout with an AltGr key, typing ordinary characters that involve AltGr
+      doesn't misfire zoom (the zoom shortcuts are ignored while `event.altKey` is
+      set).
 
-## 3. 操作の基本
+## 3. Basic interactions
 
-- [ ] コメント入力用の textarea にフォーカスがある状態で Esc を押すとフォーカスが
-      外れる（選択はまだ解除されない）。
-- [ ] その状態でもう一度 Esc を押すとブロック選択が解除される。
-- [ ] `Alt+↓` / `Alt+↑` で同じ階層内の次/前のアンカーが選択される（ブロック選択中は
-      ブロック同士、項目選択中は兄弟項目同士、行選択中は同じ thead/tbody 内の
-      兄弟行同士）。textarea にフォーカスがあっても効く。
-- [ ] キーボードでブロックを選択したとき、そのブロックが画面外なら自動で
-      スクロールして見える位置に来る。
-- [ ] Unanchored リストから「選択中ブロックへ付け直す」を押したとき、対象ブロックが
-      画面外なら自動でスクロールする。
-- [ ] `⌘R` / `Ctrl+R` を JS 側（textarea フォーカス中含む）で押すとページがリロード
-      される。
-- [ ] コメントを保存すると、ペインヘッダに `Saving…` → `Saved` の順で表示され、
-      `Saved` は 2 秒ほどで消える。
-- [ ] サーバーを落とす等で保存に失敗させると、ヘッダに `Save failed — retry` が出て
-      消えずに残る。
-- [ ] `Save failed — retry` をクリックすると保存を再試行する（成功すれば `Saved` に
-      切り替わる）。
+- [ ] With focus in the comment textarea, pressing Esc removes focus (the selection
+      isn't cleared yet).
+- [ ] Pressing Esc again in that state clears the block selection.
+- [ ] `Alt+↓` / `Alt+↑` selects the next/previous anchor at the same level (block to
+      block while a block is selected, sibling item to sibling item while an item is
+      selected, sibling row to sibling row within the same thead/tbody while a row is
+      selected). Works even while a textarea has focus.
+- [ ] Selecting a block via the keyboard automatically scrolls it into view if it's
+      off-screen.
+- [ ] Pressing "Reanchor to selected block" in the Unanchored list automatically
+      scrolls to the target block if it's off-screen.
+- [ ] Pressing `⌘R` / `Ctrl+R` on the JS side (including while a textarea has focus)
+      reloads the page.
+- [ ] Saving a comment shows `Saving…` then `Saved` in the pane header, and `Saved`
+      disappears after about 2 seconds.
+- [ ] Making the save fail (e.g. by killing the server) shows `Save failed — retry` in
+      the header, and it stays there.
+- [ ] Clicking `Save failed — retry` retries the save (switching to `Saved` on
+      success).
 
-## 4. ウィンドウ（macOS ネイティブ）
+## 4. Windows (macOS native)
 
-- [ ] ウィンドウを `480×320` より小さくリサイズしようとしても、それ以下には
-      縮まらない。
-- [ ] ウィンドウを動かす/リサイズしてしばらく待ってから、
-      `~/Library/Application Support/mdview/window.json` が更新されていることを
-      `cat` で確認する。
-- [ ] アプリを閉じて（赤信号ボタン／`⌘W`／`⌘Q`）から `cat` すると、閉じた時点の
-      位置・サイズが保存されている。
-- [ ] `⌘Q`（Dock からの Quit も同様）で終了した場合も、`window.json` が最新の
-      位置・サイズで更新されている（`⌘Q` はウィンドウの `CloseRequested` を
-      経由しないことがあるため、`LoopDestroyed` でも保存する経路の確認）。
-- [ ] 保存された位置・サイズで再起動すると、その位置・サイズで開く（起動 →
-      終了 → 再起動を複数回繰り返しても、位置・サイズがタイトルバーの高さ分ずつ
-      ずれていったりしない）。
-- [ ] 起動直後（1 秒以内）に OS 側の理由でウィンドウが一瞬動く/リサイズされても、
-      それだけでは `window.json` が書き換わらない（起動後 1 秒間はデバウンスが
-      始まらない仕様）。
-- [ ] 外付けディスプレイを外した後（保存時に使っていたモニタが無くなった状態）に
-      起動しても、画面外に消えたりせず、まっとうな位置に開く（サイズだけ復元され、
-      位置は無視される）。
-- [ ] `window.json` を壊れた JSON にして起動しても、エラーで落ちずに既定サイズで
-      開く（警告は標準エラー出力に出るだけでよい）。
-- [ ] `MDVIEW_DEBUG=1` で起動すると、起動直後に stderr へ
-      `[mdview:js] storage: ok`（または `unavailable ...`）が出る
-      （`assets/viewer.js` の localStorage 可否プローブ、`window.ipc` 経由）。
+- [ ] Trying to resize the window smaller than `480×320` never shrinks it below that.
+- [ ] After moving/resizing the window and waiting a moment, confirm with `cat` that
+      `~/Library/Application Support/markdown-remarkable/window.json` has been updated.
+- [ ] After closing the app (red traffic-light button / `⌘W` / `⌘Q`) and then running
+      `cat`, the position/size at the moment it closed is what's saved.
+- [ ] Quitting via `⌘Q` (or Quit from the Dock) also updates `window.json` with the
+      latest position/size (since `⌘Q` doesn't always go through the window's
+      `CloseRequested`, confirm the path that also saves on `LoopDestroyed`).
+- [ ] Restarting with a saved position/size reopens at that position/size (repeating
+      launch → quit → relaunch several times shouldn't drift the position/size by the
+      title bar's height each time).
+- [ ] If the OS nudges/resizes the window for its own reasons right after launch
+      (within 1 second), that alone shouldn't rewrite `window.json` (the debounce
+      doesn't start until 1 second after launch, by design).
+- [ ] Launching after an external display used at save time has been disconnected
+      doesn't leave the window off-screen — it opens somewhere reasonable (only the
+      size is restored; the position is ignored).
+- [ ] Launching with a corrupted `window.json` doesn't crash with an error — it opens
+      at the default size (a warning printed to stderr is fine).
+- [ ] Launching with `MDVIEW_DEBUG=1` prints `[markdown-remarkable:js] storage: ok` (or
+      `unavailable ...`) to stderr right after startup (`assets/viewer.js`'s
+      localStorage-availability probe, via `window.ipc`).
 
-## 5. 空状態・失敗状態
+## 5. Empty/failure states
 
-- [ ] ファイルを指定せずにネイティブウィンドウを起動し、ファイルピッカーを
-      キャンセルすると、右ペインは「ファイルを開くとここにレビューが表示されます」
-      とだけ表示され、コメントフォームは出ない。
-- [ ] その状態からファイルをドラッグ&ドロップで開くと、右ペインが通常のレビュー
-      UI に切り替わる。
-- [ ] 表示中のファイルを外部で削除する等して読み込みを失敗させると、既存の
-      エラーバナーが出て保存操作が無効化される。
-- [ ] その状態で「再読み込み」ボタンを押すと `GET /review` を再試行する（ファイルを
-      戻してから押せば正常に復帰する）。
+- [ ] Launching the native window without specifying a file, then cancelling the file
+      picker, shows only "Open a file to see its review here" in the right pane, with
+      no comment form.
+- [ ] Opening a file by dragging and dropping it from that state switches the right
+      pane over to the normal review UI.
+- [ ] Making the load fail (e.g. by deleting the file being shown externally) shows
+      the existing error banner and disables saving.
+- [ ] Clicking "Retry" in that state retries `GET /review` (restoring normally if the
+      file is put back first).
 
-## 6. ライト/ダーク
+## 6. Light/dark
 
-- [ ] OS のダークモードを切り替えても、上記の各要素（スプリッタ、折り畳みタブ、
-      保存インジケータ、バナー、プレースホルダ）が破綻なく表示される
-      （コントラスト・視認性含む）。
+- [ ] Toggling OS dark mode doesn't break any of the elements above (splitter,
+      collapse tab, save indicator, banner, placeholder) — including contrast and
+      legibility.
 
-## 7. リスト項目・表の行の選択とエクスポート（入れ子アンカー）
+## 7. Selecting list items/table rows and export (nested anchors)
 
-`docs/superpowers/specs/2026-08-23-nested-anchors-design.md` の手動確認項目。
-ネスト（3 階層程度）リストとヘッダ付きの表を含む md で確認する。
+Manual verification items for selecting and commenting on list items/table rows (see
+README's "Review comments and export" section). Verify with a Markdown
+file containing a nested list (about 3 levels deep) and a table with a header row.
 
-- [ ] リストの `<li>` をクリックすると、その項目だけが選択される（外側の
-      ブロック全体ではなく）。ネストした項目でも、クリックした項目自体が
-      選択される。
-- [ ] 表の行（ヘッダ行含む）の `<tr>` をクリックすると、その行だけが選択される。
-- [ ] 項目・行を選択すると右ペインにパンくず（例: `ブロック L10-L20 › 項目 L13`）が
-      表示され、各段をクリックするとその階層が選択される。
-- [ ] 項目を選択中は「↑ リスト全体にコメント」、行を選択中は「↑ 表全体にコメント」
-      ボタンが出て、押すと親ブロックが選択される。
-- [ ] 項目・行を含むブロックを選択中は「項目を選ぶにはクリック」のヒントが出る。
-- [ ] 項目・行にコメントを付けると、左バー + 件数バッジが該当 `<li>`/`<tr>` に
-      表示される（行は最後のセルにバッジが出る仕様）。
-- [ ] 内側の項目・行にコメントがあるブロック/項目には「内側に N 件」の薄いバッジが
-      表示される。
-- [ ] `Alt+←` で選択中の項目/行から親（項目 → その親項目またはブロック、行 →
-      ブロック）に移動する。
-- [ ] `Alt+→` で選択中のブロック/項目から最初の子アンカー（最初の項目・行）に
-      移動する。
-- [ ] 項目・行にコメントを付けて Export すると、出力 Markdown の該当行に
-      `（in list L10-L20）` / `（in table L40-L48）` の注記が付く（ネストした
-      項目でも、直近の親項目ではなくリスト全体の行範囲になる）。
-- [ ] ライブリロード（ファイル保存 → 本文差し替え）を挟んでも、項目・行の選択と
-      コメントマーカーが正しく復元される。
+- [ ] Clicking a list's `<li>` selects only that item (not the enclosing block as a
+      whole). Even for a nested item, the exact item clicked gets selected.
+- [ ] Clicking a table row's `<tr>` (including the header row) selects only that row.
+- [ ] Selecting an item/row shows a breadcrumb in the right pane (e.g. `Block L10-L20
+      › Item L13`), and clicking any segment selects that level.
+- [ ] While an item is selected, an "↑ Comment on whole list" button appears; while a
+      row is selected, "↑ Comment on whole table" appears — clicking it selects the
+      parent block.
+- [ ] While a block containing items/rows is selected, the "Click to select an item"
+      hint appears.
+- [ ] Commenting on an item/row shows a left bar plus a count badge on the
+      corresponding `<li>`/`<tr>` (a row's badge appears on its last cell, by design).
+- [ ] A block/item whose nested items/rows have comments shows a faint "N inside"
+      badge.
+- [ ] `Alt+←` moves from the selected item/row to its parent (item → its parent item
+      or block; row → block).
+- [ ] `Alt+→` moves from the selected block/item to its first nested anchor (its first
+      item/row).
+- [ ] Commenting on an item/row and exporting adds a `(in list L10-L20)` /
+      `(in table L40-L48)` note to that line in the exported Markdown (for a nested
+      item, this is the whole list's own line range, not just its immediate parent
+      item's).
+- [ ] Item/row selection and comment markers are correctly restored across a live
+      reload (saving the file → body replacement).
 
-## 8. ファイル全体コメント
+## 8. File-wide comments
 
-`docs/superpowers/specs/2026-08-24-file-comments-and-multi-window-design.md`
-「A. ファイル全体に対するコメント」の手動確認項目。
+Manual verification items for file-wide comments (see README's "Review comments and
+export" section).
 
-- [ ] ファイルを開いた直後（何も選択していない初期状態）は右ペインに
-      「ファイル全体へのコメント」見出しと入力欄が表示される（「ブロックを
-      クリック」の案内は入力欄の下に小さく残る）。
-- [ ] パンくずの根に常設の「ファイル」段があり、ブロック/項目/行を選択中は
-      「ファイル › ブロック L…-L… › 項目 L…」のように表示される。
-- [ ] パンくずの「ファイル」をクリックするとファイル全体モードに戻る
-      （選択が解除される）。
-- [ ] ブロックを選択中に Esc を押すとファイル全体モードに戻る。
-- [ ] ファイル全体へのコメントを入力して保存（保存ボタン、または
-      Cmd/Ctrl+Enter）すると一覧に追加され、`PUT /review` が発行される。
-- [ ] ファイル全体コメントを編集・削除できる（ブロックコメントと同じ操作
-      感）。
-- [ ] ヘッダの「N comments」に、ファイル全体コメントの件数も含まれる。
-- [ ] パンくずの「ファイル」段に件数バッジが表示され、ファイル全体コメント
-      の増減に追従する。
-- [ ] ファイル全体コメントには、ドキュメント本文側に左バーやバッジなどの
-      マーカーが付かない（付ける対象がそもそも無いため）。
-- [ ] ライブリロード（ファイル保存 → 本文差し替え）を挟んでも、選択して
-      いたブロック/ファイル全体モードのどちらかが維持される。
-- [ ] Export したとき、ファイル全体コメントがあれば出力 Markdown の先頭に
-      `> (file): <ファイル名>` 節が入り、件数表記が
-      `N comments (K on the file, M on B blocks)` になる（ファイル全体
-      コメントが無ければ従来どおり `M comments on B blocks`）。
-- [ ] ファイル全体モードでコメントの「編集」を押し、textarea にフォーカス
-      がある状態で Esc → もう一度 Esc の順に押すと、1 回目でフォーカスが
-      外れるだけ、2 回目で編集がキャンセルされ通常のコメント一覧表示に
-      戻る（textarea の内容が残ったままにならない）。
-- [ ] 未アンカーのコメントがある状態で、ヘッダの「N comments」（未アンカー
-      分を含む総数）と、Export した Markdown の先頭件数表記（アンカー済み
-      のみの数 + `(+U unanchored)`）を見比べ、`ヘッダの N = 先頭件数表記の
-      アンカー済み分 + U` の関係になっていることを確認する。
+- [ ] Right after opening a file (the initial state, with nothing selected), the right
+      pane shows a "Comments on the whole file" heading and an input field (the
+      "Click a block" hint stays small, below the input field).
+- [ ] The breadcrumb has a permanent "File" segment at its root, and shows as
+      "File › Block L…-L… › Item L…" while a block/item/row is selected.
+- [ ] Clicking "File" in the breadcrumb returns to file-wide mode (clearing the
+      selection).
+- [ ] Pressing Esc while a block is selected returns to file-wide mode.
+- [ ] Entering a file-wide comment and saving it (the Save button, or Cmd/Ctrl+Enter)
+      adds it to the list and issues `PUT /review`.
+- [ ] File-wide comments can be edited and deleted (the same interaction as block
+      comments).
+- [ ] The header's "N comments" count includes file-wide comments.
+- [ ] The breadcrumb's "File" segment shows a count badge that tracks the number of
+      file-wide comments.
+- [ ] File-wide comments never get a marker (left bar, badge, etc.) on the document
+      body itself (there's nothing to attach one to).
+- [ ] Whichever was active — a selected block, or file-wide mode — is preserved across
+      a live reload (saving the file → body replacement).
+- [ ] On export, if there are any file-wide comments, a `> (file): <file name>`
+      section is added at the top of the exported Markdown, and the count line reads
+      `N comments (K on the file, M on B blocks)` (without any file-wide comments it
+      stays `M comments on B blocks` as before).
+- [ ] Pressing "Edit" on a comment in file-wide mode, then pressing Esc twice with the
+      textarea focused: the first Esc only removes focus, and the second cancels the
+      edit and returns to the normal comment list (the textarea's contents don't stick
+      around).
+- [ ] With some unanchored comments present, compare the header's "N comments" (which
+      includes the unanchored ones) against the exported Markdown's own count line at
+      the top (anchored comments only, plus `(+U unanchored)`), and confirm that
+      `header's N = the exported count line's anchored portion + U`.
 
-## 9. 複数ウィンドウ（macOS ネイティブ）
+## 9. Multiple windows (macOS native)
 
-`docs/superpowers/specs/2026-08-24-file-comments-and-multi-window-design.md`
-「B. ファイルごとに別ウィンドウで開く」の手動確認項目。
+Manual verification items for opening each file in its own window (see README's "File
+tree and multi-window navigation" section).
 
-- [ ] `mdview a.md b.md` で起動すると、ファイルごとに別ウィンドウが 2 つ開く
-      （タイトルはそれぞれ `a.md — mdview` / `b.md — mdview`）。
-- [ ] 引数なしで起動すると空ウィンドウが 1 つだけ開き、ファイル選択ダイアログ
-      が出る（キャンセルすると空の「Drop a Markdown file here」のまま残る）。
-- [ ] ウィンドウが 1 つ開いている状態で Finder から別のファイルをダブル
-      クリックすると、新しいウィンドウがもう 1 つ開く（既存ウィンドウの内容
-      は変わらない）。
-- [ ] Finder から、既に別ウィンドウで開いているファイルと同じファイルを開く
-      と、新しいウィンドウは開かず既存のウィンドウが前面に来る。
-- [ ] ファイルが開いているウィンドウで ⌘O すると、新しいウィンドウが開く
-      （元のウィンドウの内容は変わらない）。
-- [ ] 空ウィンドウ（ファイル未選択）で ⌘O すると、新しいウィンドウは開かず
-      そのウィンドウにファイルが開く。
-- [ ] ファイルが開いているウィンドウに `.md` ファイルをドラッグ&ドロップ
-      すると、新しいウィンドウが開く（ドロップ先のウィンドウの内容は変わら
-      ない）。
-- [ ] 空ウィンドウに `.md` ファイルをドラッグ&ドロップすると、そのウィンドウ
-      にファイルが開く。
-- [ ] 複数ウィンドウが開いている状態で 1 つのウィンドウだけ ⌘W（または赤信号
-      ボタン）で閉じても、他のウィンドウとアプリ自体は生きたままになる。
-- [ ] 最後の 1 つのウィンドウを閉じると、アプリごと終了する。
-- [ ] 複数ウィンドウを開いた状態で ⌘Q すると、すべてのウィンドウが閉じて
-      アプリが終了する。
-- [ ] 新しく開いたウィンドウは、直前のウィンドウの位置から右下に少しずらした
-      位置（カスケード）に開く。
-- [ ] macOS の View メニュー（Zoom In/Out/Actual Size/Reload）を操作すると、
-      複数ウィンドウのうち前面にあるウィンドウにだけ効く（背面のウィンドウの
-      ズーム率やリロード状態は変わらない）。
-- [ ] ウィンドウを切り替えてから View メニューを操作すると、切り替え後に
-      前面になったウィンドウに効く。
-- [ ] いずれかのウィンドウを動かす/リサイズしてから
-      `~/Library/Application Support/mdview/window.json` を確認すると、最後に
-      動かしたウィンドウの位置・サイズが保存されている。
-- [ ] 複数ウィンドウを開いたまま ⌘Q で終了すると、`window.json` には前面
-      だったウィンドウの位置・サイズが保存されている。
-- [ ] 既に開いているファイルを、別のウィンドウへドラッグ&ドロップ／
-      ⌘O で選ぶと、新しいウィンドウは開かず既存のそのウィンドウが前面に
-      来るだけになる（`mdview a.md a.md` の起動時も同様に 1 ウィンドウに
-      なる）。
-- [ ] ウィンドウをいくつか開いてカスケードさせた後、途中の 1 枚だけ閉じて
-      から新しいファイルを開いても、残っているウィンドウのどれとも完全には
-      重ならない位置に開く（閉じたウィンドウの分だけカスケード段数が戻った
-      りしない）。
+- [ ] Running `markdown-remarkable a.md b.md` opens two separate windows, one per file
+      (titled `a.md — markdown-remarkable` and `b.md — markdown-remarkable`
+      respectively).
+- [ ] Running with no arguments opens a single empty window with a file picker (if
+      cancelled, it stays as the empty "Drop a Markdown file here" state).
+- [ ] With one window already open, double-clicking a different file in Finder opens
+      one more new window (the existing window's contents don't change).
+- [ ] Opening from Finder a file that's already open in a different window doesn't
+      open a new window — it brings the existing window to the front instead.
+- [ ] Pressing ⌘O in a window that has a file open opens a new window (the original
+      window's contents don't change).
+- [ ] Pressing ⌘O in an empty window (no file selected) doesn't open a new window — the
+      file opens in that same window.
+- [ ] Dragging and dropping a `.md` file onto a window that already has a file open
+      opens a new window (the drop target window's own contents don't change).
+- [ ] Dragging and dropping a `.md` file onto an empty window opens it in that same
+      window.
+- [ ] With multiple windows open, closing just one (⌘W or the red traffic-light
+      button) leaves the other windows and the app itself running.
+- [ ] Closing the very last window quits the whole app.
+- [ ] Pressing ⌘Q with multiple windows open closes all of them and quits the app.
+- [ ] A newly opened window appears cascaded — offset down and to the right from the
+      previous window's position.
+- [ ] Using the macOS View menu (Zoom In/Out/Actual Size/Reload) only affects whichever
+      window is currently frontmost among the open windows (background windows' zoom
+      level/reload state don't change).
+- [ ] Switching windows and then using the View menu affects whichever window is now
+      frontmost after the switch.
+- [ ] After moving/resizing any window, check
+      `~/Library/Application Support/markdown-remarkable/window.json` — it holds the position/size
+      of whichever window was moved most recently.
+- [ ] Quitting with ⌘Q while multiple windows are open saves the position/size of
+      whichever window was frontmost into `window.json`.
+- [ ] Dragging and dropping, or choosing via ⌘O, a file that's already open into a
+      different window doesn't open a new window — it just brings that existing
+      window to the front (running `markdown-remarkable a.md a.md` at launch also
+      results in a single window, the same way).
+- [ ] After opening and cascading several windows, closing one in the middle and then
+      opening a new file still opens it somewhere that doesn't fully overlap any
+      remaining window (the cascade offset doesn't roll back just because a window in
+      the middle was closed).
 
-## 10. ファイル遷移（相対リンク・戻る/進む、ネイティブウィンドウのみ）
+## 10. File navigation (relative links, back/forward, native window only)
 
-- [ ] 本文中の相対 `.md` リンクをクリックすると、同じウィンドウでリンク先の
-      ファイルに切り替わる。
-- [ ] 切り替え後、ドキュメントヘッダーの ◀ が有効になる。◀ を押すと元の
-      ファイルに戻り、今度は ▶ が有効になる。
-- [ ] 何度か行き来した後、◀/▶ の有効/無効がその都度正しく更新される
-      （行き止まりでは押せない）。
-- [ ] `⌘[`/`⌘]`（Windows/Linux は `Ctrl+[`/`Ctrl+]`）でも同様に戻る/進む
-      が効き、ボタンの有効/無効と連動する。
-- [ ] コメント入力用の textarea にフォーカスがある状態で `⌘[` を押しても、
-      textarea の中身やフォーカスに影響しない（ショートカットが無害）。
-- [ ] `root_dir` 配下のサブディレクトリを跨ぐ `../` を含むリンク
-      （例: `sub/a.md` から `../b.md`）が正しいファイルに切り替わる。
-- [ ] `root_dir` の外に出ようとする `../` を含むリンク（存在すればトップ
-      ファイルからの `../outside.md` 等）をクリックしても、何も起きない
-      （別ディレクトリの同名ファイルに誤って切り替わらない）。
-- [ ] 日本語ファイル名・空白入りファイル名（例: `名前 空白.md`）への相対
-      リンクが正しく開く。
-- [ ] 修飾キー（⌘/Ctrl/Shift/Alt のいずれか）を押しながら相対 `.md` リンク
-      をクリックしても、何も起きない（404 ページに落ちない）。
-- [ ] `.md`/`.markdown` 以外の相対リンク（例: `notes.txt`）をクリックしても
-      何も起きない（404 ページに落ちない）。
-- [ ] `#fragment` 付きのリンク（例: `other.md#section`）をクリックすると、
-      フラグメントは無視されて `other.md` に切り替わるだけになる（見出しへの
-      自動スクロールはしない）。
-- [ ] 長い文書でスクロールしても、ドキュメントヘッダーが画面上部に残り続ける
-      （sticky）。
-- [ ] `⌘+`/`⌘=` でズームを 200% まで上げても、ドキュメントヘッダーの
-      ボタン・パス表示がヘッダーの外にはみ出さない。
-- [ ] ウィンドウ A で X.md を開く → 本文の相対リンクで Y.md へ遷移する
-      （A の履歴は [X, Y]）→ ⌘O または Finder で X.md を開く（同じ内容の
-      X.md を別ウィンドウ B が表示する）→ A で ◀ を押す。期待: B が前面に
-      来るだけで A 自身は Y.md のまま切り替わらない（review sidecar の
-      競合回避のため 1 ファイル 1 ウィンドウ — 上記 Limitations 参照）。
-      A の ◀ は有効なまま、▶ は無効のまま。続けて A で ◀ をもう一度
-      押しても同じ結果を繰り返すだけで壊れない（履歴のカーソルが不整合に
-      ならない）。
-- [ ] 左ペインのファイルツリーでファイルを開いた後、ドキュメントヘッダーの
-      ◀ で元のファイルに戻れる（ツリー経由の切り替えも相対リンクと同じく
-      履歴に積まれる）。
-- [ ] ファイルを何も開いていない空のウィンドウでは、ドキュメントヘッダーの
-      ◀/▶ が両方とも無効で、パス欄が空になっている。
-- [ ] `--browser` モードでは、ドキュメントヘッダーの ◀/▶ ボタンが表示されない。
-- [ ] `--browser` モードで相対 `.md` リンクをクリックしても切り替わらない
-      （ブラウザの既定動作に任される — 404 になっても構わない。ブラウザの
-      戻るボタンで復帰できる）。
-- [ ] `--browser` モードで `http(s)` リンクをクリックすると、元のタブは
-      そのままに新しいタブが開く。
-- [ ] `[x](/other.md)`（root 相対）や `[x](//host/other.md)`（プロトコル
-      相対）をネイティブでクリックしても何も起きない（アプリ内 404 に
-      落ちない）。`--browser` では既定動作に任され、同一タブで 404 に
-      なって構わない。
-- [ ] 相対 `.md` リンクを中クリックしても、遷移も新規ウィンドウ/新規タブも
-      起きない（右クリックのコンテキストメニューは従来どおり出る）。
-- [ ] `%2f`（`/`）や `%5c`（`\`）を含む相対リンクをクリックしても、
-      何も起きない（セグメント境界をまたいで別ディレクトリに解決されない）。
-- [ ] 既存機能の回帰確認: `mailto:` リンクをクリックするとメールクライアント
-      が起動する。脚注参照 `[^1]` をクリックすると同一ページ内の脚注定義へ
-      スクロールする（相対リンクの横取りに巻き込まれない）。
-- [ ] ◀ で戻る先のファイルを事前に削除しておくと、◀ を押した後エラー
-      ページになるが、ファイルツリーから別のファイルを開けばそこから復帰
-      できる。
+- [ ] Clicking a relative `.md` link in the document body switches the same window to
+      the linked file.
+- [ ] After switching, the document header's ◀ becomes enabled. Pressing ◀ returns to
+      the original file, at which point ▶ becomes enabled.
+- [ ] After navigating back and forth a few times, ◀/▶'s enabled/disabled state
+      updates correctly each time (disabled at either end of the history).
+- [ ] `⌘[`/`⌘]` (`Ctrl+[`/`Ctrl+]` on Windows/Linux) also move back/forward the same
+      way, staying in sync with the buttons' enabled state.
+- [ ] With focus in the comment textarea, pressing `⌘[` doesn't affect the textarea's
+      contents or focus (the shortcut is a no-op there).
+- [ ] A link containing `../` that crosses a subdirectory boundary under `root_dir`
+      (e.g. `../b.md` from `sub/a.md`) switches to the correct file.
+- [ ] Clicking a link containing `../` that would climb outside `root_dir` (e.g.
+      `../outside.md` from the top-level file, if one exists) does nothing (it never
+      mistakenly switches to a same-named file in a different directory).
+- [ ] A relative link to a file with non-ASCII characters or spaces in its name (e.g.
+      `café note.md`) opens correctly.
+- [ ] Clicking a relative `.md` link while holding a modifier key (any of ⌘/Ctrl/Shift/
+      Alt) does nothing (it never falls through to a 404 page).
+- [ ] Clicking a relative link to something other than `.md`/`.markdown` (e.g.
+      `notes.txt`) does nothing (it never falls through to a 404 page).
+- [ ] Clicking a link with a `#fragment` (e.g. `other.md#section`) switches to
+      `other.md` with the fragment simply ignored (no auto-scroll to a heading).
+- [ ] The document header stays fixed at the top of the screen while scrolling a long
+      document (sticky).
+- [ ] Zooming up to 200% with `⌘+`/`⌘=` doesn't overflow the document header's own
+      buttons/path label outside the header.
+- [ ] In window A, open X.md → navigate to Y.md via a relative link in the body (A's
+      history is now [X, Y]) → open X.md via ⌘O or Finder (a different window B
+      displays the same X.md content) → press ◀ in A. Expected: B comes to the front
+      and A itself stays on Y.md without switching (one file per window, to avoid a
+      review sidecar conflict — see the Limitations section of README.md). A's ◀ stays enabled,
+      ▶ stays disabled. Pressing ◀ in A again afterward just repeats the same result
+      without breaking (the history cursor never ends up in an inconsistent state).
+- [ ] After opening a file via the left-hand file tree, pressing ◀ in the document
+      header returns to the original file (a switch via the tree gets added to the
+      history the same way a relative link does).
+- [ ] In an empty window with no file open, the document header's ◀/▶ are both
+      disabled and the path field is empty.
+- [ ] In `--browser` mode, the document header's ◀/▶ buttons don't appear at all.
+- [ ] Clicking a relative `.md` link in `--browser` mode doesn't switch anything
+      (left to the browser's own default behavior — a 404 is fine, and the browser's
+      own back button recovers from it).
+- [ ] Clicking an `http(s)` link in `--browser` mode opens a new tab, leaving the
+      original tab as-is.
+- [ ] Clicking `[x](/other.md)` (root-relative) or `[x](//host/other.md)`
+      (protocol-relative) in the native window does nothing (it never falls through to
+      an in-app 404). In `--browser` mode this is left to the default behavior, and
+      landing on a 404 in the same tab is fine.
+- [ ] Middle-clicking a relative `.md` link doesn't navigate or open a new
+      window/tab (a right-click's context menu still appears as usual).
+- [ ] Clicking a relative link containing `%2f` (`/`) or `%5c` (`\`) does nothing (it
+      never resolves across a segment boundary into a different directory).
+- [ ] Regression check for existing features: clicking a `mailto:` link launches the
+      mail client. Clicking a footnote reference `[^1]` scrolls to that footnote's
+      definition on the same page (unaffected by the relative-link interception).
+- [ ] Deleting the file that ◀ would go back to beforehand: pressing ◀ lands on an
+      error page, but opening a different file from the file tree recovers from
+      there.

@@ -50,7 +50,7 @@ body {
     Arial, sans-serif, "Apple Color Emoji", "Segoe UI Emoji";
   /* rem, not px: assets/viewer.js drives zoom by scaling the root <html>
      element's font-size, and only a relative unit here actually responds
-     to that (see docs/superpowers/specs/2026-08-23-baseline-ux-design.md). */
+     to that. */
   font-size: 1rem;
   line-height: 1.6;
   word-wrap: break-word;
@@ -662,12 +662,12 @@ body[data-mode="browser"] .doc-nav-btn {
   text-align: center;
 }
 
-/* "内側に N 件" — a block/item whose nested items/rows carry comments
+/* "N inside" — a block/item whose nested items/rows carry comments
    (assets/review.js's countCommentedDescendants()/data-inner-count). Never
    matches a row (rows have no anchor descendants), and never renders on a
    `<tr>` even if it did (same generated-content limitation as above). */
 .doc [data-inner-count]::before {
-  content: "内側に " attr(data-inner-count) " 件";
+  content: attr(data-inner-count) " inside";
   display: inline-block;
   margin-right: 0.5em;
   padding: 0.05em 0.5em;
@@ -807,7 +807,7 @@ button.review-save-status.failed {
   padding: 0.1em 0.4em;
 }
 
-/* "ファイル" — the breadcrumb's permanent root segment (assets/review.js's
+/* "File" — the breadcrumb's permanent root segment (assets/review.js's
    buildFileBreadcrumbSegment()) and the file-mode comment list heading. */
 .review-breadcrumb-badge {
   display: inline-block;

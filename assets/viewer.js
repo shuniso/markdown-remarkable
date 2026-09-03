@@ -5,8 +5,7 @@
   // to a percentage of the browser default (100% == 1.0), which the
   // rem-based sizes in assets/style.css (`.markdown-body`, `.review`) scale
   // against automatically — see render.rs's `page()` for where this script
-  // is embedded (right before live.js) and docs/superpowers/specs/
-  // 2026-08-23-baseline-ux-design.md for the design.
+  // is embedded (right before live.js).
   //
   // Persisted via `storage` (below) so it survives a reload; naturally
   // survives a live-reload body swap too, since it's set on <html>, which
@@ -21,7 +20,7 @@
 
   // Posts `msg` to the native host over wry's IPC bridge, if one exists
   // (it does in the native window — see `with_ipc_handler` in app.rs,
-  // which echoes it to stderr as `[mdview:js] <msg>` under
+  // which echoes it to stderr as `[markdown-remarkable:js] <msg>` under
   // `MDVIEW_DEBUG=1`; it doesn't in `--browser` mode, where `window.ipc`
   // is simply absent and this is a silent no-op).
   function post(msg) {
@@ -266,9 +265,10 @@
   //
   // Each `/`-split segment of `href` is `decodeURIComponent`d before being
   // compared/pushed — `render::to_html`'s `escape_href` (pulldown-cmark)
-  // percent-encodes spaces and non-ASCII bytes into a rendered `<a href>`,
-  // so a link to e.g. `名前 空白.md` arrives here as `%E5%90%8D%E5%89%8D%20
-  // ...` and has to be decoded back before it means anything as a path —
+  // percent-encodes spaces and non-ASCII bytes into a rendered `<a href>`
+  // (ASCII letters/digits are left alone), so a link to e.g.
+  // `café note.md` arrives here as `caf%C3%A9%20note.md` and has to be
+  // decoded back before it means anything as a path —
   // `routes::handle_open`'s doc comment on `path` documents this same
   // contract from the server side. Decoding can turn a segment that wasn't
   // literally `".."`/`"."` in the source `href` into one that now is
@@ -346,7 +346,7 @@
       // Shouldn't happen (tree.js always defines this before any click
       // could reach here), but fail silently rather than throw if it ever
       // does.
-      console.warn("mdview: file tree is not available; cannot open " + targetPath);
+      console.warn("markdown-remarkable: file tree is not available; cannot open " + targetPath);
     }
   }
 

@@ -6,9 +6,7 @@
   // blocks, list items, and table rows (identified by the `data-hash` the
   // server stamps on each `.blk`/`.anchor` element — see render.rs),
   // persist them via GET/PUT /review, and export them as a Markdown review
-  // summary via POST /export. See
-  // docs/superpowers/specs/2026-08-22-inline-review-comments-design.md and
-  // docs/superpowers/specs/2026-08-23-nested-anchors-design.md.
+  // summary via POST /export.
 
   var REVIEW_URL = "/review";
   var EXPORT_URL = "/export";
@@ -90,9 +88,9 @@
     return btn;
   }
 
-  // -- localStorage, wrapped in try/catch per the design doc: a disabled or
-  //    full localStorage must never throw its way into a broken pane —
-  //    just fall back to the defaults. --------------------------------
+  // -- localStorage, wrapped in try/catch: a disabled or full localStorage
+  //    must never throw its way into a broken pane — just fall back to
+  //    the defaults. --------------------------------------------------
 
   function safeStorageGet(key) {
     try {
@@ -279,8 +277,8 @@
 
   // Selects `hash`, always re-rendering. `opts.ensureVisible` scrolls the
   // block into view if needed (keyboard nav, and re-anchoring from the
-  // unanchored list — see the design doc's section 3 — where the block
-  // clicked to trigger the action isn't necessarily the one now selected).
+  // unanchored list, where the block clicked to trigger the action isn't
+  // necessarily the one now selected).
   // `opts.expandIfCollapsed` re-opens a collapsed review pane (click
   // selection only — see applyMarkers()).
   function selectBlock(hash, opts) {
@@ -307,9 +305,8 @@
   // For a top-level `.blk` div that's every other block (parent is
   // `main.doc`); for a list item, the other `<li>` in the *same* `<ul>`/
   // `<ol>` (a nested item's own parent is the inner list, not the outer
-  // item, so this naturally excludes items at a different nesting depth —
-  // see the nested-anchors design doc); for a table row, the other `<tr>`
-  // in the same `<thead>`/`<tbody>`.
+  // item, so this naturally excludes items at a different nesting depth);
+  // for a table row, the other `<tr>` in the same `<thead>`/`<tbody>`.
   function siblingAnchors(el) {
     if (!el || !el.parentElement) {
       return [];
@@ -471,7 +468,7 @@
   // Every anchor in the document, at any granularity: top-level blocks
   // *and* nested list items/table rows. Used everywhere selection,
   // marking, and unanchored-detection need to consider every anchor kind,
-  // not just blocks — see the nested-anchors design doc.
+  // not just blocks.
   function anchorElements() {
     var root = docRoot();
     return root ? root.querySelectorAll(".blk, .anchor") : [];
@@ -494,8 +491,8 @@
   // one, built from the anchor's own sanitized content) and only falls
   // back to a rough client-side derivation if that's missing for some
   // reason. Not required to match render.rs's excerpt byte-for-byte in the
-  // fallback case — it's purely a display aid (see the design doc:
-  // "excerpt と index は補助情報").
+  // fallback case — excerpt and index are purely auxiliary display aids,
+  // not identity.
   function excerptForBlockElement(blockEl) {
     var fromServer = blockEl.dataset
       ? blockEl.dataset.excerpt
@@ -662,9 +659,9 @@
       .then(function (result) {
         state.loading = false;
         if (result.status === 409) {
-          // No file open yet — not a failure, just an empty state. See the
-          // design doc's section 5: no banner, no form, just the
-          // placeholder renderAside() shows for state.noFileOpen.
+          // No file open yet — not a failure, just an empty state: no
+          // banner, no form, just the placeholder renderAside() shows for
+          // state.noFileOpen.
           state.loaded = false;
           state.noFileOpen = true;
           state.error = null;
@@ -674,7 +671,7 @@
         if (!result.ok) {
           state.loaded = false;
           state.error =
-            "レビューの読み込みに失敗したため保存は無効です: " +
+            "Couldn't load the review, so saving is disabled: " +
             errorMessage(result.payload, "unknown error");
           render();
           return;
@@ -694,7 +691,7 @@
         state.loading = false;
         state.loaded = false;
         state.error =
-          "レビューの読み込みに失敗したため保存は無効です: network error";
+          "Couldn't load the review, so saving is disabled: network error";
         render();
       });
   }
@@ -789,7 +786,7 @@
       })
       .catch(function () {
         exportBtn.disabled = false;
-        state.error = "エクスポートに失敗しました";
+        state.error = "Export failed";
         render();
       });
   }
@@ -828,7 +825,7 @@
         state.toast.copied = ok;
         if (!ok) {
           state.toast.message =
-            "Exported (コピー失敗。ファイルは保存済み)";
+            "Exported (copy failed — file was still saved)";
         }
         render();
       }
@@ -836,7 +833,7 @@
     toast.appendChild(copyBtn);
 
     toast.appendChild(
-      button("review-toast-close", "閉じる", function () {
+      button("review-toast-close", "Close", function () {
         state.toast = null;
         render();
       })
@@ -1060,14 +1057,14 @@
     clearChildren(asideEl);
 
     if (state.noFileOpen) {
-      // Section 5 of the design doc: only this placeholder, no header, no
-      // form. loadReview() re-fetches once a file is open (see
+      // No file open: only this placeholder, no header, no form.
+      // loadReview() re-fetches once a file is open (see
       // onBodyReplaced()), which replaces this with the real pane.
       asideEl.appendChild(
         el(
           "p",
           "review-placeholder",
-          "ファイルを開くとここにレビューが表示されます"
+          "Open a file to see its review here"
         )
       );
       return;
@@ -1116,16 +1113,16 @@
       // while it's unknown whether state.doc reflects what's actually on
       // disk — see saveReview()'s early return for the same guard.
       body.appendChild(
-        el("p", "review-placeholder", "レビュー機能は利用できません")
+        el("p", "review-placeholder", "Review is unavailable")
       );
       body.appendChild(
-        button("review-retry", "再読み込み", function () {
+        button("review-retry", "Retry", function () {
           loadReview();
         })
       );
     } else if (!state.selectedHash) {
       // Nothing selected — "file mode" (also entered by clicking the
-      // breadcrumb's root "ファイル" segment, or pressing Esc): comments on
+      // breadcrumb's root "File" segment, or pressing Esc): comments on
       // the document as a whole rather than any particular block/item/row.
       body.appendChild(buildFileCommentsView());
     } else {
@@ -1149,12 +1146,12 @@
   function anchorKindLabel(anchorEl) {
     var kind = anchorKindOf(anchorEl);
     if (kind === "item") {
-      return "項目";
+      return "Item";
     }
     if (kind === "row") {
-      return "行";
+      return "Row";
     }
-    return "ブロック";
+    return "Block";
   }
 
   // `el`'s own chain of enclosing anchors, top (a top-level block) to
@@ -1177,7 +1174,7 @@
     return chain;
   }
 
-  // "ファイル › ブロック L10-L20 › 項目 L13": the root "ファイル" segment
+  // "File › Block L10-L20 › Item L13": the root "File" segment
   // (see buildFileBreadcrumbSegment()) is always present — clicking it
   // enters file mode (no selected anchor) — followed by one clickable
   // segment per level of `chain` (the currently-selected level rendered as
@@ -1210,25 +1207,25 @@
     return nav;
   }
 
-  // The breadcrumb's permanent root segment: "ファイル", with a count badge
+  // The breadcrumb's permanent root segment: "File", with a count badge
   // when there's at least one file-wide comment. Plain (non-clickable) text
   // while already in file mode (nothing selected); a clickable link back to
   // file mode otherwise.
   function buildFileBreadcrumbSegment() {
     var count = state.doc.file_comments.length;
     var node = state.selectedHash
-      ? button("review-breadcrumb-link", "ファイル", function () {
+      ? button("review-breadcrumb-link", "File", function () {
           selectBlock(null);
         })
-      : el("span", "review-breadcrumb-current", "ファイル");
+      : el("span", "review-breadcrumb-current", "File");
     if (count > 0) {
       node.appendChild(el("span", "review-breadcrumb-badge", String(count)));
     }
     return node;
   }
 
-  // While an item/row is selected: "↑ リスト全体にコメント"/"↑ 表全体に
-  // コメント", jumping to the enclosing block. While a block containing at
+  // While an item/row is selected: "↑ Comment on whole list"/"↑ Comment on
+  // whole table", jumping to the enclosing block. While a block containing at
   // least one item/row is selected: a plain (non-actionable) hint that
   // there's finer-grained anchors to click into.
   function buildHint(anchorEl) {
@@ -1238,13 +1235,13 @@
       if (!blockEl) {
         return null;
       }
-      var whole = kind === "item" ? "リスト" : "表";
-      return button("review-hint-up", "↑ " + whole + "全体にコメント", function () {
+      var whole = kind === "item" ? "list" : "table";
+      return button("review-hint-up", "↑ Comment on whole " + whole, function () {
         selectBlock(blockEl.getAttribute("data-hash"), { ensureVisible: true });
       });
     }
     if (anchorEl.querySelector(".anchor")) {
-      return el("p", "review-hint", "項目を選ぶにはクリック");
+      return el("p", "review-hint", "Click to select an item");
     }
     return null;
   }
@@ -1257,7 +1254,7 @@
     var excerpt = block ? block.excerpt : anchorEl ? excerptForBlockElement(anchorEl) : "";
     var kind = anchorEl ? anchorKindOf(anchorEl) : block && block.kind ? block.kind : "block";
 
-    // The breadcrumb (root "ファイル" segment plus the selected anchor's own
+    // The breadcrumb (root "File" segment plus the selected anchor's own
     // chain) is shown even if `anchorEl` no longer exists live — e.g. the
     // selected anchor was removed by a live-reload — so there's always a
     // way back to file mode. `ancestorChain` itself needs a live element,
@@ -1310,9 +1307,9 @@
           onSave(comment.id, value);
         }
       };
-      actions.appendChild(button("review-save", "保存", save));
+      actions.appendChild(button("review-save", "Save", save));
       actions.appendChild(
-        button("review-cancel", "キャンセル", function () {
+        button("review-cancel", "Cancel", function () {
           state.editingId = null;
           render();
         })
@@ -1330,13 +1327,13 @@
     item.appendChild(el("p", "review-comment-text", comment.text));
     var actions2 = el("div", "review-comment-actions");
     actions2.appendChild(
-      button("review-comment-edit", "編集", function () {
+      button("review-comment-edit", "Edit", function () {
         state.editingId = comment.id;
         render();
       })
     );
     actions2.appendChild(
-      button("review-comment-delete", "削除", function () {
+      button("review-comment-delete", "Delete", function () {
         onDelete(comment.id);
       })
     );
@@ -1367,7 +1364,7 @@
   function buildCommentFormView(onSubmit) {
     var form = el("div", "review-form");
     var textarea = el("textarea", "review-textarea");
-    textarea.placeholder = "コメントを入力… (Cmd/Ctrl+Enter で保存)";
+    textarea.placeholder = "Enter a comment… (Cmd/Ctrl+Enter to save)";
     form.appendChild(textarea);
 
     var submit = function () {
@@ -1378,7 +1375,7 @@
       textarea.value = "";
       onSubmit(value);
     };
-    form.appendChild(button("review-save", "保存", submit));
+    form.appendChild(button("review-save", "Save", submit));
 
     textarea.addEventListener("keydown", function (event) {
       if ((event.metaKey || event.ctrlKey) && event.key === "Enter") {
@@ -1401,16 +1398,16 @@
   }
 
   // "File mode": entered whenever nothing is selected (initial state, Esc,
-  // or clicking the breadcrumb's root "ファイル" segment). Comments on the
+  // or clicking the breadcrumb's root "File" segment). Comments on the
   // document as a whole rather than any particular block/item/row — no
-  // excerpt/quote to show, since there's no anchor. The "ブロックをクリック"
+  // excerpt/quote to show, since there's no anchor. The "Click a block"
   // hint that used to be the entire placeholder here now sits below the
   // input as a small reminder that per-block comments are also available.
   function buildFileCommentsView() {
     var wrap = el("div", "review-selected");
     wrap.appendChild(buildBreadcrumb([]));
     wrap.appendChild(
-      el("h3", "review-file-heading", "ファイル全体へのコメント")
+      el("h3", "review-file-heading", "Comments on the whole file")
     );
 
     var list = el("div", "review-comments");
@@ -1421,7 +1418,7 @@
     wrap.appendChild(list);
 
     wrap.appendChild(buildFileCommentForm());
-    wrap.appendChild(el("p", "review-hint review-file-hint", "ブロックをクリック"));
+    wrap.appendChild(el("p", "review-hint review-file-hint", "Click a block"));
     return wrap;
   }
 
@@ -1467,7 +1464,7 @@
     var actions = el("div", "review-unanchored-actions");
     var reanchorBtn = button(
       "review-reanchor",
-      "選択中ブロックへ付け直す",
+      "Reanchor to selected block",
       function () {
         if (!state.selectedHash) {
           return;
@@ -1485,7 +1482,7 @@
     reanchorBtn.disabled = !state.selectedHash;
     actions.appendChild(reanchorBtn);
     actions.appendChild(
-      button("review-unanchored-delete", "削除", function () {
+      button("review-unanchored-delete", "Delete", function () {
         deleteUnanchored(block.hash);
       })
     );
@@ -1498,8 +1495,7 @@
   function onBodyReplaced() {
     if (state.noFileOpen) {
       // A file may have just been opened — re-fetch to find out, rather
-      // than sitting on the stale "no file open" placeholder. See section
-      // 5 of the design doc.
+      // than sitting on the stale "no file open" placeholder.
       loadReview();
       return;
     }

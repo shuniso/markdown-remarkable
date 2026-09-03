@@ -4,13 +4,13 @@
   // Left-hand file tree: lists every Markdown file under the open
   // document's parent directory (`GET /tree`), lets folders be collapsed,
   // highlights the currently-open file, and switches the current window's
-  // file in place on click (`PUT /open`). See
-  // docs/superpowers/specs/2026-08-29-file-tree-design.md. Pane
-  // resize/collapse follows the same `mdview.tree.*` localStorage/pointer-
-  // capture pattern assets/review.js uses for the right-hand review pane —
-  // see its comments for the reasoning behind each piece; this file only
-  // re-explains what differs (the pane sits at the *left* edge, so its
-  // width tracks the cursor directly rather than `innerWidth - clientX`).
+  // file in place on click (`PUT /open`).
+  // Pane resize/collapse follows the same `mdview.tree.*`
+  // localStorage/pointer-capture pattern assets/review.js uses for the
+  // right-hand review pane — see its comments for the reasoning behind
+  // each piece; this file only re-explains what differs (the pane sits at
+  // the *left* edge, so its width tracks the cursor directly rather than
+  // `innerWidth - clientX`).
 
   var TREE_URL = "/tree";
   var OPEN_URL = "/open";
@@ -378,7 +378,7 @@
       })
       .catch(function () {
         state.loading = false;
-        state.error = "ファイルツリーの読み込みに失敗しました";
+        state.error = "Couldn't load the file tree";
         render();
       });
   }
@@ -420,16 +420,16 @@
         return response
           .json()
           .then(function (payload) {
-            state.error = errorMessage(payload, "ファイルを開けませんでした");
+            state.error = errorMessage(payload, "Couldn't open file");
             render();
           })
           .catch(function () {
-            state.error = "ファイルを開けませんでした";
+            state.error = "Couldn't open file";
             render();
           });
       })
       .catch(function () {
-        state.error = "ファイルを開けませんでした";
+        state.error = "Couldn't open file";
         render();
       });
   }
@@ -488,7 +488,7 @@
       // header, just the placeholder. loadTree() re-fetches once a file is
       // open (see onBodyReplaced()).
       treeEl.appendChild(
-        el("p", "tree-placeholder", "ファイルを開くとここにツリーが表示されます")
+        el("p", "tree-placeholder", "Open a file to see its tree here")
       );
       return;
     }
@@ -505,7 +505,7 @@
     }
 
     if (state.entries.length === 0) {
-      treeEl.appendChild(el("p", "tree-placeholder", "Markdown ファイルが見つかりません"));
+      treeEl.appendChild(el("p", "tree-placeholder", "No Markdown files found"));
       return;
     }
 
@@ -519,7 +519,7 @@
 
     if (state.truncated) {
       treeEl.appendChild(
-        el("p", "tree-truncated", "一部のファイル/フォルダは表示されていません")
+        el("p", "tree-truncated", "Some files/folders are not shown")
       );
     }
   }
