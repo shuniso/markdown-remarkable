@@ -6,3 +6,6 @@
 *.zip
 *.exe
 .DS_Store
+
+# Internal working notes, not part of the public docs
+docs/superpowers/
