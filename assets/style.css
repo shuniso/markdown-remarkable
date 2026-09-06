@@ -254,36 +254,14 @@ body {
   z-index: 5;
   display: flex;
   align-items: center;
-  gap: 0.4rem;
-  /* rem-based padding, not a fixed px height — so the header's own size
-     scales with zoom (assets/viewer.js sets the root font-size) instead of
-     clipping its buttons/text once the page is zoomed up. */
-  padding: 0.35rem 0.6rem;
+  gap: 0.5rem;
+  /* Same band height as `.tree-header`/`.review-header` (2.5rem, in rem so
+     it scales with zoom) so the three headers' bottom borders line up at
+     the same y across the whole window width. */
+  min-height: 2.5rem;
+  padding: 0 0.75rem;
   border-bottom: 1px solid var(--md-border);
   background-color: var(--md-bg);
-}
-
-.doc-nav-btn {
-  flex: 0 0 auto;
-  font: inherit;
-  font-size: 0.8em;
-  color: inherit;
-  background-color: var(--md-review-bg);
-  border: 1px solid var(--md-border);
-  border-radius: 6px;
-  padding: 0.15em 0.5em;
-  line-height: 1.4;
-  cursor: pointer;
-}
-
-.doc-nav-btn:hover:not(:disabled) {
-  background-color: var(--md-border);
-}
-
-.doc-nav-btn:disabled {
-  color: var(--md-muted);
-  cursor: default;
-  opacity: 0.5;
 }
 
 .doc-header-path {
@@ -292,6 +270,62 @@ body {
   white-space: nowrap;
   color: var(--md-muted);
   font-size: 0.8em;
+}
+
+/* -- Shared icon button: doc back/forward + tree/review collapse --------
+   One visual style for `.doc-nav-btn`, `.tree-collapse-btn`, `.review-
+   collapse-btn` — square, chevron-only, no text glyph (glyph rendering for
+   ⟨/⟩/◀/▶ varies by platform font; a CSS-drawn chevron doesn't). Sizes stay
+   in rem/em so zoom (assets/viewer.js sets the root font-size) scales them
+   along with everything else. `.review .icon-btn` is written out
+   explicitly so it beats `.review button`'s (0,1,1) padding/background/
+   border — `.icon-btn` alone (0,1,0) would lose that fight. */
+.icon-btn,
+.review .icon-btn {
+  flex: 0 0 auto;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 1.75rem;
+  height: 1.75rem;
+  padding: 0;
+  font: inherit;
+  line-height: 1;
+  color: var(--md-muted);
+  background-color: transparent;
+  border: 1px solid transparent;
+  border-radius: 6px;
+  cursor: pointer;
+}
+
+.icon-btn:hover:not(:disabled),
+.review .icon-btn:hover:not(:disabled) {
+  color: var(--md-fg);
+  background-color: var(--md-review-bg);
+  border-color: var(--md-border);
+}
+
+.icon-btn:disabled,
+.review .icon-btn:disabled {
+  opacity: 0.4;
+  cursor: default;
+}
+
+/* Chevron, drawn as a rotated corner rather than a text glyph. */
+.icon-btn::before {
+  content: "";
+  width: 0.5rem;
+  height: 0.5rem;
+  border-top: 1.5px solid currentColor;
+  border-right: 1.5px solid currentColor;
+}
+
+.icon-btn.chevron-right::before {
+  transform: translateX(-20%) rotate(45deg);
+}
+
+.icon-btn.chevron-left::before {
+  transform: translateX(20%) rotate(-135deg);
 }
 
 /* `--browser` mode has no per-window history at all (`GET`/`PUT /nav`
@@ -312,7 +346,13 @@ body[data-mode="browser"] .doc-nav-btn {
   position: sticky;
   top: 0;
   height: 100vh;
-  padding: 1rem;
+  /* No top padding: `.review-header` is `position: sticky; top: 0` inside
+     this scroll container, and a sticky child can't be pulled above its
+     containing block's content edge with a negative margin — the pane's
+     own top padding would push the header band down out of line with
+     `.doc-header`/`.tree-header`. The header's margin-bottom supplies the
+     spacing below the band instead. */
+  padding: 0 1rem 1rem;
   background-color: var(--md-bg);
   font-family:
     -apple-system, BlinkMacSystemFont, "Segoe UI", "Noto Sans", Helvetica,
@@ -351,10 +391,12 @@ body[data-mode="browser"] .doc-nav-btn {
   display: none;
 }
 
-.review-collapse-btn {
-  font-size: 0.8em;
-  padding: 0.2em 0.55em;
-  line-height: 1;
+/* `.review-collapse-tab` is `position: fixed` at the right edge and takes
+   no space in the flex row, so without this the doc column would run
+   underneath it (clipping the right end of `.doc-header` and any wide
+   content). Reserve exactly the tab's width instead. */
+.layout.review-collapsed {
+  padding-right: 1.75rem;
 }
 
 .review-collapse-tab {
@@ -397,7 +439,9 @@ body[data-mode="browser"] .doc-nav-btn {
   position: sticky;
   top: 0;
   height: 100vh;
-  padding: 0.5rem;
+  /* No top padding — same reasoning as `.review`: `.tree-header` is sticky
+     at `top: 0` and must sit flush with the window's top edge. */
+  padding: 0 0.5rem 0.5rem;
   background-color: var(--md-bg);
   font-family:
     -apple-system, BlinkMacSystemFont, "Segoe UI", "Noto Sans", Helvetica,
@@ -415,15 +459,30 @@ body[data-mode="browser"] .doc-nav-btn {
   display: none;
 }
 
+/* Same as `.layout.review-collapsed`'s padding-right: `.tree-collapse-tab`
+   is fixed at the left edge, and `.doc-header`'s path label would
+   otherwise sit hidden behind it. */
+.layout.tree-collapsed {
+  padding-left: 1.75rem;
+}
+
 .tree-header {
   display: flex;
   align-items: center;
-  justify-content: space-between;
   gap: 0.5rem;
-  padding: 0.15em 0.4em 0.6em;
-  margin-bottom: 0.4em;
+  /* Same band height as `.doc-header`/`.review-header` (2.5rem). Negative
+     horizontal margins cancel `.tree`'s own 0.5rem side padding so the
+     border spans the full pane width edge to edge; the padding below
+     re-adds it inside the header, with extra left space to match the
+     other two panes' 0.75rem inner edge. */
+  min-height: 2.5rem;
+  margin: 0 -0.5rem 0.5rem;
+  padding: 0 0.5rem 0 0.75rem;
   border-bottom: 1px solid var(--md-border);
-  font-weight: 600;
+  background-color: var(--md-bg);
+  position: sticky;
+  top: 0;
+  z-index: 5;
 }
 
 .tree-root-name {
@@ -432,23 +491,14 @@ body[data-mode="browser"] .doc-nav-btn {
   white-space: nowrap;
   color: var(--md-muted);
   font-size: 0.8em;
-}
-
-.tree-collapse-btn {
-  flex: 0 0 auto;
-  font: inherit;
-  font-size: 0.8em;
-  color: inherit;
-  background-color: var(--md-review-bg);
-  border: 1px solid var(--md-border);
-  border-radius: 6px;
-  padding: 0.2em 0.55em;
-  line-height: 1;
-  cursor: pointer;
-}
-
-.tree-collapse-btn:hover {
-  background-color: var(--md-border);
+  /* Grow into the header's leftover space so the collapse button stays
+     pinned at the pane's inner edge instead of `justify-content: space-
+     between` floating it in the middle. `min-width: 0` because a flex
+     item's default `min-width: auto` floors it at its content width, so
+     the ellipsis would never engage and a long root name would overflow
+     the pane sideways instead. */
+  flex: 1 1 auto;
+  min-width: 0;
 }
 
 .tree-collapse-tab {
@@ -685,11 +735,27 @@ body[data-mode="browser"] .doc-nav-btn {
   display: flex;
   flex-wrap: wrap;
   align-items: center;
-  justify-content: space-between;
   gap: 0.5rem;
-  padding-bottom: 0.75rem;
-  margin-bottom: 0.75rem;
+  /* Same band height as `.doc-header`/`.tree-header` (2.5rem). Negative
+     horizontal margins cancel `.review`'s own 1rem side padding so the
+     border spans the full pane width edge to edge; the padding below
+     re-adds it inside the header, with less left space so the collapse
+     button sits at the pane's inner edge (mirroring the tree pane's
+     collapse button, which sits at its own inner/right edge). No
+     `justify-content: space-between` — order is collapse button, count,
+     save status, then `.review-export` pushed right by its own
+     `margin-left: auto`. */
+  min-height: 2.5rem;
+  margin: 0 -1rem 0.75rem;
+  padding: 0 1rem 0 0.75rem;
   border-bottom: 1px solid var(--md-border);
+  background-color: var(--md-bg);
+  position: sticky;
+  top: 0;
+  z-index: 5;
+}
+
+.review-count {
   font-weight: 600;
 }
 
@@ -712,14 +778,22 @@ body[data-mode="browser"] .doc-nav-btn {
   opacity: 0.5;
 }
 
-.review-export {
+.review .review-export {
+  /* `.review .review-export`, not a bare `.review-export`: `.review
+     button` (0,1,1) would otherwise beat a lone class (0,1,0) and keep its
+     default padding/font-size here. Pushed to the far right of
+     `.review-header` regardless of how many siblings (count, save status)
+     precede it, and sized down to fit inside the shared 2.5rem band. */
+  margin-left: auto;
+  padding: 0.25em 0.7em;
+  font-size: 0.8125rem;
   background-color: var(--md-accent);
   color: var(--md-accent-fg);
   border-color: var(--md-accent);
   font-weight: 600;
 }
 
-.review-export:hover {
+.review .review-export:hover {
   filter: brightness(1.1);
 }
 

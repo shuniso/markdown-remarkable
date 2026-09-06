@@ -93,7 +93,7 @@ This document summarizes the results of a security audit performed on `markdown-
 
 ### State-changing routes
 
-- `PUT /nav` (the document header's ◀/▶ buttons, `⌘[`/`⌘]`) is a state-change route
+- `PUT /nav` (the document header's Back/Forward buttons, `⌘[`/`⌘]`) is a state-change route
   that only ever moves the native window's own internal "back/forward history for
   that window" (a sequence of `.md`/`.markdown` paths under `root_dir` — never
   written to disk, and gone once the window closes) one step. The request carries no
@@ -120,7 +120,7 @@ This document summarizes the results of a security audit performed on `markdown-
 
 1. **`http(s):`/`mailto:` links are handed off outside the app**: clicking one launches
    the OS's default browser/mail client. This remains true even once the native
-   window grew a document header (◀/▶, `⌘[`/`⌘]`) — not because there's "no back
+   window grew a document header (Back/Forward, `⌘[`/`⌘]`) — not because there's "no back
    button", but because the window's WebView is deliberately scoped to displaying
    only the currently open document (plus relative link targets under `root_dir`),
    and is never meant to become a route for loading arbitrary web content — that's a

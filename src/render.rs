@@ -1341,10 +1341,10 @@ pub fn page(
              <div class=\"splitter tree-splitter\" id=\"tree-splitter\"></div>\n\
              <div class=\"doc-column\">\n\
              <header class=\"doc-header\">\n\
-             <button type=\"button\" class=\"doc-nav-btn\" id=\"doc-back\" \
-             aria-label=\"Back\" title=\"Back (⌘[)\" disabled>◀</button>\n\
-             <button type=\"button\" class=\"doc-nav-btn\" id=\"doc-forward\" \
-             aria-label=\"Forward\" title=\"Forward (⌘])\" disabled>▶</button>\n\
+             <button type=\"button\" class=\"doc-nav-btn icon-btn chevron-left\" id=\"doc-back\" \
+             aria-label=\"Back\" title=\"Back (⌘[)\" disabled></button>\n\
+             <button type=\"button\" class=\"doc-nav-btn icon-btn chevron-right\" id=\"doc-forward\" \
+             aria-label=\"Forward\" title=\"Forward (⌘])\" disabled></button>\n\
              <span class=\"doc-header-path\" id=\"doc-header-path\"></span>\n\
              </header>\n\
              <main class=\"markdown-body doc\">\n\

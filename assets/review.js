@@ -1071,6 +1071,16 @@
     }
 
     var header = el("div", "review-header");
+    var collapseBtn = button(
+      "review-collapse-btn icon-btn chevron-right",
+      "",
+      function () {
+        applyPaneCollapsed(true);
+      }
+    );
+    collapseBtn.setAttribute("aria-label", "Hide review pane");
+    collapseBtn.title = "Hide review pane (⌘\\)";
+    header.appendChild(collapseBtn);
     header.appendChild(
       el("span", "review-count", totalCommentCount() + " comments")
     );
@@ -1085,11 +1095,6 @@
         })
       );
     }
-    header.appendChild(
-      button("review-collapse-btn", "⟩", function () {
-        applyPaneCollapsed(true);
-      })
-    );
     header.appendChild(
       button("review-export", "Export", function (event) {
         handleExport(event.currentTarget);

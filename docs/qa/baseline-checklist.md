@@ -24,7 +24,7 @@ is listed here.
 - [ ] Body/pane text isn't selectable while dragging (`user-select: none`).
 - [ ] Dragging the width all the way left never goes below 240px.
 - [ ] Dragging the width all the way right never exceeds 60% of the window width.
-- [ ] The pane header's "⟩" button collapses it.
+- [ ] The pane header's collapse (chevron) button collapses it.
 - [ ] While collapsed, a vertical tab appears at the right edge of the screen
       (equivalent to a 28px width at the default zoom level — it's `1.75rem`) reading
       "Review · N" (N being the comment count).
@@ -249,9 +249,9 @@ tree and multi-window navigation" section).
 
 - [ ] Clicking a relative `.md` link in the document body switches the same window to
       the linked file.
-- [ ] After switching, the document header's ◀ becomes enabled. Pressing ◀ returns to
-      the original file, at which point ▶ becomes enabled.
-- [ ] After navigating back and forth a few times, ◀/▶'s enabled/disabled state
+- [ ] After switching, the document header's Back becomes enabled. Pressing Back returns to
+      the original file, at which point Forward becomes enabled.
+- [ ] After navigating back and forth a few times, Back/Forward's enabled/disabled state
       updates correctly each time (disabled at either end of the history).
 - [ ] `⌘[`/`⌘]` (`Ctrl+[`/`Ctrl+]` on Windows/Linux) also move back/forward the same
       way, staying in sync with the buttons' enabled state.
@@ -276,17 +276,17 @@ tree and multi-window navigation" section).
       buttons/path label outside the header.
 - [ ] In window A, open X.md → navigate to Y.md via a relative link in the body (A's
       history is now [X, Y]) → open X.md via ⌘O or Finder (a different window B
-      displays the same X.md content) → press ◀ in A. Expected: B comes to the front
+      displays the same X.md content) → press Back in A. Expected: B comes to the front
       and A itself stays on Y.md without switching (one file per window, to avoid a
-      review sidecar conflict — see the Limitations section of README.md). A's ◀ stays enabled,
-      ▶ stays disabled. Pressing ◀ in A again afterward just repeats the same result
+      review sidecar conflict — see the Limitations section of README.md). A's Back stays enabled,
+      Forward stays disabled. Pressing Back in A again afterward just repeats the same result
       without breaking (the history cursor never ends up in an inconsistent state).
-- [ ] After opening a file via the left-hand file tree, pressing ◀ in the document
+- [ ] After opening a file via the left-hand file tree, pressing Back in the document
       header returns to the original file (a switch via the tree gets added to the
       history the same way a relative link does).
-- [ ] In an empty window with no file open, the document header's ◀/▶ are both
+- [ ] In an empty window with no file open, the document header's Back/Forward are both
       disabled and the path field is empty.
-- [ ] In `--browser` mode, the document header's ◀/▶ buttons don't appear at all.
+- [ ] In `--browser` mode, the document header's Back/Forward buttons don't appear at all.
 - [ ] Clicking a relative `.md` link in `--browser` mode doesn't switch anything
       (left to the browser's own default behavior — a 404 is fine, and the browser's
       own back button recovers from it).
@@ -303,6 +303,6 @@ tree and multi-window navigation" section).
 - [ ] Regression check for existing features: clicking a `mailto:` link launches the
       mail client. Clicking a footnote reference `[^1]` scrolls to that footnote's
       definition on the same page (unaffected by the relative-link interception).
-- [ ] Deleting the file that ◀ would go back to beforehand: pressing ◀ lands on an
+- [ ] Deleting the file that Back would go back to beforehand: pressing Back lands on an
       error page, but opening a different file from the file tree recovers from
       there.

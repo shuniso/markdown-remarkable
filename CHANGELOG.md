@@ -7,6 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- Pane headers now share one height so their bottom borders form a single
+  line; collapse and back/forward buttons use a consistent icon style; the
+  review header keeps the collapse button at the pane's inner edge with
+  Export at the far right.
+
 ## [0.1.0] - 2026-09-03
 
 ### Added

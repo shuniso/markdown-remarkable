@@ -79,7 +79,7 @@ Clicking a relative link to another Markdown file (e.g.
 `[see also](../notes/other.md)`) does the same thing — unless that file is
 already open in a different window, in which case that window is brought
 to the front instead, so two windows never end up racing to write the same
-review sidecar. A doc header shows **◀**/**▶** buttons for per-window
+review sidecar. A doc header shows Back/Forward buttons for per-window
 back/forward history through everywhere you've navigated (also `⌘[`/`⌘]`).
 
 Each `FILE` on the command line gets its own independent native window —
@@ -139,7 +139,7 @@ macOS uses Cmd; Windows/Linux use Ctrl for the same shortcuts unless noted.
 | Cmd/Ctrl+Enter | Save the comment being edited |
 | Esc | Deselect the current block, or select the file-wide comment |
 
-`⌘[`/`⌘]` and the doc header's ◀/▶ buttons only exist in the native window;
+`⌘[`/`⌘]` and the doc header's Back/Forward buttons only exist in the native window;
 `--browser` mode has no per-window history. On keyboard layouts where
 `[`/`]` require AltGr (many European layouts), `⌘[`/`⌘]` may not be
 reachable — the doc header's own buttons still work.

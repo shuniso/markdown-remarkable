@@ -468,11 +468,16 @@
   function buildHeader() {
     var header = el("div", "tree-header");
     header.appendChild(el("span", "tree-root-name", state.root));
-    header.appendChild(
-      button("tree-collapse-btn", "⟨", function () {
+    var collapseBtn = button(
+      "tree-collapse-btn icon-btn chevron-left",
+      "",
+      function () {
         applyPaneCollapsed(true);
-      })
+      }
     );
+    collapseBtn.setAttribute("aria-label", "Hide file tree");
+    collapseBtn.title = "Hide file tree (⌘⇧E)";
+    header.appendChild(collapseBtn);
     return header;
   }
 
