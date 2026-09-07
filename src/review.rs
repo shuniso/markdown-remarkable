@@ -628,6 +628,14 @@ fn push_comment_bullet(out: &mut String, prefix: &str, text: &str) {
 /// returns `(path, markdown)` — the file name-only path plus the exact
 /// text written, so the caller (an HTTP handler) can hand both back to the
 /// client without a second disk read.
+///
+/// The output *path* is decided by `md`'s extension ([`export_path`], via
+/// [`crate::util::file_kind`]), not by the `kind` parameter — the two are
+/// independent inputs. Every in-tree caller derives both `kind` and `md`
+/// from the same file, so they always agree in practice, but nothing here
+/// enforces that: passing a `kind` that disagrees with `md`'s own extension
+/// changes how the Markdown body is rendered without changing where it's
+/// written.
 pub fn export(md: &Path, kind: FileKind, text: &str, doc: &ReviewDoc) -> Result<(PathBuf, String)> {
     let path = export_path(md);
     let md_name = file_title(md);

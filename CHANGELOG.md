@@ -28,7 +28,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   Export at the far right.
 - Review export for a `.txt` file now writes to `<name>.txt.review.md`
   (the full file name, not just the stem) so it never collides with a
-  same-stem `.md` file's export.
+  same-stem `.md` file's export. If you previously exported a `.txt`
+  review under 0.1.0 (when `.txt` support meant opening it as Markdown
+  from the CLI), the old `<stem>.review.md` file is left on disk as-is —
+  nothing removes or migrates it.
 - If a `.txt` file was previously opened as Markdown from the CLI and
   reviewed, its existing comments (anchored by block hash) can't
   re-anchor to the new line-based anchors and show up as Unanchored

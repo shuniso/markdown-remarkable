@@ -172,9 +172,22 @@ fn exports_a_txt_file_as_plain_text_html() {
     // scoped under `.doc` in the embedded stylesheet — `render::page` only
     // adds `.doc` for the live view, so a `.doc`-scoped rule would silently
     // lose its whitespace/monospace formatting in a standalone `--export`ed
-    // page (see assets/style.css's comment on this).
-    assert!(exported.contains(".plain .blk"), "{exported}");
-    assert!(exported.contains("white-space: pre-wrap"), "{exported}");
+    // page (see assets/style.css's comment on this). Each assert is
+    // anchored on the rule itself rather than a bare substring:
+    // - a bare `contains(".plain .blk")` also matches `.plain .blk-blank`
+    //   and would still pass even if the real rule were renamed/removed;
+    // - a bare `contains("white-space: pre-wrap")` also matches other rules
+    //   in the stylesheet (e.g. `.review-comment-text`) and would still
+    //   pass even if `.plain .blk` itself lost that declaration.
+    assert!(exported.contains("\n.plain .blk {"), "{exported}");
+    assert!(
+        !exported.contains(".doc .plain .blk"),
+        "`.plain .blk` must not be scoped under `.doc`: {exported}"
+    );
+    assert!(
+        exported.contains("\n.plain .blk {\n  white-space: pre-wrap;"),
+        "{exported}"
+    );
 }
 
 #[test]

@@ -306,3 +306,28 @@ tree and multi-window navigation" section).
 - [ ] Deleting the file that Back would go back to beforehand: pressing Back lands on an
       error page, but opening a different file from the file tree recovers from
       there.
+
+## 11. Plain-text (`.txt`) support
+
+Manual verification items for `.txt` files specifically (see README's "Review
+comments and export" and "Platform notes" sections).
+
+- [ ] Dragging and dropping a `.txt` file onto a window opens it as plain text
+      (verbatim, no Markdown syntax interpreted), same as a `.md` file.
+- [ ] macOS: `open -a markdown-remarkable notes.txt` opens the file the same
+      way — this exercises the app bundle's `Event::Opened` file-open path,
+      not the CLI's own file-argument parsing in `main.rs`, so it's worth
+      checking on its own.
+- [ ] File ▸ Open… lets you pick a `.txt` file; a `.rs` file in the same
+      folder isn't selectable there.
+- [ ] Switching to a `.txt` file from the left-hand file tree works the same
+      as switching to a `.md` file.
+- [ ] Exporting a `.txt` file's review writes to `<name>.txt.review.md` (not
+      `<name>.review.md` — that name stays reserved for `.md`/`.markdown`).
+- [ ] macOS: `.txt` shows up in Finder's "Open With" menu for the app, and
+      the OS's default handler for `.md` files is unchanged by this.
+- [ ] macOS: choosing the app in Finder's "Open With" for a `.rs` file (which
+      also lists it there, via `public.plain-text` conformance) does nothing
+      useful either way — if the app wasn't already running, this opens an
+      empty window plus, after a short grace period, a file-picker dialog; if
+      it was already running, nothing happens at all.

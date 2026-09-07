@@ -12,8 +12,8 @@ next to the document, never in the Markdown itself.
 ## Why
 
 - **Review comments live beside the document, not inside it.** Comments are
-  saved in `<file>.review.json` next to the Markdown file; the document
-  itself is never edited.
+  saved in `<file>.review.json` next to the document (Markdown or plain
+  text); the document itself is never edited.
 - **Export a review as Markdown.** One click turns every commented block
   into a short, quotable summary — handy for pasting into an AI agent or a
   pull request description.

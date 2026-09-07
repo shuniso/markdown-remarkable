@@ -12,7 +12,8 @@ This document summarizes the results of a security audit performed on `markdown-
 ### Files read
 
 - Only these 5 kinds of files are ever read:
-  - The Markdown file that's currently open.
+  - The Markdown or plain-text file that's currently open (`.md`/`.markdown`/`.txt`
+    — see `util::file_kind`).
   - Its sidecar review file, `<file>.review.json`, next to it.
   - `window.json`, which stores window position/size (under the OS's own config directory).
   - Image files under the open file's parent directory (`GET /asset?p=...`, live view only
@@ -37,7 +38,7 @@ This document summarizes the results of a security audit performed on `markdown-
       meaningful threat in an environment where another process on the same machine
       can manipulate the filesystem at that exact moment (the same exposure `--browser`
       already carries).
-  - Other `.md`/`.markdown` files under `root_dir` (the parent directory of the
+  - Other `.md`/`.markdown`/`.txt` files under `root_dir` (the parent directory of the
     **first file that window ever opened**, canonicalized, and fixed for the lifetime
     of that window — never recomputed on a later switch, so `GET /tree`'s listing and
     `PUT /open`'s switch target both stay confined to that same directory for as long
@@ -49,8 +50,9 @@ This document summarizes the results of a security audit performed on `markdown-
     (i.e. arbitrary text written by that file's author)" — but the validation applied
     to `path` (below) is exactly identical on either path; the document's own input
     gets no special treatment. Validation:
-    - Only `Component::Normal` components, and only a `.md`/`.markdown` extension
-      (reusing the same function used for images).
+    - Only `Component::Normal` components (reusing the same function used for
+      images), and only an extension `util::file_kind` recognizes
+      (`.md`/`.markdown`/`.txt`).
     - Confirms the target path itself is not a symlink via `symlink_metadata` (before
       `canonicalize` — this rejects even a symlink whose target would otherwise land
       inside the allowed range. This is stricter than the escape check below, to keep
@@ -62,18 +64,19 @@ This document summarizes the results of a security audit performed on `markdown-
       grabbed and blocking the UI thread inside `read_to_string`).
     `GET /tree`'s exclusion list (hidden folders, `node_modules`, etc.) and depth limit
     exist purely for display purposes and have no bearing on what's actually permitted
-    here. Once switched to, that file becomes "the Markdown file that's currently
-    open" and is treated exactly like the first bullet point from here on (no size
-    cap, and the same lack of hard-link detection/TOCTOU protection as the other
-    bullets applies).
+    here. Once switched to, that file becomes "the Markdown or plain-text file
+    that's currently open" and is treated exactly like the first bullet point
+    from here on (no size cap, and the same lack of hard-link detection/TOCTOU
+    protection as the other bullets applies).
   - `GET /tree` (also for the left-hand file tree) never reads file **contents**, but
     it does walk the directory tree under `root_dir` up to depth 4 and up to 2000
     entries (past which it returns `truncated: true`), listing directory and file
-    names that include `.md`/`.markdown`. It also caps the raw number of **visited**
-    entries (before pruning) at 20000, so that scanning a huge directory tree
-    containing no Markdown at all can't tie up the UI thread for a long time even
-    though none of it ever shows up in the response. Hidden directories (starting
-    with `.`), `node_modules`, and `target` are skipped, and symlinks are detected via
+    names that include `.md`/`.markdown`/`.txt`. It also caps the raw number of
+    **visited** entries (before pruning) at 20000, so that scanning a huge directory
+    tree containing no Markdown or plain-text file at all can't tie up the UI
+    thread for a long time even though none of it ever shows up in the response.
+    Hidden directories (starting with `.`), `node_modules`, and `target` are
+    skipped, and symlinks are detected via
     `DirEntry::file_type` (equivalent to `symlink_metadata`) and never followed.
     Non-UTF-8 file/directory names are excluded from the listing (a `to_string_lossy`
     rendering with embedded U+FFFD characters can't be opened via `PUT /open` anyway,
@@ -83,7 +86,9 @@ This document summarizes the results of a security audit performed on `markdown-
 
 - Only these 4 kinds of files are ever written:
   - The review sidecar `<file>.review.json` (`PUT /review`).
-  - The review export `<stem>.review.md` (`POST /export` / the panel's Export button).
+  - The review export (`POST /export` / the panel's Export button): `<stem>.review.md`
+    for a Markdown file, or `<name>.txt.review.md` (the full file name) for a
+    plain-text file — see `review::export_path`.
   - `window.json` (debounced and saved after the window is moved/resized).
   - `--export`'s output file, `OUT.html`.
   - Every one of these is written by creating a tmp file with `OpenOptions::create_new`
@@ -95,7 +100,7 @@ This document summarizes the results of a security audit performed on `markdown-
 
 - `PUT /nav` (the document header's Back/Forward buttons, `⌘[`/`⌘]`) is a state-change route
   that only ever moves the native window's own internal "back/forward history for
-  that window" (a sequence of `.md`/`.markdown` paths under `root_dir` — never
+  that window" (a sequence of `.md`/`.markdown`/`.txt` paths under `root_dir` — never
   written to disk, and gone once the window closes) one step. The request carries no
   path at all (the body is just `{"dir":"back"|"forward"}`) — where it moves to is
   always decided by the history the server itself already holds. Paths land in that
