@@ -7,6 +7,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- `.txt` files can now be opened and reviewed: they are shown as plain
+  text (no Markdown syntax is interpreted, tabs and indentation are kept)
+  and take line-level comments as well as file-wide ones. They appear in
+  the file tree, the open dialog, and drag & drop alongside
+  `.md`/`.markdown`.
+
 ### Changed
 
 - Pane headers now share one height so their bottom borders form a single

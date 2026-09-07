@@ -71,10 +71,12 @@ once the file exists again.
 
 ### File tree and multi-window navigation
 
-A left-hand file tree lists the `.md`/`.markdown` files under the
+A left-hand file tree lists the `.md`/`.markdown`/`.txt` files under the
 directory of the file the window first opened (the window's root
 directory; it does not move when you switch files), so you can switch
-between files in the same window.
+between files in the same window. A `.txt` file is shown as plain text —
+no Markdown syntax is interpreted — and takes line-level and file-wide
+review comments just like a Markdown document.
 Clicking a relative link to another Markdown file (e.g.
 `[see also](../notes/other.md)`) does the same thing — unless that file is
 already open in a different window, in which case that window is brought
@@ -164,7 +166,7 @@ instead. The effect is identical either way.
 
 With no `FILE`, a native "open file" dialog appears; cancelling it shows an
 empty "drop a Markdown file here" window. You can drag & drop one or more
-`.md`/`.markdown` files onto a window at any time.
+`.md`/`.markdown`/`.txt` files onto a window at any time.
 
 Set the environment variable `MDVIEW_DEBUG=1` to log every request the
 native window's WebView makes to stderr — handy for checking that live
@@ -220,7 +222,7 @@ scripts/bundle-macos.sh --install  # ...and copies it to /Applications
 ```
 
 This produces a double-clickable app that also shows up in Finder's "Open
-With" menu for `.md`/`.markdown` files. It's built for the machine's native
+With" menu for `.md`/`.markdown`/`.txt` files. It's built for the machine's native
 architecture (on Apple Silicon with a Rosetta-installed rustup, run
 `rustup target add aarch64-apple-darwin` first) and ad-hoc signed by
 default, which is enough to run on your own machine. macOS 15+ won't let an
