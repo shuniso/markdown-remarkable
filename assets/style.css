@@ -641,6 +641,28 @@ body[data-mode="browser"] .doc-nav-btn {
   text-align: center;
 }
 
+/* -- Plain-text documents (.plain wraps every line; render.rs's
+   to_html_plain) -------------------------------------------------------
+   Deliberately NOT scoped to `.doc`: `render::page` only adds that class
+   for the live view, so a `--export`ed .txt page would otherwise lose its
+   whitespace and monospace formatting. The hover/selected/has-comments
+   styling above stays `.doc`-scoped, since only the live view has a
+   review pane to drive it. */
+
+.plain .blk {
+  white-space: pre-wrap;
+  font-family:
+    ui-monospace, SFMono-Regular, "SF Mono", Menlo, Consolas,
+    "Liberation Mono", monospace;
+  tab-size: 4;
+}
+
+.plain .blk-blank {
+  /* One line's worth of height, matching `.markdown-body`'s line-height,
+     so a blank line in the source is a blank line on screen. */
+  min-height: 1.6em;
+}
+
 /* -- Nested anchors: list items / table rows (assets/review.js's
    `li.anchor`/`tr.anchor`) --------------------------------------------- */
 

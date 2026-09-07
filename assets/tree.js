@@ -510,7 +510,7 @@
     }
 
     if (state.entries.length === 0) {
-      treeEl.appendChild(el("p", "tree-placeholder", "No Markdown files found"));
+      treeEl.appendChild(el("p", "tree-placeholder", "No Markdown or text files found"));
       return;
     }
 
