@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Builds target/bundle/markdown-remarkable.app — a double-clickable macOS app that also
-# registers itself as a viewer for .md/.markdown files.
+# registers itself as a viewer for .md/.markdown/.txt files.
 #
 #   scripts/bundle-macos.sh            # build the bundle
 #   scripts/bundle-macos.sh --install  # ...and copy it to /Applications
