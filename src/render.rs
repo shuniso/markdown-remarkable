@@ -579,6 +579,141 @@ pub fn blocks(markdown: &str) -> Vec<Block> {
         .collect()
 }
 
+/// One non-blank line of a plain-text document, trimmed, plus the
+/// derived fields [`to_html_plain`] and [`anchors_plain`] both need — see
+/// [`plain_lines`].
+struct PlainLine {
+    /// See [`Block::hash`]/[`hash_source`], computed from `source`.
+    hash: String,
+    /// The line, trimmed of leading/trailing whitespace.
+    source: String,
+    /// See [`plain_line_excerpt`], computed from `source`.
+    excerpt: String,
+}
+
+/// Walks `text` line by line (`str::lines`, so a CRLF file's `\r` never
+/// survives the split), yielding `(1-based line number, raw line,
+/// Some(PlainLine) | None)` for every line in document order. The third
+/// element is `None` for a blank or whitespace-only line (which still gets
+/// a line number, advancing the count) and `Some` — built from the
+/// *trimmed* line's hash/source/excerpt — for every other line.
+///
+/// This is the single place the "trim, check blank, hash, excerpt" walk is
+/// written: [`to_html_plain`] and [`anchors_plain`] both consume it rather
+/// than re-implementing it, which is what makes it impossible for the two
+/// to disagree on which lines get an anchor or what a given line's
+/// hash/excerpt is.
+fn plain_lines(text: &str) -> impl Iterator<Item = (usize, &str, Option<PlainLine>)> {
+    text.lines().enumerate().map(|(index, line)| {
+        let trimmed = line.trim();
+        let plain = if trimmed.is_empty() {
+            None
+        } else {
+            Some(PlainLine {
+                hash: hash_source(trimmed),
+                source: trimmed.to_string(),
+                excerpt: plain_line_excerpt(trimmed),
+            })
+        };
+        (index + 1, line, plain)
+    })
+}
+
+/// The plain-text analogue of [`to_html`]: renders `text` verbatim, with
+/// no Markdown parsing at all (`# x` stays `# x`, `<script>` becomes
+/// escaped, inert text), for a document opened as
+/// [`FileKind::PlainText`](crate::util::FileKind).
+///
+/// Every non-blank line becomes its own review anchor, wrapped in exactly
+/// the same `<div class="blk" data-kind="block" data-hash="..."
+/// data-line-start="..." data-line-end="..." data-excerpt="...">` markup
+/// [`to_html`] gives a top-level Markdown block — that is what lets
+/// `assets/review.js` drive line-level comments with no changes of its
+/// own. A blank line becomes `<div class="blk-blank"></div>`, which
+/// deliberately does *not* carry the `blk` class, so it is neither
+/// clickable nor counted by review.js's `querySelectorAll(".blk")`.
+///
+/// The whole fragment is wrapped in `<div class="plain">`, which
+/// `assets/style.css` hangs `white-space: pre-wrap` / a monospace font /
+/// `tab-size` off (unscoped, so `--export`'s standalone page — which has
+/// no `.doc` class — formats the same way the live view does).
+///
+/// `hash`/`data-excerpt` are computed from the *trimmed* line (see
+/// [`anchors_plain`], which must agree with this function line for line —
+/// both are built on the shared [`plain_lines`] walk), while the rendered
+/// body keeps the raw line so indentation and tabs survive. Line splitting
+/// is `str::lines`, so a CRLF file's `\r` never reaches the output or the
+/// hash.
+pub fn to_html_plain(text: &str) -> String {
+    let mut out = String::from("<div class=\"plain\">\n");
+    for (line_number, line, plain) in plain_lines(text) {
+        let Some(PlainLine { hash, excerpt, .. }) = plain else {
+            out.push_str("<div class=\"blk-blank\"></div>\n");
+            continue;
+        };
+        let line_number = line_number.to_string();
+        out.push_str("<div class=\"blk\" data-kind=\"block\" data-hash=\"");
+        out.push_str(&hash);
+        out.push_str("\" data-line-start=\"");
+        out.push_str(&line_number);
+        out.push_str("\" data-line-end=\"");
+        out.push_str(&line_number);
+        out.push_str("\" data-excerpt=\"");
+        out.push_str(&escape_html_text(&excerpt));
+        out.push_str("\">");
+        out.push_str(&escape_html_text(line));
+        out.push_str("</div>\n");
+    }
+    out.push_str("</div>\n");
+    out
+}
+
+/// The plain-text analogue of [`anchors`]: one [`AnchorKind::Block`]
+/// anchor per non-blank line of `text`, in document order. Blank lines
+/// produce no anchor at all (but still advance the line counter), and
+/// `parent` is always `None` — plain text has no nesting, so there are
+/// never `Item`/`Row` anchors to parent anything to.
+///
+/// The hashes/excerpts this returns match, one for one and in order, the
+/// `data-hash`/`data-excerpt` attributes [`to_html_plain`] emits for the
+/// same input — the same invariant [`blocks`] and [`to_html`] hold for
+/// Markdown, and what makes a saved comment re-anchor across reloads. Both
+/// functions are built on the shared [`plain_lines`] walk, so this holds
+/// by construction rather than by keeping two copies in sync by hand.
+pub fn anchors_plain(text: &str) -> Vec<Anchor> {
+    plain_lines(text)
+        .filter_map(|(line_number, _line, plain)| {
+            plain.map(
+                |PlainLine {
+                     hash,
+                     source,
+                     excerpt,
+                 }| Anchor {
+                    kind: AnchorKind::Block,
+                    hash,
+                    source,
+                    excerpt,
+                    line_start: line_number,
+                    line_end: line_number,
+                    parent: None,
+                },
+            )
+        })
+        .collect()
+}
+
+/// A plain-text line's excerpt: its first 80 *characters* (not bytes, so
+/// a multi-byte character is never split), from the already-trimmed line.
+///
+/// Deliberately not [`excerpt_of`]: that one skips a leading code-fence
+/// line in favor of the next line, which is a Markdown-specific rule —
+/// applied here it would give a line that merely starts with ``` an empty
+/// excerpt. Used by [`plain_lines`], which both [`to_html_plain`] and
+/// [`anchors_plain`] consume, so the two can never disagree.
+fn plain_line_excerpt(trimmed_line: &str) -> String {
+    trimmed_line.chars().take(80).collect()
+}
+
 /// Computes a block's 1-based `(line_start, line_end)` within `markdown`,
 /// given its (untrimmed) byte `range` as reported by
 /// [`Parser::into_offset_iter`]. `line_start` counts the `\n` characters
@@ -1382,8 +1517,11 @@ pub fn page(
 }
 
 /// Escapes text for use in an HTML text/attribute context (`&`, `<`, `>`,
-/// `"`, `'`). Used only for the page title, which is plain text supplied by
-/// the caller (the file name), not Markdown.
+/// `"`, `'`). Used for the page title (plain text supplied by the caller —
+/// the file name — not Markdown), for the `data-excerpt` attributes
+/// [`to_html`]/[`push_anchor_open`] emit, and for every line of a
+/// plain-text document rendered by [`to_html_plain`], whose body never
+/// goes through pulldown-cmark's own escaping.
 fn escape_html_text(input: &str) -> String {
     let mut escaped = String::with_capacity(input.len());
     for ch in input.chars() {
@@ -2912,5 +3050,154 @@ final paragraph
             assert_eq!(b.line_start, a.line_start + 3);
             assert_eq!(b.line_end, a.line_end + 3);
         }
+    }
+
+    // -- to_html_plain() / anchors_plain(): plain text ---------------------
+
+    #[test]
+    fn to_html_plain_wraps_every_non_blank_line_in_a_block_div() {
+        let html = to_html_plain("first\nsecond\n");
+        assert!(
+            html.contains("<div class=\"blk\" data-kind=\"block\" data-hash=\""),
+            "{html}"
+        );
+        assert_eq!(html.matches("class=\"blk\"").count(), 2, "{html}");
+        assert!(html.contains(">first</div>"), "{html}");
+        assert!(html.contains(">second</div>"), "{html}");
+    }
+
+    #[test]
+    fn to_html_plain_marks_blank_lines_with_a_non_clickable_div() {
+        let html = to_html_plain("a\n\nb\n");
+        assert!(html.contains("<div class=\"blk-blank\"></div>"), "{html}");
+        // The blank-line div must not carry the `blk` class review.js
+        // clicks on: `class="blk-blank"` never matches `class="blk"`.
+        assert_eq!(html.matches("class=\"blk\"").count(), 2, "{html}");
+    }
+
+    #[test]
+    fn to_html_plain_does_not_interpret_markdown_syntax() {
+        let html = to_html_plain("# Title\n*em*\n- item\n| a | b |\n");
+        assert!(!html.contains("<h1>"), "{html}");
+        assert!(!html.contains("<em>"), "{html}");
+        assert!(!html.contains("<li>"), "{html}");
+        assert!(!html.contains("<table>"), "{html}");
+        assert!(html.contains("># Title</div>"), "{html}");
+        assert!(html.contains(">*em*</div>"), "{html}");
+    }
+
+    #[test]
+    fn to_html_plain_escapes_html_special_characters() {
+        let html = to_html_plain("<script>alert(1)</script>\n& \" '\n");
+        assert!(!html.contains("<script>"), "{html}");
+        assert!(
+            html.contains("&lt;script&gt;alert(1)&lt;/script&gt;"),
+            "{html}"
+        );
+        assert!(html.contains("&amp; &quot; &#39;"), "{html}");
+    }
+
+    #[test]
+    fn to_html_plain_normalizes_crlf_line_endings() {
+        let crlf = to_html_plain("a\r\nb\r\n");
+        let lf = to_html_plain("a\nb\n");
+        assert_eq!(crlf, lf);
+        assert!(!crlf.contains('\r'), "{crlf}");
+    }
+
+    #[test]
+    fn to_html_plain_keeps_tab_characters_as_is() {
+        let html = to_html_plain("\tindented\n");
+        assert!(html.contains(">\tindented</div>"), "{html}");
+    }
+
+    #[test]
+    fn to_html_plain_truncates_data_excerpt_to_eighty_characters() {
+        // Multi-byte characters must be counted, not sliced by byte.
+        let html = to_html_plain(&"日".repeat(100));
+        let expected = format!("data-excerpt=\"{}\"", "日".repeat(80));
+        assert!(html.contains(&expected), "{html}");
+    }
+
+    #[test]
+    fn to_html_plain_wraps_the_whole_output_in_a_plain_div() {
+        let html = to_html_plain("a\n");
+        assert!(html.starts_with("<div class=\"plain\">"), "{html}");
+        assert!(html.trim_end().ends_with("</div>"), "{html}");
+        // An empty document still produces the wrapper, nothing else.
+        let empty = to_html_plain("");
+        assert!(empty.starts_with("<div class=\"plain\">"), "{empty}");
+        assert!(!empty.contains("class=\"blk\""), "{empty}");
+    }
+
+    #[test]
+    fn anchors_plain_hashes_match_to_html_plain_data_hashes() {
+        let text = "first line\n\nsecond line\n\tthird line\n";
+        let expected = anchors_plain(text);
+        let html = to_html_plain(text);
+
+        let found_hashes = block_level_hashes(&html);
+
+        assert_eq!(found_hashes.len(), expected.len());
+        assert_eq!(found_hashes.len(), 3);
+        for (found, anchor) in found_hashes.iter().zip(expected.iter()) {
+            assert_eq!(*found, anchor.hash);
+        }
+    }
+
+    #[test]
+    fn anchors_plain_line_starts_match_to_html_plain_data_line_start() {
+        // Additional to the brief: prove the shared line-walk helper keeps
+        // `data-line-start` and `anchors_plain(..)[i].line_start` in lock
+        // step, not just the hashes checked above.
+        let text = "first line\n\nsecond line\n\tthird line\n";
+        let expected = anchors_plain(text);
+        let html = to_html_plain(text);
+
+        const MARKER: &str = "data-line-start=\"";
+        let found_line_starts: Vec<usize> = html
+            .match_indices(MARKER)
+            .map(|(idx, _)| {
+                let rest = &html[idx + MARKER.len()..];
+                rest[..rest.find('"').expect("closing quote")]
+                    .parse()
+                    .expect("numeric data-line-start")
+            })
+            .collect();
+
+        assert_eq!(found_line_starts.len(), expected.len());
+        assert_eq!(found_line_starts.len(), 3);
+        for (found, anchor) in found_line_starts.iter().zip(expected.iter()) {
+            assert_eq!(*found, anchor.line_start);
+        }
+    }
+
+    #[test]
+    fn anchors_plain_reports_one_based_single_line_ranges() {
+        let anchors = anchors_plain("a\n\nb\n");
+        assert_eq!(anchors.len(), 2);
+        assert_eq!((anchors[0].line_start, anchors[0].line_end), (1, 1));
+        // Blank lines still advance the line counter.
+        assert_eq!((anchors[1].line_start, anchors[1].line_end), (3, 3));
+    }
+
+    #[test]
+    fn anchors_plain_marks_every_anchor_as_a_parentless_block() {
+        let anchors = anchors_plain("a\nb\n");
+        assert!(anchors.iter().all(|a| a.kind == AnchorKind::Block));
+        assert!(anchors.iter().all(|a| a.parent.is_none()));
+    }
+
+    #[test]
+    fn anchors_plain_skips_blank_and_whitespace_only_lines() {
+        let anchors = anchors_plain("a\n\n   \n\t\nb\n");
+        assert_eq!(anchors.len(), 2);
+        assert_eq!(anchors[0].source, "a");
+        assert_eq!(anchors[1].source, "b");
+        // `source`/`excerpt` are trimmed even though the rendered body
+        // keeps the raw indentation.
+        let indented = anchors_plain("    padded    \n");
+        assert_eq!(indented[0].source, "padded");
+        assert_eq!(indented[0].excerpt, "padded");
     }
 }
