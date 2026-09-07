@@ -9,7 +9,7 @@
 //! header at all (there's no network hop to spoof), so it isn't a routing
 //! concern both callers share.
 
-use crate::render::{self, page, to_html};
+use crate::render::{self, page, to_html, to_html_plain};
 use crate::review::{self, ReviewDoc};
 use crate::util::{file_kind, file_title, FileKind};
 use percent_encoding::{percent_decode_str, utf8_percent_encode, AsciiSet, CONTROLS};
@@ -395,7 +395,10 @@ fn handle_get_review(file: Option<&Path>) -> Reply {
             return error_json(500, "failed to read document");
         }
     };
-    let live_anchors = render::anchors(&markdown);
+    let live_anchors = match file_kind(path).unwrap_or(FileKind::Markdown) {
+        FileKind::Markdown => render::anchors(&markdown),
+        FileKind::PlainText => render::anchors_plain(&markdown),
+    };
     let unanchored: Vec<&str> = review::unanchored(&doc, &live_anchors);
 
     let mut value = serde_json::to_value(&doc).unwrap_or_else(|_| serde_json::json!({}));
@@ -1294,11 +1297,19 @@ fn handle_version(version: &AtomicU64) -> Reply {
 
 /// Reads and renders `path`, returning `(title, body_html)` on success or
 /// just `title` (for the `500` body) on failure. The OS error itself is
-/// logged to stderr, never returned to the caller.
+/// logged to stderr, never returned to the caller. Files for which
+/// `util::file_kind` returns `PlainText` are rendered with
+/// `render::to_html_plain` instead of the Markdown renderer.
 fn read_and_render(path: &Path) -> Result<(String, String), String> {
     let title = file_title(path);
     match fs::read_to_string(path) {
-        Ok(markdown) => Ok((title, to_html(&markdown, true))),
+        Ok(text) => {
+            let body_html = match file_kind(path).unwrap_or(FileKind::Markdown) {
+                FileKind::Markdown => to_html(&text, true),
+                FileKind::PlainText => to_html_plain(&text),
+            };
+            Ok((title, body_html))
+        }
         Err(err) => {
             eprintln!("warning: failed to read {}: {err}", path.display());
             Err(title)
@@ -1691,6 +1702,63 @@ mod tests {
         let value: serde_json::Value = serde_json::from_slice(&get_reply.body).unwrap();
         assert_eq!(value["unanchored"], serde_json::json!([]));
         assert_eq!(value["blocks"][0]["kind"], "item");
+    }
+
+    #[test]
+    fn body_of_a_txt_file_is_rendered_as_plain_text() {
+        let dir = tempfile::tempdir().expect("create tempdir");
+        let file_path = dir.path().join("notes.txt");
+        std::fs::write(&file_path, "# Title\n\nplain body\n").expect("write text file");
+        let version = AtomicU64::new(0);
+
+        let reply = handle_reply(&get("/body"), Some(&file_path), &version, false);
+        assert_eq!(reply.status, 200);
+        let body = String::from_utf8(reply.body).expect("utf8 body");
+        assert!(body.contains("class=\"plain\""), "{body}");
+        assert!(body.contains("class=\"blk\""), "{body}");
+        assert!(body.contains("class=\"blk-blank\""), "{body}");
+        assert!(!body.contains("<h1>"), "{body}");
+        assert!(body.contains("# Title"), "{body}");
+    }
+
+    #[test]
+    fn get_review_anchors_a_comment_to_a_plain_text_line() {
+        let dir = tempfile::tempdir().expect("create tempdir");
+        let file_path = dir.path().join("notes.txt");
+        let text = "alpha\nbravo\n";
+        std::fs::write(&file_path, text).expect("write text file");
+        let version = AtomicU64::new(0);
+
+        let line_hash = render::anchors_plain(text)[1].hash.clone();
+
+        let headers = with_request_header();
+        let doc_json = serde_json::json!({
+            "version": 1,
+            "file": "notes.txt",
+            "blocks": [{
+                "hash": line_hash,
+                "excerpt": "bravo",
+                "kind": "block",
+                "comments": [{
+                    "id": "c_0123456789abcdef",
+                    "text": "looks good",
+                    "created": "2026-09-07T07:00:00Z",
+                    "updated": "2026-09-07T07:00:00Z",
+                }]
+            }]
+        });
+        let body = serde_json::to_vec(&doc_json).unwrap();
+        let put_reply = handle_reply(
+            &put_review(&body, &headers),
+            Some(&file_path),
+            &version,
+            false,
+        );
+        assert_eq!(put_reply.status, 200);
+
+        let get_reply = handle_reply(&get("/review"), Some(&file_path), &version, false);
+        let value: serde_json::Value = serde_json::from_slice(&get_reply.body).unwrap();
+        assert_eq!(value["unanchored"], serde_json::json!([]));
     }
 
     #[test]
