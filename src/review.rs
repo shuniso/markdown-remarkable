@@ -122,10 +122,26 @@ pub fn sidecar_path(md: &Path) -> PathBuf {
     PathBuf::from(name)
 }
 
-/// The export path for `md`: `notes.md` -> `notes.review.md`, next to the
-/// Markdown file itself (`file_stem` + `.review.md`, keeping the same
-/// parent directory).
+/// The export path for `md`, next to the file itself.
+///
+/// For Markdown (`.md`/`.markdown`, or any extension `file_kind` doesn't
+/// recognize as [`FileKind::PlainText`]): `notes.md` -> `notes.review.md`
+/// (`file_stem` + `.review.md`) — unchanged from before `.txt` support, so
+/// existing users' export file names don't move.
+///
+/// For [`FileKind::PlainText`]: `notes.txt` -> `notes.txt.review.md` (the
+/// full file name, same construction as [`sidecar_path`]), *not*
+/// stem-based. Stem-based would collide: `notes.md` and `notes.txt` share
+/// the stem `notes`, so `export_path` for one would silently overwrite the
+/// other's export (`atomic_write` doesn't warn on overwrite). Using the
+/// full name for `.txt` avoids that collision without changing the
+/// established Markdown-only naming.
 pub fn export_path(md: &Path) -> PathBuf {
+    if crate::util::file_kind(md) == Some(FileKind::PlainText) {
+        let mut name = md.as_os_str().to_owned();
+        name.push(".review.md");
+        return PathBuf::from(name);
+    }
     let stem = md
         .file_stem()
         .map(|s| s.to_string_lossy().into_owned())
@@ -655,9 +671,22 @@ mod tests {
     }
 
     #[test]
-    fn export_path_replaces_a_txt_extension_with_review_md() {
+    fn export_path_of_a_txt_file_appends_review_md_to_the_full_file_name() {
         let path = export_path(Path::new("/tmp/notes.txt"));
+        assert_eq!(path, Path::new("/tmp/notes.txt.review.md"));
+    }
+
+    #[test]
+    fn export_path_of_a_markdown_extension_file_stays_stem_based() {
+        let path = export_path(Path::new("/tmp/notes.markdown"));
         assert_eq!(path, Path::new("/tmp/notes.review.md"));
+    }
+
+    #[test]
+    fn export_paths_of_a_markdown_and_a_txt_with_the_same_stem_do_not_collide() {
+        let md_path = export_path(Path::new("/tmp/notes.md"));
+        let txt_path = export_path(Path::new("/tmp/notes.txt"));
+        assert_ne!(md_path, txt_path);
     }
 
     // -- load / save round-trip -------------------------------------------

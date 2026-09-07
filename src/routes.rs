@@ -178,8 +178,9 @@ fn has_request_header(req: &RouteRequest) -> bool {
 ///   [`REQUEST_HEADER`] (`403` if absent), a JSON body matching the
 ///   sidecar schema (`400` if it doesn't parse or fails [`review::validate`]),
 ///   and a successful write (`500` on I/O failure).
-/// - `POST /export` — requires [`REQUEST_HEADER`], writes
-///   `<stem>.review.md`, and returns its file name and contents as JSON.
+/// - `POST /export` — requires [`REQUEST_HEADER`], writes the review export
+///   (see [`review::export_path`] for the exact name), and returns its file
+///   name and contents as JSON.
 /// - `GET`/`HEAD /asset?p=<percent-encoded relative path>` — a local image
 ///   file next to the open document, for `<img>` targets `render::to_html`
 ///   rewrote to this route (`rewrite_local_images: true`, only in effect
@@ -450,9 +451,9 @@ fn handle_put_review(req: &RouteRequest, file: Option<&Path>) -> Reply {
     Reply::json(200, serde_json::json!({ "ok": true }))
 }
 
-/// `POST /export`: writes `<stem>.review.md` next to the document and
-/// returns its file name (never a full path) and contents. Requires
-/// [`REQUEST_HEADER`].
+/// `POST /export`: writes the review export (see [`review::export_path`])
+/// next to the document and returns its file name (never a full path) and
+/// contents. Requires [`REQUEST_HEADER`].
 fn handle_export(req: &RouteRequest, file: Option<&Path>) -> Reply {
     if !has_request_header(req) {
         return error_json(403, "missing X-Mdview-Request header");
@@ -2052,11 +2053,11 @@ mod tests {
         let reply = handle_reply(&post_export(&headers), Some(&file_path), &version, false);
         assert_eq!(reply.status, 200);
         let value: serde_json::Value = serde_json::from_slice(&reply.body).unwrap();
-        assert_eq!(value["path"], "notes.review.md");
+        assert_eq!(value["path"], "notes.txt.review.md");
         let markdown = value["markdown"].as_str().unwrap();
         assert!(markdown.starts_with("# Review: notes.txt"));
         assert!(markdown.contains("> L2: bravo"), "{markdown}");
-        assert!(dir.path().join("notes.review.md").exists());
+        assert!(dir.path().join("notes.txt.review.md").exists());
     }
 
     // -- /asset -----------------------------------------------------------
