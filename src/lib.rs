@@ -12,6 +12,6 @@ pub mod render;
 pub mod review;
 pub mod routes;
 pub mod server;
-mod util;
+pub mod util;
 pub mod watch;
 pub mod window_state;
