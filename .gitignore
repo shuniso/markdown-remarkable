@@ -9,3 +9,6 @@
 
 # Internal working notes, not part of the public docs
 docs/superpowers/
+
+# subagent-driven-development scratch (ledger, briefs, review packages)
+.superpowers/
