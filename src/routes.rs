@@ -11,7 +11,7 @@
 
 use crate::render::{self, page, to_html};
 use crate::review::{self, ReviewDoc};
-use crate::util::file_title;
+use crate::util::{file_kind, file_title};
 use percent_encoding::{percent_decode_str, utf8_percent_encode, AsciiSet, CONTROLS};
 use serde::Deserialize;
 use std::fs;
@@ -199,7 +199,8 @@ fn has_request_header(req: &RouteRequest) -> bool {
 ///   fixed root — see [`handle_tree`] for why this is not simply
 ///   `asset_parent_dir(file)` any more).
 /// - `PUT /open` — switches the currently-viewed file to a `.md`/
-///   `.markdown` file named by a JSON body, within `root_dir`'s scope.
+///   `.markdown`/`.txt` file named by a JSON body, within `root_dir`'s
+///   scope.
 ///   `allow_open` gates this entirely: `false` (the browser server,
 ///   `server.rs`) always answers `501` — there's no second window to switch
 ///   there, so the CLI's own FILE argument stays authoritative for the life
@@ -493,8 +494,8 @@ fn handle_export(req: &RouteRequest, file: Option<&Path>) -> Reply {
 /// parent directory. `0` is the parent directory's own direct children; a
 /// subdirectory found there is itself scanned (depth `1`) as long as
 /// `1 <= TREE_MAX_DEPTH`, and so on. A subdirectory found at depth
-/// `TREE_MAX_DEPTH` is listed (if it has a `.md`/`.markdown` file directly
-/// in it — see [`scan_tree_dir`]) but never itself descended into, so
+/// `TREE_MAX_DEPTH` is listed (if it has a `.md`/`.markdown`/`.txt` file
+/// directly in it — see [`scan_tree_dir`]) but never itself descended into, so
 /// nothing below it appears at all — not even to decide whether to prune
 /// it, unlike every shallower directory.
 const TREE_MAX_DEPTH: usize = 4;
@@ -761,7 +762,7 @@ fn scan_tree_dir(
                 continue;
             }
             dir_names.push(name);
-        } else if file_type.is_file() && is_markdown_name(&name) {
+        } else if file_type.is_file() && file_kind(Path::new(&name)).is_some() {
             file_names.push(name);
         }
     }
@@ -776,7 +777,7 @@ fn scan_tree_dir(
         let mut child_entries = Vec::new();
         scan_tree_dir(root, &child_rel, depth + 1, state, &mut child_entries);
         if child_entries.is_empty() {
-            // No `.md`/`.markdown` file anywhere inside (within the depth
+            // No `.md`/`.markdown`/`.txt` file anywhere inside (within the depth
             // budget, or nothing could be verified because a budget ran
             // out while exploring it) — prune this directory entirely
             // rather than show an empty folder.
@@ -830,17 +831,6 @@ fn is_excluded_tree_dir(name: &str) -> bool {
     name.starts_with('.') || matches!(name, "node_modules" | "target")
 }
 
-/// `true` if `name`'s extension is `.md`/`.markdown`, matched
-/// case-insensitively — the same test `app.rs`'s `is_markdown_file` applies
-/// to a dropped/opened file, applied here to a bare file name instead of a
-/// full path.
-fn is_markdown_name(name: &str) -> bool {
-    Path::new(name)
-        .extension()
-        .and_then(|ext| ext.to_str())
-        .is_some_and(|ext| ext.eq_ignore_ascii_case("md") || ext.eq_ignore_ascii_case("markdown"))
-}
-
 /// The JSON body `PUT /open` expects: `{"path": "<relative path>"}`, the
 /// same `path` value a `GET /tree` entry reported.
 #[derive(Deserialize)]
@@ -878,7 +868,8 @@ struct OpenRequest {
 /// - `path`, parsed as a [`Path`], is made up *only* of
 ///   [`Component::Normal`] segments (see [`is_plain_relative_path`], the
 ///   same check [`handle_asset`] applies to its own `p` query value) and
-///   its extension (lowercased) is `md` or `markdown` — `400` otherwise.
+///   its extension is one `util::file_kind` recognizes (`md`/`markdown`/
+///   `txt`, case-insensitively) — `400` otherwise.
 /// - `root_dir.join(path)` (not yet canonicalized) is not itself a symlink
 ///   — `404` otherwise, checked via `fs::symlink_metadata` so the check
 ///   can't be fooled by `canonicalize` transparently resolving it first.
@@ -895,21 +886,21 @@ struct OpenRequest {
 ///   just above).
 /// - The canonicalized target's metadata says it's a regular file
 ///   (`fs::metadata(..).is_file()`) — `404` otherwise. Without this, a
-///   `path` naming a directory, FIFO, or device node that happens to end
-///   in `.md` would pass every check above and then hang the WebView's
-///   protocol-handler thread the moment the switch lands and something
-///   tries to `fs::read_to_string` it (a FIFO's read blocks until a writer
-///   opens the other end, which may be never).
+///   `path` naming a directory, FIFO, or device node that happens to have
+///   an openable extension would pass every check above and then hang the
+///   WebView's protocol-handler thread the moment the switch lands and
+///   something tries to `fs::read_to_string` it (a FIFO's read blocks
+///   until a writer opens the other end, which may be never).
 ///
 /// The [`TREE_MAX_DEPTH`]/hidden-directory/`node_modules`/`target`
 /// exclusions and the [`TREE_MAX_ENTRIES`]/[`TREE_MAX_VISITED_ENTRIES`]
 /// caps `GET /tree` applies are a *display* concern only (what the tree
 /// pane chooses to draw) — none of them are access-control boundaries this
-/// function enforces. A `.md` file that lives inside a hidden directory or
-/// `node_modules` (something `GET /tree` would never list) is still a
-/// perfectly valid `PUT /open` target as long as it's within `root_dir` and
-/// passes every check above; the only boundary that matters here is the
-/// canonicalize-and-prefix escape check.
+/// function enforces. A `.md`/`.txt` file that lives inside a hidden
+/// directory or `node_modules` (something `GET /tree` would never list) is
+/// still a perfectly valid `PUT /open` target as long as it's within
+/// `root_dir` and passes every check above; the only boundary that matters
+/// here is the canonicalize-and-prefix escape check.
 ///
 /// On success: `200` `{"ok": true, "reloaded": true}`, plus
 /// [`Action::OpenFile`] carrying the canonicalized target path for the
@@ -952,11 +943,7 @@ fn handle_open(
     if !is_plain_relative_path(rel_path) {
         return (error_json(400, "invalid path"), Action::None);
     }
-    let extension_allowed = rel_path
-        .extension()
-        .and_then(|ext| ext.to_str())
-        .is_some_and(|ext| ext.eq_ignore_ascii_case("md") || ext.eq_ignore_ascii_case("markdown"));
-    if !extension_allowed {
+    if file_kind(rel_path).is_none() {
         return (error_json(400, "invalid file extension"), Action::None);
     }
 
@@ -2319,12 +2306,51 @@ mod tests {
     }
 
     #[test]
-    fn tree_omits_a_folder_with_no_markdown_inside() {
+    fn tree_lists_txt_files_alongside_markdown() {
+        let dir = tempfile::tempdir().expect("create tempdir");
+        let file_path = dir.path().join("doc.md");
+        std::fs::write(&file_path, "# Hi\n").expect("write markdown file");
+        std::fs::write(dir.path().join("notes.txt"), "hello\n").expect("write text file");
+        let version = AtomicU64::new(0);
+
+        let reply = handle_reply(&get("/tree"), Some(&file_path), &version, false);
+        assert_eq!(reply.status, 200);
+        let value: serde_json::Value = serde_json::from_slice(&reply.body).unwrap();
+        let names: Vec<&str> = value["entries"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|entry| entry["name"].as_str().unwrap())
+            .collect();
+        assert_eq!(names, vec!["doc.md", "notes.txt"]);
+    }
+
+    #[test]
+    fn tree_omits_an_unsupported_extension() {
+        let dir = tempfile::tempdir().expect("create tempdir");
+        let file_path = dir.path().join("doc.md");
+        std::fs::write(&file_path, "# Hi\n").expect("write markdown file");
+        std::fs::write(dir.path().join("main.rs"), "fn main() {}\n").expect("write rust file");
+        let version = AtomicU64::new(0);
+
+        let reply = handle_reply(&get("/tree"), Some(&file_path), &version, false);
+        let value: serde_json::Value = serde_json::from_slice(&reply.body).unwrap();
+        let names: Vec<&str> = value["entries"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|entry| entry["name"].as_str().unwrap())
+            .collect();
+        assert_eq!(names, vec!["doc.md"]);
+    }
+
+    #[test]
+    fn tree_omits_a_folder_with_no_supported_file_inside() {
         let dir = tempfile::tempdir().expect("create tempdir");
         let file_path = dir.path().join("doc.md");
         std::fs::write(&file_path, "# Hi\n").expect("write markdown file");
         std::fs::create_dir(dir.path().join("assets")).expect("create dir");
-        std::fs::write(dir.path().join("assets").join("readme.txt"), "hi").expect("write file");
+        std::fs::write(dir.path().join("assets").join("readme.log"), "hi").expect("write file");
         let version = AtomicU64::new(0);
 
         let reply = handle_reply(&get("/tree"), Some(&file_path), &version, false);
@@ -2501,14 +2527,43 @@ mod tests {
     }
 
     #[test]
-    fn open_rejects_a_non_markdown_extension() {
+    fn open_accepts_a_txt_file() {
         let dir = tempfile::tempdir().expect("create tempdir");
         let file_path = dir.path().join("doc.md");
         std::fs::write(&file_path, "# Hi\n").expect("write markdown file");
-        std::fs::write(dir.path().join("notes.txt"), "hi").expect("write file");
+        let target = dir.path().join("notes.txt");
+        std::fs::write(&target, "hello\n").expect("write text file");
         let version = AtomicU64::new(0);
         let headers = with_request_header();
         let body = br#"{"path":"notes.txt"}"#;
+
+        let (reply, action) = handle(
+            &put_open(body, &headers),
+            Some(&file_path),
+            &version,
+            false,
+            true,
+            None,
+            None,
+        );
+        assert_eq!(reply.status, 200);
+        match action {
+            Action::OpenFile(opened) => {
+                assert_eq!(opened, target.canonicalize().expect("canonicalize target"))
+            }
+            other => panic!("expected Action::OpenFile, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn open_rejects_an_unsupported_extension() {
+        let dir = tempfile::tempdir().expect("create tempdir");
+        let file_path = dir.path().join("doc.md");
+        std::fs::write(&file_path, "# Hi\n").expect("write markdown file");
+        std::fs::write(dir.path().join("notes.rs"), "fn main() {}\n").expect("write file");
+        let version = AtomicU64::new(0);
+        let headers = with_request_header();
+        let body = br#"{"path":"notes.rs"}"#;
 
         let (reply, action) = handle(
             &put_open(body, &headers),
@@ -3156,7 +3211,7 @@ mod tests {
         let dir = tempfile::tempdir().expect("create tempdir");
         std::fs::write(dir.path().join("doc.md"), "# Hi\n").expect("write markdown file");
         for i in 0..10 {
-            std::fs::write(dir.path().join(format!("noise{i}.txt")), b"x")
+            std::fs::write(dir.path().join(format!("noise{i}.log")), b"x")
                 .expect("write noise file");
         }
         let (entries, truncated) = collect_tree_entries(dir.path(), 1_000, 5);
