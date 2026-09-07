@@ -29,7 +29,8 @@
 
 use anyhow::{Context, Result};
 use clap::Parser;
-use markdown_remarkable::render::{page, to_html};
+use markdown_remarkable::render::{page, to_html, to_html_plain};
+use markdown_remarkable::util::{file_kind, FileKind};
 use markdown_remarkable::{app, review, server, watch};
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -111,9 +112,9 @@ fn main() -> Result<()> {
         // the native window and the browser server each read a file live,
         // per request, via `routes::handle`.
         let file = &cli.file[0];
-        let markdown = fs::read_to_string(file)
+        let text = fs::read_to_string(file)
             .with_context(|| format!("failed to read {}", file.display()))?;
-        return export(file, &markdown, export_path, cli.allow_remote_images);
+        return export(file, &text, export_path, cli.allow_remote_images);
     }
 
     if cli.browser {
@@ -211,13 +212,16 @@ fn run_browser(file: &Path, port: u16, no_open: bool, allow_remote_images: bool)
     server::run(http_server, file, version, allow_remote_images)
 }
 
-/// Renders `markdown` (already read from `file`, so `--export` doesn't pay
-/// for a second disk read) to a standalone, non-live HTML page and writes it
-/// to `out`.
-fn export(file: &Path, markdown: &str, out: &Path, allow_remote_images: bool) -> Result<()> {
+/// Renders `text` (already read from `file`, so `--export` doesn't pay for a
+/// second disk read) to a standalone, non-live HTML page and writes it to
+/// `out`.
+fn export(file: &Path, text: &str, out: &Path, allow_remote_images: bool) -> Result<()> {
     ensure_not_same_file(file, out)?;
 
-    let body_html = to_html(markdown, false);
+    let body_html = match file_kind(file).unwrap_or(FileKind::Markdown) {
+        FileKind::Markdown => to_html(text, false),
+        FileKind::PlainText => to_html_plain(text),
+    };
     let title = file
         .file_name()
         .map(|name| name.to_string_lossy().into_owned())

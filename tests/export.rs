@@ -148,6 +148,29 @@ fn exports_a_standalone_non_live_html_file() {
 }
 
 #[test]
+fn exports_a_txt_file_as_plain_text_html() {
+    let dir = tempfile::tempdir().expect("create tempdir");
+    let input_path = dir.path().join("notes.txt");
+    let output_path = dir.path().join("out.html");
+    std::fs::write(&input_path, "# Title\n\nplain body\n").expect("write text file");
+
+    let status = Command::new(env!("CARGO_BIN_EXE_markdown-remarkable"))
+        .arg(&input_path)
+        .arg("--export")
+        .arg(&output_path)
+        .status()
+        .expect("run markdown-remarkable");
+
+    assert!(status.success(), "expected a successful export");
+
+    let exported = std::fs::read_to_string(&output_path).expect("read exported html file");
+    assert!(exported.contains("<!doctype html>"));
+    assert!(exported.contains("class=\"plain\""), "{exported}");
+    assert!(!exported.contains("<h1>Title</h1>"), "{exported}");
+    assert!(exported.contains("# Title"), "{exported}");
+}
+
+#[test]
 fn export_rejects_more_than_one_file() {
     let dir = tempfile::tempdir().expect("create tempdir");
     let file_a = dir.path().join("a.md");
