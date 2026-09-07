@@ -677,10 +677,10 @@ struct ScanBudget {
 /// A subdirectory is only recursed into (to decide whether it belongs in
 /// the output at all) while `depth < TREE_MAX_DEPTH`; deeper than that it's
 /// simply never looked at. Once recursed into, a subdirectory that turns
-/// out to contain no `.md`/`.markdown` file anywhere within the depth
-/// budget contributes nothing and is pruned — neither it nor its (empty)
-/// contents are added to `out`. Hidden entries (name starting with `.`,
-/// which also covers `.git`), `node_modules`, and `target` are skipped
+/// out to contain no `.md`/`.markdown`/`.txt` file anywhere within the
+/// depth budget contributes nothing and is pruned — neither it nor its
+/// (empty) contents are added to `out`. Hidden entries (name starting with
+/// `.`, which also covers `.git`), `node_modules`, and `target` are skipped
 /// outright, as directories, without being recursed into at all. A
 /// directory entry (symlink or not) that `DirEntry::file_type` reports as
 /// [`std::fs::FileType::is_symlink`] is skipped too — this walk never
