@@ -43,10 +43,10 @@ use std::sync::Arc;
 #[derive(Parser, Debug)]
 #[command(name = "markdown-remarkable", version, about)]
 struct Cli {
-    /// Markdown file(s) to view — each gets its own native window. If
-    /// omitted entirely, one native window opens a file-picker dialog on
-    /// startup — cancelling it shows an empty "drop a file here" page
-    /// instead of exiting.
+    /// Markdown or plain-text file(s) to view — each gets its own native
+    /// window. If omitted entirely, one native window opens a file-picker
+    /// dialog on startup — cancelling it shows an empty "drop a file here"
+    /// page instead of exiting.
     #[arg(num_args = 0..)]
     file: Vec<PathBuf>,
 

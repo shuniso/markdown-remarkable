@@ -185,9 +185,12 @@ markdown-remarkable notes.md --export notes.html
 
 ## Review comments and export
 
-Comments live in `<file>.review.json` next to the Markdown file (e.g.
-`notes.md` -> `notes.md.review.json`). The **Export** button in the pane
-header writes `<stem>.review.md` (e.g. `notes.md` -> `notes.review.md`) — a
+Comments live in `<file>.review.json` next to the file (e.g. `notes.md` ->
+`notes.md.review.json`, `notes.txt` -> `notes.txt.review.json`). The
+**Export** button in the pane header writes `<stem>.review.md` for Markdown
+(e.g. `notes.md` -> `notes.review.md`) — but the full file name for
+plain text, `notes.txt` -> `notes.txt.review.md`, so a `.txt` and a `.md`
+with the same stem never export to the same file. Either way it's a
 Markdown summary of every commented block, in document order: each one as
 a one-line quote giving its source line range and excerpt (`> L12-L18: ##
 Design notes`) followed by its comments. The block's full source isn't
@@ -222,7 +225,14 @@ scripts/bundle-macos.sh --install  # ...and copies it to /Applications
 ```
 
 This produces a double-clickable app that also shows up in Finder's "Open
-With" menu for `.md`/`.markdown`/`.txt` files. It's built for the machine's native
+With" menu for `.md`/`.markdown`/`.txt` files. Because the bundle declares
+`.txt` support via the `public.plain-text` UTI, Finder also lists it as an
+option for other plain-text-conforming files (`.rs`, `.log`, `.json`, and
+so on) — but only `.md`, `.markdown`, and `.txt` are actually opened;
+anything else is silently ignored (no window, no error). If the app wasn't
+already running, "ignored" still means a cold start: an empty window
+appears and, after a short grace period with nothing to show, a
+file-picker dialog opens on top of it. It's built for the machine's native
 architecture (on Apple Silicon with a Rosetta-installed rustup, run
 `rustup target add aarch64-apple-darwin` first) and ad-hoc signed by
 default, which is enough to run on your own machine. macOS 15+ won't let an
@@ -359,11 +369,16 @@ the exact commands CI runs.
   Developer ID, no notarization) — meant for your own machine. There's no
   installer for Linux or Windows.
 - Review comments are per-block/per-item/per-row, not per-cell,
-  per-line, or per-selection, and there's no reply thread or
-  resolved/unresolved status — just a flat list of comments per anchor.
-  Two anchors with identical (trimmed) source hash the same and so share
-  comments. The `.review.json` sidecar isn't watched for external changes
-  — edit it by hand at your own risk.
+  per-line, or per-selection — for a `.txt` file, each line *is* a block,
+  so comments there are effectively per-line — and there's no reply
+  thread or resolved/unresolved status — just a flat list of comments per
+  anchor. Two anchors with identical (trimmed) source hash the same and so
+  share comments; this is easy to hit in a `.txt` file, where lines like
+  `}` or `---` recur verbatim. The `.review.json` sidecar isn't watched
+  for external changes — edit it by hand at your own risk.
+- A very large `.txt` file (tens of thousands of lines or more) gets one
+  review anchor per line, so rendering and selection get noticeably
+  heavier as the line count grows — there's no line-count cap.
 - The pane header's comment count includes unanchored comments, but the
   Export summary's headline count only covers anchored ones; unanchored
   comments are called out separately as `(+U unanchored)`.

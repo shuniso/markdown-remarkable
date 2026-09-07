@@ -1,7 +1,7 @@
 (function () {
   "use strict";
 
-  // Left-hand file tree: lists every Markdown file under the open
+  // Left-hand file tree: lists every Markdown or plain-text file under the open
   // document's parent directory (`GET /tree`), lets folders be collapsed,
   // highlights the currently-open file, and switches the current window's
   // file in place on click (`PUT /open`).

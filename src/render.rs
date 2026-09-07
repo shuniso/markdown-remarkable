@@ -644,6 +644,11 @@ fn plain_lines(text: &str) -> impl Iterator<Item = (usize, &str, Option<PlainLin
 /// body keeps the raw line so indentation and tabs survive. Line splitting
 /// is `str::lines`, so a CRLF file's `\r` never reaches the output or the
 /// hash.
+///
+/// One exception to "verbatim": a whitespace-only line is folded into the
+/// same blank-line `<div class="blk-blank">` as a truly empty line (see
+/// [`plain_lines`]), so its whitespace is not part of the output — only a
+/// non-blank line's leading/trailing whitespace survives.
 pub fn to_html_plain(text: &str) -> String {
     let mut out = String::from("<div class=\"plain\">\n");
     for (line_number, line, plain) in plain_lines(text) {
@@ -3073,6 +3078,17 @@ final paragraph
         // The blank-line div must not carry the `blk` class review.js
         // clicks on: `class="blk-blank"` never matches `class="blk"`.
         assert_eq!(html.matches("class=\"blk\"").count(), 2, "{html}");
+    }
+
+    #[test]
+    fn to_html_plain_keeps_leading_and_trailing_whitespace_in_the_body() {
+        // The rendered body pushes the *raw* line, not the trimmed one used
+        // for hashing/excerpt — a `.trim_end()` (or any trim) on the body
+        // here would make this fail, silently breaking the "verbatim"
+        // rendering doc comment promises for a non-blank line that carries
+        // leading/trailing whitespace.
+        let html = to_html_plain("    padded    \n");
+        assert!(html.contains(">    padded    </div>"), "{html}");
     }
 
     #[test]

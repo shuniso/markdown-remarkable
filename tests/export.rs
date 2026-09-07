@@ -168,6 +168,13 @@ fn exports_a_txt_file_as_plain_text_html() {
     assert!(exported.contains("class=\"plain\""), "{exported}");
     assert!(!exported.contains("<h1>Title</h1>"), "{exported}");
     assert!(exported.contains("# Title"), "{exported}");
+    // The `.plain .blk` rule (and its `white-space: pre-wrap`) must not be
+    // scoped under `.doc` in the embedded stylesheet — `render::page` only
+    // adds `.doc` for the live view, so a `.doc`-scoped rule would silently
+    // lose its whitespace/monospace formatting in a standalone `--export`ed
+    // page (see assets/style.css's comment on this).
+    assert!(exported.contains(".plain .blk"), "{exported}");
+    assert!(exported.contains("white-space: pre-wrap"), "{exported}");
 }
 
 #[test]

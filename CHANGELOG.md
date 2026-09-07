@@ -13,7 +13,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   text (no Markdown syntax is interpreted, tabs and indentation are kept)
   and take line-level comments as well as file-wide ones. They appear in
   the file tree, the open dialog, and drag & drop alongside
-  `.md`/`.markdown`.
+  `.md`/`.markdown`; `--export` renders a `.txt` file as plain-text HTML
+  the same way the live view does.
+- macOS `.app` bundle now declares `public.plain-text` conformance, so it
+  appears in Finder's "Open With" menu for `.txt` files (and other
+  plain-text-conforming files, though only `.md`/`.markdown`/`.txt` are
+  actually opened).
 
 ### Changed
 
@@ -21,6 +26,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   line; collapse and back/forward buttons use a consistent icon style; the
   review header keeps the collapse button at the pane's inner edge with
   Export at the far right.
+- Review export for a `.txt` file now writes to `<name>.txt.review.md`
+  (the full file name, not just the stem) so it never collides with a
+  same-stem `.md` file's export.
+- If a `.txt` file was previously opened as Markdown from the CLI and
+  reviewed, its existing comments (anchored by block hash) can't
+  re-anchor to the new line-based anchors and show up as Unanchored
+  instead — no data is lost.
+- Library API: the `util` module is now public (`FileKind`, `file_kind`),
+  and `review::export_markdown`/`review::export` take a `FileKind`
+  parameter — a breaking change for library users.
 
 ## [0.1.0] - 2026-09-03
 
