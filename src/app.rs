@@ -15,7 +15,7 @@
 
 use crate::nav_history::NavHistory;
 use crate::routes;
-use crate::util::file_title;
+use crate::util::{file_kind, file_title};
 use crate::watch;
 use crate::window_state::{self, MonitorRect, WindowState};
 use anyhow::{Context, Result};
@@ -479,12 +479,12 @@ pub fn run(initial: Vec<PathBuf>, allow_remote_images: bool) -> Result<()> {
             Event::Opened { urls } => {
                 // Finder double-click / "Open With" / `open -a`: the OS
                 // hands us file URLs, possibly several at once (opening
-                // multiple selected files together) — every markdown one
-                // gets a window.
+                // multiple selected files together) — every one this app
+                // can open (Markdown or plain text) gets a window.
                 let dropped: Vec<PathBuf> = urls
                     .iter()
                     .filter_map(|url| url.to_file_path().ok())
-                    .filter(|path| is_markdown_file(path))
+                    .filter(|path| file_kind(path).is_some())
                     .collect();
                 if !dropped.is_empty() {
                     picker_deadline = None;
@@ -1359,9 +1359,9 @@ fn protocol_response(
 /// window has no way back — it has a doc header with back/forward buttons
 /// now (see `nav_history`) — but a deliberate design boundary: this
 /// WebView's whole purpose is to render the currently open document (and,
-/// via a relative link, other `.md`/`.markdown` files inside its
-/// `root_dir` — see `routes::handle_open`), never to load arbitrary
-/// external web content as its own top-level page. See
+/// via a relative link, other files this app can open — Markdown or plain
+/// text — inside its `root_dir`, see `routes::handle_open`), never to load
+/// arbitrary external web content as its own top-level page. See
 /// `docs/SECURITY.md`'s exception 1 for the user-facing version of this.
 fn navigation_policy(url: String) -> bool {
     if is_internal_url(&url) {
@@ -1383,7 +1383,7 @@ fn navigation_policy(url: String) -> bool {
     false
 }
 
-/// Every file dropped with a `.md`/`.markdown` extension (case-insensitive)
+/// Every file this app can open (`.md`/`.markdown`/`.txt`, case-insensitive)
 /// is accepted — dropping several files at once opens all of them, not just
 /// the first — while anything else in the drop is silently skipped.
 /// Returns `true` if at least one file was accepted, `false` if none were
@@ -1404,7 +1404,7 @@ fn handle_drag_drop(
         return false;
     };
     let mut accepted_any = false;
-    for path in paths.into_iter().filter(|path| is_markdown_file(path)) {
+    for path in paths.into_iter().filter(|path| file_kind(path).is_some()) {
         // If the event loop has already shut down, there's nothing
         // useful to do with the error — the process is exiting anyway.
         let _ = proxy.send_event(UserEvent::OpenFile(path, window_id));
@@ -1413,15 +1413,9 @@ fn handle_drag_drop(
     accepted_any
 }
 
-fn is_markdown_file(path: &Path) -> bool {
-    path.extension()
-        .and_then(|ext| ext.to_str())
-        .is_some_and(|ext| ext.eq_ignore_ascii_case("md") || ext.eq_ignore_ascii_case("markdown"))
-}
-
 fn pick_file_dialog() -> Option<PathBuf> {
     rfd::FileDialog::new()
-        .add_filter("Markdown", &["md", "markdown"])
+        .add_filter("Markdown / Text", &["md", "markdown", "txt"])
         .pick_file()
 }
 
