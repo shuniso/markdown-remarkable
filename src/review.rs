@@ -6,7 +6,7 @@
 //! wires this up to `GET/PUT /review` and `POST /export`.
 
 use crate::render::{self, Anchor, AnchorKind};
-use crate::util::file_title;
+use crate::util::{file_title, FileKind};
 use anyhow::{anyhow, Context, Result};
 use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
@@ -389,8 +389,23 @@ fn now_rfc3339() -> String {
 /// `now` is the RFC3339 export timestamp; passed in (rather than computed
 /// here) so this stays a pure, deterministically-testable function — see
 /// [`export`] for the impure wrapper that supplies it.
-pub fn export_markdown(md_name: &str, markdown: &str, doc: &ReviewDoc, now: &str) -> String {
-    let live_anchors = render::anchors(markdown);
+///
+/// `kind` selects which anchor set `text` is walked with: `PlainText` uses
+/// [`render::anchors_plain`], giving one anchor per non-empty line (so every
+/// section reads as `> L12: <line>`, never `(in list …)`/`(in table …)`,
+/// since plain text has no such structure), while `Markdown` keeps the
+/// existing [`render::anchors`] behavior described above.
+pub fn export_markdown(
+    md_name: &str,
+    kind: FileKind,
+    text: &str,
+    doc: &ReviewDoc,
+    now: &str,
+) -> String {
+    let live_anchors = match kind {
+        FileKind::Markdown => render::anchors(text),
+        FileKind::PlainText => render::anchors_plain(text),
+    };
     // Filtered to entries that actually have a comment to show: `unanchored`
     // itself only checks hash membership, so a `ReviewBlock` with an empty
     // `comments` list (shouldn't normally happen — the client drops a block
@@ -592,16 +607,16 @@ fn push_comment_bullet(out: &mut String, prefix: &str, text: &str) {
     }
 }
 
-/// Writes the export Markdown for `md` (given its already-read
-/// `markdown` content and loaded review `doc`) to [`export_path`], and
+/// Writes the export Markdown for `md` (given its `kind`, already-read
+/// `text` content, and loaded review `doc`) to [`export_path`], and
 /// returns `(path, markdown)` — the file name-only path plus the exact
 /// text written, so the caller (an HTTP handler) can hand both back to the
 /// client without a second disk read.
-pub fn export(md: &Path, markdown: &str, doc: &ReviewDoc) -> Result<(PathBuf, String)> {
+pub fn export(md: &Path, kind: FileKind, text: &str, doc: &ReviewDoc) -> Result<(PathBuf, String)> {
     let path = export_path(md);
     let md_name = file_title(md);
     let now = now_rfc3339();
-    let rendered = export_markdown(&md_name, markdown, doc, &now);
+    let rendered = export_markdown(&md_name, kind, text, doc, &now);
     atomic_write(&path, rendered.as_bytes())?;
     Ok((path, rendered))
 }
@@ -630,6 +645,18 @@ mod tests {
     #[test]
     fn export_path_replaces_the_extension_with_review_md() {
         let path = export_path(Path::new("/tmp/notes.md"));
+        assert_eq!(path, Path::new("/tmp/notes.review.md"));
+    }
+
+    #[test]
+    fn sidecar_path_appends_review_json_to_a_txt_file_name() {
+        let path = sidecar_path(Path::new("/tmp/notes.txt"));
+        assert_eq!(path, Path::new("/tmp/notes.txt.review.json"));
+    }
+
+    #[test]
+    fn export_path_replaces_a_txt_extension_with_review_md() {
+        let path = export_path(Path::new("/tmp/notes.txt"));
         assert_eq!(path, Path::new("/tmp/notes.review.md"));
     }
 
@@ -1138,7 +1165,13 @@ mod tests {
             blocks: vec![],
             file_comments: Vec::new(),
         };
-        let out = export_markdown("notes.md", "# Hi\n", &doc, "2026-08-22T07:10:00Z");
+        let out = export_markdown(
+            "notes.md",
+            FileKind::Markdown,
+            "# Hi\n",
+            &doc,
+            "2026-08-22T07:10:00Z",
+        );
         assert_eq!(
             out,
             "# Review: notes.md\n\nExported: 2026-08-22T07:10:00Z · 0 comments on 0 blocks\n"
@@ -1175,7 +1208,13 @@ mod tests {
             file_comments: Vec::new(),
         };
 
-        let out = export_markdown("notes.md", markdown, &doc, "2026-08-22T07:10:00Z");
+        let out = export_markdown(
+            "notes.md",
+            FileKind::Markdown,
+            markdown,
+            &doc,
+            "2026-08-22T07:10:00Z",
+        );
 
         let expected = format!(
             "# Review: notes.md\n\n\
@@ -1206,7 +1245,13 @@ mod tests {
             file_comments: vec![comment("c_2", "全体として章立てが前後している")],
         };
 
-        let out = export_markdown("notes.md", markdown, &doc, "2026-08-24T01:00:00Z");
+        let out = export_markdown(
+            "notes.md",
+            FileKind::Markdown,
+            markdown,
+            &doc,
+            "2026-08-24T01:00:00Z",
+        );
         let expected = "# Review: notes.md\n\n\
              Exported: 2026-08-24T01:00:00Z · 2 comments (1 on the file, 1 on 1 blocks)\n\n\
              > (file): notes.md\n\n\
@@ -1228,7 +1273,13 @@ mod tests {
             blocks: vec![],
             file_comments: Vec::new(),
         };
-        let out = export_markdown("notes.md", "# Hi\n", &doc, "2026-08-22T07:10:00Z");
+        let out = export_markdown(
+            "notes.md",
+            FileKind::Markdown,
+            "# Hi\n",
+            &doc,
+            "2026-08-22T07:10:00Z",
+        );
         assert!(!out.contains("(file)"));
         // Count format stays the original "M comments on B blocks" — no
         // parenthesized breakdown — when there are no file comments.
@@ -1244,7 +1295,13 @@ mod tests {
             blocks: vec![],
             file_comments: vec![comment("c_1", "全体コメント")],
         };
-        let out = export_markdown("notes.md", "# Hi\n", &doc, "2026-08-22T07:10:00Z");
+        let out = export_markdown(
+            "notes.md",
+            FileKind::Markdown,
+            "# Hi\n",
+            &doc,
+            "2026-08-22T07:10:00Z",
+        );
         assert_eq!(
             out,
             "# Review: notes.md\n\n\
@@ -1262,7 +1319,13 @@ mod tests {
             blocks: vec![],
             file_comments: vec![comment("c_1", "first line\nsecond line")],
         };
-        let out = export_markdown("notes.md", "# Hi\n", &doc, "2026-08-22T07:10:00Z");
+        let out = export_markdown(
+            "notes.md",
+            FileKind::Markdown,
+            "# Hi\n",
+            &doc,
+            "2026-08-22T07:10:00Z",
+        );
         assert!(out.contains("- first line\n  second line\n"));
     }
 
@@ -1284,7 +1347,13 @@ mod tests {
             file_comments: Vec::new(),
         };
 
-        let out = export_markdown("notes.md", markdown, &doc, "2026-08-22T07:10:00Z");
+        let out = export_markdown(
+            "notes.md",
+            FileKind::Markdown,
+            markdown,
+            &doc,
+            "2026-08-22T07:10:00Z",
+        );
         // No full-source quote any more — just the line range and excerpt,
         // followed directly by the comment list.
         assert!(out.contains("> L1-L2: > line one\n\n- check this\n"));
@@ -1308,7 +1377,13 @@ mod tests {
             file_comments: Vec::new(),
         };
 
-        let out = export_markdown("notes.md", markdown, &doc, "2026-08-22T07:10:00Z");
+        let out = export_markdown(
+            "notes.md",
+            FileKind::Markdown,
+            markdown,
+            &doc,
+            "2026-08-22T07:10:00Z",
+        );
         assert!(out.contains("> L1: # Heading\n\n"));
         assert!(!out.contains("L1-L1"));
     }
@@ -1328,7 +1403,13 @@ mod tests {
             }],
             file_comments: Vec::new(),
         };
-        let out = export_markdown("notes.md", markdown, &doc, "2026-08-22T07:10:00Z");
+        let out = export_markdown(
+            "notes.md",
+            FileKind::Markdown,
+            markdown,
+            &doc,
+            "2026-08-22T07:10:00Z",
+        );
         assert!(out.contains("- first line\n  second line\n  third line\n"));
     }
 
@@ -1347,7 +1428,13 @@ mod tests {
             file_comments: Vec::new(),
         };
 
-        let out = export_markdown("notes.md", markdown, &doc, "2026-08-22T07:10:00Z");
+        let out = export_markdown(
+            "notes.md",
+            FileKind::Markdown,
+            markdown,
+            &doc,
+            "2026-08-22T07:10:00Z",
+        );
         assert!(out.contains("## Unanchored\n\n"));
         assert!(out.contains("> (not found): 旧 excerpt\n\n"));
         assert!(out.contains("- コメント本文\n"));
@@ -1371,7 +1458,13 @@ mod tests {
             }],
             file_comments: Vec::new(),
         };
-        let out = export_markdown("notes.md", markdown, &doc, "2026-08-22T07:10:00Z");
+        let out = export_markdown(
+            "notes.md",
+            FileKind::Markdown,
+            markdown,
+            &doc,
+            "2026-08-22T07:10:00Z",
+        );
         assert!(!out.contains("Unanchored"));
         assert!(!out.contains("unanchored"));
     }
@@ -1391,7 +1484,13 @@ mod tests {
             }],
             file_comments: Vec::new(),
         };
-        let out = export_markdown("notes.md", markdown, &doc, "2026-08-22T07:10:00Z");
+        let out = export_markdown(
+            "notes.md",
+            FileKind::Markdown,
+            markdown,
+            &doc,
+            "2026-08-22T07:10:00Z",
+        );
         assert!(!out.contains("Uncommented paragraph"));
         assert_eq!(out.matches("> L").count(), 1);
     }
@@ -1421,7 +1520,13 @@ mod tests {
             ],
             file_comments: Vec::new(),
         };
-        let out = export_markdown("notes.md", markdown, &doc, "2026-08-22T07:10:00Z");
+        let out = export_markdown(
+            "notes.md",
+            FileKind::Markdown,
+            markdown,
+            &doc,
+            "2026-08-22T07:10:00Z",
+        );
         let first_idx = out.find("First heading").expect("first heading present");
         let second_idx = out.find("Second heading").expect("second heading present");
         assert!(first_idx < second_idx);
@@ -1447,9 +1552,110 @@ mod tests {
             }],
             file_comments: Vec::new(),
         };
-        let out = export_markdown("notes.md", markdown, &doc, "2026-08-22T07:10:00Z");
+        let out = export_markdown(
+            "notes.md",
+            FileKind::Markdown,
+            markdown,
+            &doc,
+            "2026-08-22T07:10:00Z",
+        );
         assert_eq!(out.matches("> L").count(), 1);
         assert!(out.contains("1 comments on 1 blocks"));
+    }
+
+    // -- export_markdown: plain text --------------------------------------
+
+    #[test]
+    fn export_markdown_labels_a_plain_text_line_with_its_line_number() {
+        let text = "alpha\nbravo\ncharlie\n";
+        let live = render::anchors_plain(text);
+        let doc = ReviewDoc {
+            version: 1,
+            file: "notes.txt".to_string(),
+            blocks: vec![ReviewBlock {
+                hash: live[2].hash.clone(),
+                excerpt: live[2].excerpt.clone(),
+                kind: AnchorKindDto::Block,
+                comments: vec![comment("c_1", "この行が怪しい")],
+            }],
+            file_comments: Vec::new(),
+        };
+
+        let out = export_markdown(
+            "notes.txt",
+            FileKind::PlainText,
+            text,
+            &doc,
+            "2026-09-07T07:10:00Z",
+        );
+
+        let expected = "# Review: notes.txt\n\n\
+             Exported: 2026-09-07T07:10:00Z · 1 comments on 1 blocks\n\n\
+             > L3: charlie\n\n\
+             - この行が怪しい\n";
+        assert_eq!(out, expected);
+    }
+
+    #[test]
+    fn export_markdown_plain_text_lines_get_no_in_list_or_in_table_suffix() {
+        let text = "- looks like a list item\n| looks | like a table |\n";
+        let live = render::anchors_plain(text);
+        let doc = ReviewDoc {
+            version: 1,
+            file: "notes.txt".to_string(),
+            blocks: vec![
+                ReviewBlock {
+                    hash: live[0].hash.clone(),
+                    excerpt: live[0].excerpt.clone(),
+                    kind: AnchorKindDto::Block,
+                    comments: vec![comment("c_1", "a")],
+                },
+                ReviewBlock {
+                    hash: live[1].hash.clone(),
+                    excerpt: live[1].excerpt.clone(),
+                    kind: AnchorKindDto::Block,
+                    comments: vec![comment("c_2", "b")],
+                },
+            ],
+            file_comments: Vec::new(),
+        };
+
+        let out = export_markdown(
+            "notes.txt",
+            FileKind::PlainText,
+            text,
+            &doc,
+            "2026-09-07T07:10:00Z",
+        );
+
+        assert!(!out.contains("(in list"), "{out}");
+        assert!(!out.contains("(in table"), "{out}");
+        assert!(out.contains("> L1: - looks like a list item\n"), "{out}");
+        assert!(out.contains("> L2: | looks | like a table |\n"), "{out}");
+    }
+
+    #[test]
+    fn export_markdown_plain_text_keeps_the_file_comment_section_first() {
+        let doc = ReviewDoc {
+            version: 1,
+            file: "notes.txt".to_string(),
+            blocks: Vec::new(),
+            file_comments: vec![comment("c_1", "全体の構成が読みにくい")],
+        };
+
+        let out = export_markdown(
+            "notes.txt",
+            FileKind::PlainText,
+            "alpha\n",
+            &doc,
+            "2026-09-07T07:10:00Z",
+        );
+
+        let expected = "# Review: notes.txt\n\n\
+             Exported: 2026-09-07T07:10:00Z · 1 comments (1 on the file, 0 on 0 blocks)\n\n\
+             > (file): notes.txt\n\n\
+             - 全体の構成が読みにくい\n";
+        assert_eq!(out, expected);
     }
 
     // -- export_markdown: item/row anchors --------------------------------
@@ -1476,7 +1682,13 @@ mod tests {
             }],
             file_comments: Vec::new(),
         };
-        let out = export_markdown("notes.md", markdown, &doc, "2026-08-22T07:10:00Z");
+        let out = export_markdown(
+            "notes.md",
+            FileKind::Markdown,
+            markdown,
+            &doc,
+            "2026-08-22T07:10:00Z",
+        );
 
         let expected_quote = format!(
             "> {}: 三番目の項目 (in list {})\n\n- コメント\n",
@@ -1511,7 +1723,13 @@ mod tests {
             }],
             file_comments: Vec::new(),
         };
-        let out = export_markdown("notes.md", markdown, &doc, "2026-08-22T07:10:00Z");
+        let out = export_markdown(
+            "notes.md",
+            FileKind::Markdown,
+            markdown,
+            &doc,
+            "2026-08-22T07:10:00Z",
+        );
 
         let expected_quote = format!(
             "> {}: d | e | f (in table {})\n\n- 確認\n",
@@ -1541,7 +1759,13 @@ mod tests {
             }],
             file_comments: Vec::new(),
         };
-        let out = export_markdown("notes.md", markdown, &doc, "2026-08-22T07:10:00Z");
+        let out = export_markdown(
+            "notes.md",
+            FileKind::Markdown,
+            markdown,
+            &doc,
+            "2026-08-22T07:10:00Z",
+        );
         assert!(out.contains("> L1: # Heading\n\n"));
         assert!(!out.contains("in list"));
         assert!(!out.contains("in table"));
@@ -1576,7 +1800,13 @@ mod tests {
             }],
             file_comments: Vec::new(),
         };
-        let out = export_markdown("notes.md", markdown, &doc, "2026-08-22T07:10:00Z");
+        let out = export_markdown(
+            "notes.md",
+            FileKind::Markdown,
+            markdown,
+            &doc,
+            "2026-08-22T07:10:00Z",
+        );
         let expected_suffix = format!("(in list {})", line_label(block.line_start, block.line_end));
         assert!(
             out.contains(&expected_suffix),
@@ -1610,7 +1840,13 @@ mod tests {
             }],
             file_comments: Vec::new(),
         };
-        let out = export_markdown("notes.md", markdown, &doc, "2026-08-22T07:10:00Z");
+        let out = export_markdown(
+            "notes.md",
+            FileKind::Markdown,
+            markdown,
+            &doc,
+            "2026-08-22T07:10:00Z",
+        );
 
         let expected_suffix = format!(
             "(in block {})",
@@ -1642,7 +1878,13 @@ mod tests {
             }],
             file_comments: Vec::new(),
         };
-        let out = export_markdown("notes.md", markdown, &doc, "2026-08-22T07:10:00Z");
+        let out = export_markdown(
+            "notes.md",
+            FileKind::Markdown,
+            markdown,
+            &doc,
+            "2026-08-22T07:10:00Z",
+        );
         assert!(!out.contains("Unanchored"));
         assert!(!out.contains("unanchored"));
     }
@@ -1669,7 +1911,13 @@ mod tests {
                 .collect(),
             file_comments: Vec::new(),
         };
-        let out = export_markdown("notes.md", markdown, &doc, "2026-08-22T07:10:00Z");
+        let out = export_markdown(
+            "notes.md",
+            FileKind::Markdown,
+            markdown,
+            &doc,
+            "2026-08-22T07:10:00Z",
+        );
         let list_idx = out.find("- one").expect("list block quoted");
         let one_idx = out.find("in list").expect("first item's suffix present");
         let unrelated_idx = out
@@ -1687,7 +1935,7 @@ mod tests {
         std::fs::write(&md, "# Hi\n").expect("write md");
         let doc = empty_doc(&md);
 
-        let (path, markdown) = export(&md, "# Hi\n", &doc).expect("export");
+        let (path, markdown) = export(&md, FileKind::Markdown, "# Hi\n", &doc).expect("export");
         assert_eq!(path, dir.path().join("notes.review.md"));
         let on_disk = std::fs::read_to_string(&path).expect("read exported file");
         assert_eq!(on_disk, markdown);

@@ -11,7 +11,7 @@
 
 use crate::render::{self, page, to_html};
 use crate::review::{self, ReviewDoc};
-use crate::util::{file_kind, file_title};
+use crate::util::{file_kind, file_title, FileKind};
 use percent_encoding::{percent_decode_str, utf8_percent_encode, AsciiSet, CONTROLS};
 use serde::Deserialize;
 use std::fs;
@@ -472,7 +472,8 @@ fn handle_export(req: &RouteRequest, file: Option<&Path>) -> Reply {
             return error_json(500, "failed to read review data");
         }
     };
-    match review::export(path, &markdown, &doc) {
+    let kind = file_kind(path).unwrap_or(FileKind::Markdown);
+    match review::export(path, kind, &markdown, &doc) {
         Ok((export_path, exported_markdown)) => {
             let file_name = export_path
                 .file_name()
@@ -1943,6 +1944,50 @@ mod tests {
             .as_str()
             .unwrap()
             .starts_with("# Review: notes.md"));
+        assert!(dir.path().join("notes.review.md").exists());
+    }
+
+    #[test]
+    fn export_of_a_txt_file_writes_a_review_md_next_to_it() {
+        let dir = tempfile::tempdir().expect("create tempdir");
+        let file_path = dir.path().join("notes.txt");
+        let text = "alpha\nbravo\ncharlie\n";
+        std::fs::write(&file_path, text).expect("write text file");
+        // A sidecar with a comment on line 2's hash: this only shows up as
+        // `> L2: bravo` in the export if `handle_export` actually renders
+        // through the plain-text (one-line-per-anchor) branch — the
+        // Markdown branch would fold these lines into a single paragraph
+        // block and never produce a match for this hash, so this is the
+        // regression check for the `FileKind` dispatch itself, not just
+        // that *some* `.review.md` got written.
+        let live = render::anchors_plain(text);
+        let doc = ReviewDoc {
+            version: 1,
+            file: "notes.txt".to_string(),
+            blocks: vec![review::ReviewBlock {
+                hash: live[1].hash.clone(),
+                excerpt: live[1].excerpt.clone(),
+                kind: review::AnchorKindDto::Block,
+                comments: vec![review::Comment {
+                    id: "c_1".to_string(),
+                    text: "この行が怪しい".to_string(),
+                    created: "2026-09-07T07:00:00Z".to_string(),
+                    updated: "2026-09-07T07:00:00Z".to_string(),
+                }],
+            }],
+            file_comments: Vec::new(),
+        };
+        review::save(&file_path, &doc).expect("save sidecar");
+        let version = AtomicU64::new(0);
+        let headers = with_request_header();
+
+        let reply = handle_reply(&post_export(&headers), Some(&file_path), &version, false);
+        assert_eq!(reply.status, 200);
+        let value: serde_json::Value = serde_json::from_slice(&reply.body).unwrap();
+        assert_eq!(value["path"], "notes.review.md");
+        let markdown = value["markdown"].as_str().unwrap();
+        assert!(markdown.starts_with("# Review: notes.txt"));
+        assert!(markdown.contains("> L2: bravo"), "{markdown}");
         assert!(dir.path().join("notes.review.md").exists());
     }
 
