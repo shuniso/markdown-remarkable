@@ -84,6 +84,16 @@ to the front instead, so two windows never end up racing to write the same
 review sidecar. A doc header shows Back/Forward buttons for per-window
 back/forward history through everywhere you've navigated (also `⌘[`/`⌘]`).
 
+The folder button in the tree header (or ⌘⇧O) re-picks that window's root
+directory via the OS's native "choose a folder" dialog — the only way to
+move it; it's never settable by anything the app receives over its own
+protocol/HTTP surface. If the currently open file is still inside the newly
+picked folder, it stays open exactly as it was (scroll position, selection,
+and review highlighting are untouched) and only the tree pane refreshes;
+otherwise the window falls back to its empty "drop a file here" state. The
+window's back/forward history is cleared either way, since every entry in
+it names a path under the folder that just stopped being the root.
+
 Each `FILE` on the command line gets its own independent native window —
 own watcher, title, zoom level, and history — cascaded slightly down and to
 the right of the last one so new windows don't stack exactly on top of each
@@ -129,6 +139,7 @@ macOS uses Cmd; Windows/Linux use Ctrl for the same shortcuts unless noted.
 | Shortcut | Action |
 |---|---|
 | ⌘O | Open a file (macOS menu only) |
+| ⌘⇧O | Re-pick the file tree's root folder (macOS menu only; also available as the tree header's folder button on every platform) |
 | ⌘W | Close the current window (macOS menu only) |
 | ⌘Q | Quit — closes every window at once (macOS menu only) |
 | ⌘R | Reload |

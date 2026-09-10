@@ -607,6 +607,52 @@ fn put_nav_is_501_in_browser_mode() {
 }
 
 #[test]
+fn put_pick_root_is_501_in_browser_mode() {
+    let harness = start_test_server("# Hi\n");
+
+    let response = raw_request_with_body(
+        harness.addr,
+        "PUT",
+        "/pick-root",
+        &[("X-Mdview-Request", "1")],
+        b"",
+    );
+    let response = String::from_utf8_lossy(&response);
+    assert!(
+        response.starts_with("HTTP/1.1 501"),
+        "expected 501 for PUT /pick-root in --browser mode, got: {response}"
+    );
+}
+
+#[test]
+fn put_pick_root_ignores_a_path_in_its_body_and_still_501s_in_browser_mode() {
+    // `--browser` mode always answers 501 before ever looking at the
+    // request header or body (`allow_open: false` is checked first — see
+    // `routes::handle_pick_root`, same order `PUT /open`/`PUT /nav` use),
+    // so this also demonstrates a body carrying a path has no special
+    // handling: the response is identical to the empty-body case above.
+    // The `X-Mdview-Request`-header 403 case can only be exercised with
+    // `allow_open: true` (the native app), so it's a `routes.rs` unit test
+    // instead (`pick_root_without_the_request_header_is_403`) — this
+    // browser-mode server never reaches that check at all.
+    let harness = start_test_server("# Hi\n");
+    let body = br#"{"path":"/etc/passwd","root_dir":"/"}"#;
+
+    let response = raw_request_with_body(
+        harness.addr,
+        "PUT",
+        "/pick-root",
+        &[("X-Mdview-Request", "1")],
+        body,
+    );
+    let response = String::from_utf8_lossy(&response);
+    assert!(
+        response.starts_with("HTTP/1.1 501"),
+        "expected 501 for PUT /pick-root in --browser mode regardless of body, got: {response}"
+    );
+}
+
+#[test]
 fn put_review_body_over_1_mib_is_413_over_raw_http() {
     let harness = start_test_server("# Hi\n");
     // A JSON body comfortably over the 1 MiB limit.

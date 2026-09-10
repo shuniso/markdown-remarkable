@@ -550,6 +550,37 @@
       });
   }
 
+  // Re-syncs the doc header — the back/forward buttons' disabled state and
+  // the current-file path label — without touching the document itself.
+  // Exposed as window.__mdviewViewer.refreshDocHeader (see just below
+  // initDocHeader) for app.rs's reestablish_root to call, alongside
+  // window.__mdviewTree.reload(), once PUT /pick-root moves root_dir while
+  // leaving the currently open file in place: history was just cleared
+  // server-side, so refreshNavState() alone (a plain GET /nav) is enough to
+  // pick that up, but the path label is root-relative, so it needs its own
+  // fresh GET /tree read here — deliberately *not* routed through
+  // currentRelativePath()'s window.__mdviewTree.getCurrent() shortcut,
+  // whose cached value could still be racing tree.js's own in-flight
+  // reload() at the exact moment this runs.
+  function refreshDocHeaderAfterRootChange() {
+    refreshNavState();
+    var pathEl = document.getElementById("doc-header-path");
+    if (!pathEl) {
+      return;
+    }
+    fetch(TREE_URL, { method: "GET", cache: "no-store", headers: REQUEST_HEADERS })
+      .then(function (response) {
+        return response.ok ? response.json() : null;
+      })
+      .then(function (payload) {
+        pathEl.textContent =
+          payload && typeof payload.current === "string" ? payload.current : "";
+      })
+      .catch(function () {
+        pathEl.textContent = "";
+      });
+  }
+
   function initDocHeader() {
     docBackBtn = document.getElementById("doc-back");
     docForwardBtn = document.getElementById("doc-forward");
@@ -581,6 +612,8 @@
   } else {
     initDocHeader();
   }
+
+  window.__mdviewViewer.refreshDocHeader = refreshDocHeaderAfterRootChange;
 
   // True while a TEXTAREA or INPUT holds focus — same check
   // assets/review.js's own global shortcuts use (`isTextInputFocused`

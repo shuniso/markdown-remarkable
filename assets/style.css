@@ -328,6 +328,46 @@ body {
   transform: translateX(20%) rotate(-135deg);
 }
 
+/* Tree header's folder button (PUT /pick-root) — same CSS-drawn-glyph
+   approach as the chevron above (no platform-dependent glyph rendering),
+   just a different shape: an open folder, drawn as two currentColor-
+   bordered rectangles (a narrow "tab" sitting on a wider "body") instead
+   of the chevron's single corner. `position: relative` so the tab
+   (`::after`) can be placed against the button itself rather than
+   whichever ancestor happens to be positioned. `::before`'s `border`
+   shorthand fully replaces the shared rule's `border-top`/`border-right`
+   chevron, so nothing chevron-shaped leaks through here. */
+.icon-btn.tree-folder-btn {
+  position: relative;
+}
+
+.icon-btn.tree-folder-btn::before {
+  width: 0.85rem;
+  height: 0.55rem;
+  border: 1.3px solid currentColor;
+  border-radius: 1px;
+}
+
+.icon-btn.tree-folder-btn::after {
+  content: "";
+  position: absolute;
+  top: calc(50% - 0.37rem);
+  left: calc(50% - 0.42rem);
+  width: 0.4rem;
+  height: 0.18rem;
+  border: 1.3px solid currentColor;
+  border-bottom: none;
+  border-radius: 1px 1px 0 0;
+}
+
+/* `--browser` mode has no window/root concept at all (`PUT /pick-root`
+   always answers `501` there — see routes::handle_pick_root's docs), so
+   the folder button never does anything there either; hidden for the same
+   reason `.doc-nav-btn` is just below. */
+body[data-mode="browser"] .tree-folder-btn {
+  display: none;
+}
+
 /* `--browser` mode has no per-window history at all (`GET`/`PUT /nav`
    always answer accordingly — see routes::handle's docs), so the nav
    buttons never do anything there; hide them rather than show permanently-

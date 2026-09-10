@@ -117,6 +117,15 @@ pub enum Action {
     /// decides the target, and only the caller (`app.rs`) has mutable access
     /// to it.
     Navigate(NavDirection),
+    /// Open the OS-native "choose a folder" dialog for the current window
+    /// and, if the user picks one, re-establish it as that window's
+    /// file-tree root — see [`handle_pick_root`]. Deliberately carries no
+    /// path at all, unlike every other variant here: the whole point of
+    /// `PUT /pick-root` is that a path can never arrive over this protocol
+    /// surface, only out of the dialog itself (`app.rs`'s
+    /// `pick_folder_dialog`/`reestablish_root`), which is why this can't be
+    /// `PickRoot(PathBuf)` the way [`Action::OpenFile`] is.
+    PickRoot,
 }
 
 /// Which way a `PUT /nav` request asks the current window to move through
@@ -197,8 +206,9 @@ fn has_request_header(req: &RouteRequest) -> bool {
 ///   is unaffected: `sandbox` only restricts a response when it's
 ///   navigated to/rendered as its own document.
 /// - `GET /tree` — the file tree rooted at `root_dir` (the *window's own*
-///   fixed root — see [`handle_tree`] for why this is not simply
-///   `asset_parent_dir(file)` any more).
+///   root — see [`handle_tree`] for why this is not simply
+///   `asset_parent_dir(file)` any more, and for why `root_dir` is no longer
+///   quite as fixed as that name once implied — see [`Action::PickRoot`]).
 /// - `PUT /open` — switches the currently-viewed file to a `.md`/
 ///   `.markdown`/`.txt` file named by a JSON body, within `root_dir`'s
 ///   scope.
@@ -215,18 +225,28 @@ fn has_request_header(req: &RouteRequest) -> bool {
 /// - `PUT /nav` — moves the current window's history one step per a JSON
 ///   body `{"dir": "back"|"forward"}`, gated by `allow_open` the same way
 ///   `PUT /open` is (`501` under `--browser`). See [`handle_nav_put`].
+/// - `PUT /pick-root` — asks the native app to open its OS-native "choose a
+///   folder" dialog and, if the user picks one, re-establish it as the
+///   current window's file-tree root. Gated by `allow_open` the same way
+///   `PUT /open`/`PUT /nav` are (`501` under `--browser`), and otherwise
+///   only ever checks [`REQUEST_HEADER`] (`403` if absent) — it never reads
+///   its own request body at all, so a path can never reach `root_dir` this
+///   way, only through the dialog itself. See [`handle_pick_root`].
 /// - anything else — `404`.
 ///
 /// `root_dir`, when `Some`, is the directory `GET /tree`/`PUT /open` treat
-/// as their read/switch boundary — the *window's* fixed root (its very
-/// first file's parent, established once and never moved by a later
+/// as their read/switch boundary — the *window's* own root (its very first
+/// file's parent, established once and never moved by an ordinary file
 /// switch — see `app.rs`'s `WindowCtx::root_dir`), not
 /// `asset_parent_dir(file)` (which would drift every time the current file
 /// changes, making "switch to a subfolder, then switch back" impossible).
-/// `None` (always passed by `server.rs`,
-/// which has no window/root concept of its own) falls back to
-/// `asset_parent_dir(file)` for both routes, same as before `root_dir`
-/// existed. `GET`/`HEAD /asset` deliberately keeps using
+/// It *can* move, but only ever in response to `PUT /pick-root` succeeding
+/// (a user explicitly picking a new folder via the OS-native dialog — see
+/// [`Action::PickRoot`] and `app.rs`'s `reestablish_root`), never as a side
+/// effect of anything else that happens in this module. `None` (always
+/// passed by `server.rs`, which has no window/root concept of its own)
+/// falls back to `asset_parent_dir(file)` for both routes, same as before
+/// `root_dir` existed. `GET`/`HEAD /asset` deliberately keeps using
 /// `asset_parent_dir(file)` directly regardless of `root_dir` — an image's
 /// `src="…"` is a relative reference resolved against the *document
 /// currently rendering it*, not the window's root, so switching files must
@@ -234,8 +254,11 @@ fn has_request_header(req: &RouteRequest) -> bool {
 ///
 /// `GET`/`PUT /review` and `POST /export` all answer `409` when `file` is
 /// `None` — there's nothing to review yet. So does `GET`/`HEAD /asset` and
-/// `GET /tree`/`PUT /open` — there's no document to resolve a relative path
-/// against.
+/// `PUT /open` — there's no document to resolve a relative path against.
+/// `GET /tree` is the one exception: it answers `409` only when `root_dir`
+/// is *also* `None` (see [`handle_tree`]'s own docs) — a root alone is
+/// already enough to list a tree, even with no file currently open (the
+/// state `PUT /pick-root` can leave a window in).
 ///
 /// A read failure (file deleted, permissions changed, etc.) never leaks the
 /// absolute path or OS error text (those go to stderr, same as every other
@@ -294,6 +317,7 @@ pub fn handle(
         ("PUT", "/open") => handle_open(req, file, allow_open, root_dir),
         ("GET", "/nav") => (handle_nav_get(nav, allow_open), Action::None),
         ("PUT", "/nav") => handle_nav_put(req, nav, allow_open),
+        ("PUT", "/pick-root") => handle_pick_root(req, allow_open),
         _ => (Reply::text(404, "404 Not Found"), Action::None),
     };
     (
@@ -533,12 +557,16 @@ struct TreeEntry {
     kind: &'static str,
 }
 
-/// The directory `GET /tree`/`PUT /open` scope their walk/switch to —
-/// `root_dir` if the caller passed one (the native app always does, once a
-/// window has a file open at all — see `app.rs`'s `WindowCtx::root_dir`),
-/// or `asset_parent_dir(md_path)` otherwise (`server.rs`, which has no
-/// window/root concept, always passes `None`). See [`handle`]'s docs for
-/// why this must be the window's *fixed* root rather than
+/// The directory `PUT /open` scopes its switch to (with `md_path` `Some` —
+/// [`handle_open`] already answers `409` before reaching this when `file`
+/// is `None`) — `root_dir` if the caller passed one (the native app always
+/// does, once a window has a file open at all — see `app.rs`'s
+/// `WindowCtx::root_dir`), or `asset_parent_dir(md_path)` otherwise
+/// (`server.rs`, which has no window/root concept, always passes `None`).
+/// [`handle_tree`] inlines the same rule itself rather than calling this —
+/// it also has to handle `md_path` being absent entirely (`file: None` with
+/// `root_dir: Some`), which this signature has no way to express. See
+/// [`handle`]'s docs for why this must be the window's own root rather than
 /// `asset_parent_dir` of whatever happens to be open right now.
 fn tree_root_dir<'a>(root_dir: Option<&'a Path>, md_path: &'a Path) -> &'a Path {
     root_dir.unwrap_or_else(|| asset_parent_dir(md_path))
@@ -593,24 +621,39 @@ fn path_components_to_slash(path: &Path) -> String {
 /// root (see [`tree_relative_path`]) — a bare file name when the window's
 /// root is that file's own parent (the common case: no switch has
 /// descended into a subfolder yet), a `/`-joined relative path otherwise.
-/// `"truncated"` is present (and `true`) only once [`TREE_MAX_ENTRIES`] or
-/// [`TREE_MAX_VISITED_ENTRIES`] is hit; otherwise the field is omitted
-/// entirely.
+/// `"current"` is `null` (never an empty string) when no file is currently
+/// open — see below. `"truncated"` is present (and `true`) only once
+/// [`TREE_MAX_ENTRIES`] or [`TREE_MAX_VISITED_ENTRIES`] is hit; otherwise
+/// the field is omitted entirely.
 ///
-/// `409` if `file` is `None` — there's no document to root the tree at.
+/// `409` only when there's truly nothing to root a tree at: `root_dir` is
+/// `None` *and* `file` is `None` too (an empty native window that has never
+/// had a file opened in it, or `server.rs`, which never passes a
+/// `root_dir` at all). Once `root_dir` is `Some` — a file has been opened
+/// in this window at some point, or its root was explicitly re-established
+/// via `PUT /pick-root` (see [`Action::PickRoot`]) — `GET /tree` always
+/// succeeds, even with no file currently open right now (the state
+/// `app.rs`'s `reestablish_root` leaves a window in when the newly picked
+/// folder doesn't contain whatever was open before): a root alone is
+/// already enough to know what to list, and `"current"` is simply `null`
+/// in that case rather than resolved against any file. `root_dir: None`
+/// with `file: Some` keeps the pre-`root_dir` fallback
+/// (`asset_parent_dir(file)`) exactly as before.
+///
 /// A directory that can't be read (permissions, deleted mid-walk, ...) is
 /// skipped rather than failing the whole request, same as every other
 /// best-effort read in this module.
 fn handle_tree(file: Option<&Path>, root_dir: Option<&Path>) -> Reply {
-    let Some(md_path) = file else {
-        return no_file_open();
+    let parent = match (root_dir, file) {
+        (Some(root), _) => root,
+        (None, Some(md_path)) => asset_parent_dir(md_path),
+        (None, None) => return no_file_open(),
     };
-    let parent = tree_root_dir(root_dir, md_path);
     let root = parent
         .file_name()
         .map(|name| name.to_string_lossy().into_owned())
         .unwrap_or_else(|| ".".to_string());
-    let current = tree_relative_path(md_path, parent);
+    let current = file.map(|md_path| tree_relative_path(md_path, parent));
 
     let (entries, truncated) =
         collect_tree_entries(parent, TREE_MAX_ENTRIES, TREE_MAX_VISITED_ENTRIES);
@@ -981,6 +1024,52 @@ fn handle_open(
     (
         Reply::json(200, serde_json::json!({ "ok": true, "reloaded": true })),
         Action::OpenFile(candidate_canonical),
+    )
+}
+
+/// `PUT /pick-root`: asks the native app to open its OS-native "choose a
+/// folder" dialog and, if the user picks one, re-establish it as the
+/// current window's file-tree root — see `app.rs`'s `pick_folder_dialog`/
+/// `reestablish_root`, and `docs/SECURITY.md` for the full trust-boundary
+/// rationale. Gated by `allow_open` exactly like [`handle_open`]/
+/// [`handle_nav_put`] — `false` (the browser server) always answers `501`
+/// first, since `--browser` has no window/root concept at all to reassign.
+///
+/// With `allow_open: true`, only [`REQUEST_HEADER`] is checked (`403` if
+/// absent, same CSRF defense as every other state-changing route in this
+/// module) — there is deliberately nothing else *to* check here. Unlike
+/// every other `PUT`/`POST` route in this module, this one never reads
+/// `req.body` at all: a client can influence which folder becomes the new
+/// `root_dir` by exactly one means, the OS-owned dialog itself, never by
+/// anything carried over this custom-protocol/HTTP surface. That mirrors
+/// the trust already placed in the very first file a window ever opens
+/// (via a CLI argument, ⌘O, or a Finder "Open") — that path never goes
+/// through `PUT /open`'s validation either, precisely because it never
+/// arrives as untrusted input in the first place.
+///
+/// On success: `202` `{"ok": true}` — sent back *before* the dialog even
+/// opens, let alone before the user responds to it — plus
+/// [`Action::PickRoot`] for the caller (`app.rs`'s `protocol_response`) to
+/// actually open the dialog on the event loop's own thread and, if the user
+/// picks a folder, apply it. This function never blocks on, or even knows
+/// about, how long that takes — same "the caller does the actual work"
+/// split [`Action::OpenFile`]/[`Action::Navigate`] already use.
+fn handle_pick_root(req: &RouteRequest, allow_open: bool) -> (Reply, Action) {
+    if !allow_open {
+        return (
+            error_json(501, "picking a folder is not supported in --browser mode"),
+            Action::None,
+        );
+    }
+    if !has_request_header(req) {
+        return (
+            error_json(403, "missing X-Mdview-Request header"),
+            Action::None,
+        );
+    }
+    (
+        Reply::json(202, serde_json::json!({ "ok": true })),
+        Action::PickRoot,
     )
 }
 
@@ -2509,6 +2598,40 @@ mod tests {
         assert_eq!(reply.status, 409);
     }
 
+    #[test]
+    fn tree_with_root_dir_but_no_file_open_returns_the_tree_instead_of_409() {
+        // Once a root has been established — the window's first file, or a
+        // later `PUT /pick-root` — `GET /tree` must not also require a file
+        // to be open: `app.rs`'s `reestablish_root` clears the current file
+        // back to `None` whenever the newly picked folder doesn't contain
+        // it, but the tree pane must still show the new root's contents.
+        // `409` is reserved for "there is no root to show at all".
+        let dir = tempfile::tempdir().expect("create tempdir");
+        let root_dir = dir.path().canonicalize().expect("canonicalize root dir");
+        std::fs::write(dir.path().join("a.md"), "# A\n").expect("write a.md");
+        let version = AtomicU64::new(0);
+
+        let (reply, _action) = handle(
+            &get("/tree"),
+            None,
+            &version,
+            false,
+            true,
+            Some(&root_dir),
+            None,
+        );
+        assert_eq!(reply.status, 200);
+        let value: serde_json::Value = serde_json::from_slice(&reply.body).unwrap();
+        assert_eq!(value["current"], serde_json::Value::Null);
+        let names: Vec<&str> = value["entries"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|entry| entry["name"].as_str().unwrap())
+            .collect();
+        assert!(names.contains(&"a.md"), "{names:?}");
+    }
+
     // -- PUT /open ------------------------------------------------------
 
     #[test]
@@ -3087,6 +3210,100 @@ mod tests {
         assert_eq!(action, Action::Navigate(NavDirection::Forward));
     }
 
+    // -- PUT /pick-root ---------------------------------------------------
+
+    fn put_pick_root<'a>(body: &'a [u8], headers: &'a [(String, String)]) -> RouteRequest<'a> {
+        RouteRequest {
+            method: "PUT",
+            path: "/pick-root",
+            headers,
+            body,
+        }
+    }
+
+    #[test]
+    fn pick_root_in_browser_mode_is_501() {
+        let version = AtomicU64::new(0);
+        let headers = with_request_header();
+
+        // `allow_open: false` — what server.rs (`--browser`) always passes.
+        let (reply, action) = handle(
+            &put_pick_root(&[], &headers),
+            None,
+            &version,
+            false,
+            false,
+            None,
+            None,
+        );
+        assert_eq!(reply.status, 501);
+        assert_eq!(action, Action::None);
+    }
+
+    #[test]
+    fn pick_root_without_the_request_header_is_403() {
+        let version = AtomicU64::new(0);
+
+        let (reply, action) = handle(
+            &put_pick_root(&[], &REQUEST_HEADER_PAIR),
+            None,
+            &version,
+            false,
+            true,
+            None,
+            None,
+        );
+        assert_eq!(reply.status, 403);
+        assert_eq!(action, Action::None);
+    }
+
+    #[test]
+    fn pick_root_never_reads_a_path_from_its_own_body() {
+        // The whole point of PUT /pick-root: a client can never choose the
+        // new root by any means other than the OS-native folder dialog
+        // itself. A JSON body naming an arbitrary path must have zero
+        // effect — `Action::PickRoot` carries no path at all (unlike
+        // `Action::OpenFile`), so there is nothing here a malicious body
+        // could even influence; this only pins that down as an explicit
+        // regression test.
+        let version = AtomicU64::new(0);
+        let headers = with_request_header();
+        let malicious_body = br#"{"path":"/etc/passwd","root":"../../etc","root_dir":"/"}"#;
+
+        let (reply, action) = handle(
+            &put_pick_root(malicious_body, &headers),
+            None,
+            &version,
+            false,
+            true,
+            None,
+            None,
+        );
+        assert_eq!(reply.status, 202);
+        assert_eq!(action, Action::PickRoot);
+    }
+
+    #[test]
+    fn pick_root_succeeds_even_with_no_file_open() {
+        // There's nothing file-specific about re-picking a root — an empty
+        // window (no file ever opened, `file: None`) can still ask for the
+        // dialog.
+        let version = AtomicU64::new(0);
+        let headers = with_request_header();
+
+        let (reply, action) = handle(
+            &put_pick_root(&[], &headers),
+            None,
+            &version,
+            false,
+            true,
+            None,
+            None,
+        );
+        assert_eq!(reply.status, 202);
+        assert_eq!(action, Action::PickRoot);
+    }
+
     // -- root_dir: the window's fixed tree/switch root -------------------
 
     #[test]
@@ -3238,6 +3455,63 @@ mod tests {
             tree_relative_path(Path::new(".."), Path::new("/somewhere/else")),
             ""
         );
+    }
+
+    #[test]
+    fn open_404s_for_a_path_under_the_old_root_once_root_dir_moves() {
+        // Characterizes what `PUT /pick-root` moving `root_dir` (via
+        // `app.rs`'s `reestablish_root`) actually does to `PUT /open`'s
+        // boundary: a path that was perfectly valid under the old
+        // `root_dir` must 404 once `handle()` is called again with a new
+        // one — the boundary this enforces is always whichever `root_dir`
+        // it was just handed, never something remembered across calls.
+        let old_dir = tempfile::tempdir().expect("create old tempdir");
+        let old_root = old_dir
+            .path()
+            .canonicalize()
+            .expect("canonicalize old root");
+        let old_file = old_dir.path().join("a.md");
+        std::fs::write(&old_file, "# A\n").expect("write a.md");
+        std::fs::write(old_dir.path().join("b.md"), "# B\n").expect("write b.md");
+
+        let new_dir = tempfile::tempdir().expect("create new tempdir");
+        let new_root = new_dir
+            .path()
+            .canonicalize()
+            .expect("canonicalize new root");
+        std::fs::write(new_dir.path().join("c.md"), "# C\n").expect("write c.md");
+
+        let version = AtomicU64::new(0);
+        let headers = with_request_header();
+
+        // Under the old root, switching from a.md to the sibling b.md
+        // succeeds.
+        let (reply1, action1) = handle(
+            &put_open(br#"{"path":"b.md"}"#, &headers),
+            Some(&old_file),
+            &version,
+            false,
+            true,
+            Some(&old_root),
+            None,
+        );
+        assert_eq!(reply1.status, 200);
+        assert!(matches!(action1, Action::OpenFile(_)));
+
+        // root_dir now points elsewhere (as if PUT /pick-root had just
+        // moved it) — the very same request against the old file is out of
+        // bounds against the new root.
+        let (reply2, action2) = handle(
+            &put_open(br#"{"path":"b.md"}"#, &headers),
+            Some(&old_file),
+            &version,
+            false,
+            true,
+            Some(&new_root),
+            None,
+        );
+        assert_eq!(reply2.status, 404);
+        assert_eq!(action2, Action::None);
     }
 
     // -- PUT /review: residual cross-window risk (documented, not fixed

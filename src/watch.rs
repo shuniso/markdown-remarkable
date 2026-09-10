@@ -33,6 +33,11 @@ pub fn watch(path: &Path, version: Arc<AtomicU64>) -> Result<RecommendedWatcher>
         .map(Path::to_path_buf)
         .unwrap_or_else(|| PathBuf::from("."));
 
+    // kqueue reports writes to a watched file, but reports renames/removals
+    // through its containing directory. Watch both so neither save strategy
+    // loses live reload.
+    let target_for_events = target.clone();
+    let parent_for_events = parent.clone();
     let mut watcher = notify::recommended_watcher(move |result: notify::Result<Event>| {
         let event = match result {
             Ok(event) => event,
@@ -48,7 +53,9 @@ pub fn watch(path: &Path, version: Arc<AtomicU64>) -> Result<RecommendedWatcher>
             return;
         }
         let touches_target = event.paths.iter().any(|changed| {
-            changed == &target || changed.canonicalize().ok().as_ref() == Some(&target)
+            changed == &target_for_events
+                || changed == &parent_for_events
+                || changed.canonicalize().ok().as_ref() == Some(&target_for_events)
         });
         if touches_target {
             version.fetch_add(1, Ordering::SeqCst);
@@ -59,6 +66,9 @@ pub fn watch(path: &Path, version: Arc<AtomicU64>) -> Result<RecommendedWatcher>
     watcher
         .watch(&parent, RecursiveMode::NonRecursive)
         .with_context(|| format!("failed to watch directory {}", parent.display()))?;
+    watcher
+        .watch(&target, RecursiveMode::NonRecursive)
+        .with_context(|| format!("failed to watch file {}", target.display()))?;
 
     Ok(watcher)
 }

@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.2.0] - 2026-09-10
+
 ### Added
 
 - `.txt` files can now be opened and reviewed: they are shown as plain
@@ -19,6 +21,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   appears in Finder's "Open With" menu for `.txt` files (and other
   plain-text-conforming files, though only `.md`/`.markdown`/`.txt` are
   actually opened).
+- The file tree's root folder can now be re-picked from within a window,
+  via a new folder button in the tree header or ⌘⇧O (macOS menu: File ▸
+  Open Folder…) — no more being stuck with whatever directory the window's
+  first file happened to live in. The new folder is always chosen through
+  the OS's own native folder-picker dialog, never a path sent to the app
+  over its own protocol/HTTP surface (see `docs/SECURITY.md`). If the
+  currently open file is still inside the newly picked folder it stays
+  open untouched (scroll position, selection, and review highlighting all
+  survive); otherwise the window falls back to its empty "drop a file
+  here" state. Either way, that window's back/forward history is cleared,
+  since every entry in it names a path under the folder that just stopped
+  being the root.
 
 ### Changed
 
@@ -39,6 +53,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Library API: the `util` module is now public (`FileKind`, `file_kind`),
   and `review::export_markdown`/`review::export` take a `FileKind`
   parameter — a breaking change for library users.
+
+### Fixed
+
+- macOS live reload now uses the kqueue watcher backend, which continues to
+  detect file saves on macOS 26 where the FSEvents backend does not deliver
+  change notifications.
 
 ## [0.1.0] - 2026-09-03
 
@@ -101,5 +121,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   cross-file navigation, and atomic writes for all files the app saves —
   in `docs/SECURITY.md`, and fixed the issues found during that audit.
 
-[Unreleased]: https://github.com/shuniso/markdown-remarkable/compare/v0.1.0...HEAD
+[Unreleased]: https://github.com/shuniso/markdown-remarkable/compare/v0.2.0...HEAD
+[0.2.0]: https://github.com/shuniso/markdown-remarkable/releases/tag/v0.2.0
 [0.1.0]: https://github.com/shuniso/markdown-remarkable/releases/tag/v0.1.0

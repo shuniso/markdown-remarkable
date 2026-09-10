@@ -5,13 +5,17 @@
 //! Not covered by automated tests — GUI startup/event-loop code isn't
 //! practical to exercise the way `routes`, `server`, and `watch` are. The
 //! routing logic it calls into (`routes::handle`) is fully unit-tested on
-//! its own. The one exception is
-//! [`is_internal_url`]/[`is_windows_internal_url`] (the navigation-policy
-//! check deciding whether a URL stays inside the app) — a pure function
-//! with no window/event-loop dependency, so it's unit-tested directly; see
-//! the `tests` module at the bottom of this file. Set `MDVIEW_DEBUG=1` to
-//! log every request every WebView makes through the custom protocol, which
-//! is how the live-reload path gets verified by hand.
+//! its own. The exceptions are the handful of functions in this module
+//! that are themselves pure, with no window/event-loop/`WebView` dependency
+//! — [`is_internal_url`]/[`is_windows_internal_url`] (the navigation-policy
+//! check deciding whether a URL stays inside the app), [`request_path`]
+//! (query-string handling for the custom-protocol request), and
+//! [`file_stays_under_root`] (the decision half of `PUT /pick-root`'s
+//! `reestablish_root`, split out for exactly this reason — see its own doc
+//! comment) — each unit-tested directly; see the `tests` module at the
+//! bottom of this file. Set `MDVIEW_DEBUG=1` to log every request every
+//! WebView makes through the custom protocol, which is how the live-reload
+//! path gets verified by hand.
 
 use crate::nav_history::NavHistory;
 use crate::routes;
@@ -214,6 +218,24 @@ enum UserEvent {
     /// parameter docs), same division of labor as [`UserEvent::SwitchFile`]
     /// vs. `open_file`.
     Navigate(routes::NavDirection, WindowId),
+    /// Only the macOS menu (File ▸ Open Folder…, ⌘⇧O) posts this — see
+    /// [`install_menu`]. Carries no window id, same as [`UserEvent::PickFile`]
+    /// and for the same reason: the menu handler has no access to `windows`
+    /// at the moment it fires, so `run` resolves it to the frontmost window
+    /// (via [`focused_window_id`]) once the event actually arrives. Other
+    /// platforms have no menu bar at all; the tree pane's own folder button
+    /// (`PUT /pick-root`) reaches the same dialog there instead — see
+    /// [`UserEvent::PickRoot`].
+    #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+    PickRootMenu,
+    /// `PUT /pick-root` (the tree pane's folder button) asked to re-pick the
+    /// given window's file-tree root — posted by [`protocol_response`]
+    /// whenever `routes::handle` returns [`routes::Action::PickRoot`].
+    /// Unlike [`UserEvent::PickRootMenu`], this already carries the exact
+    /// window the request came in on, same reasoning as
+    /// [`UserEvent::SwitchFile`]/[`UserEvent::Navigate`] — the protocol
+    /// handler always knows precisely which WebView asked.
+    PickRoot(WindowId),
 }
 
 /// One open window: its `tao` window/`wry` WebView pair, the file state and
@@ -243,21 +265,28 @@ struct WindowCtx {
     /// touch the filesystem for every other open window on every dedup
     /// check.
     canonical_file: Option<PathBuf>,
-    /// This window's *fixed* file-tree root: the canonicalized parent
-    /// directory of the first file this window ever opened — `Some` from
+    /// This window's file-tree root: the canonicalized parent directory of
+    /// the first file this window ever opened — `Some` from
     /// [`create_window`] if it was given a file, or set once by
     /// [`open_file`] (`establish_root: true`) the first time a file lands
     /// in a window that started empty. `None` only while the window truly
-    /// has no file yet.
+    /// has no file yet and no root has been picked either.
     ///
-    /// Deliberately never recomputed on a later switch (`open_file` with
-    /// `establish_root: false`, from `UserEvent::SwitchFile`): `GET
+    /// Never recomputed as a *side effect* of a later switch (`open_file`
+    /// with `establish_root: false`, from `UserEvent::SwitchFile`): `GET
     /// /tree`/`PUT /open` need a stable scope that survives descending
     /// into a subdirectory, or switching back out of one would 404 (the
     /// switch's new file's own parent might be a subdirectory of the real
     /// root, or — after switching back — the root itself again; recomputing
     /// it from "whatever's open right now" on every switch would make the
-    /// scope drift with it). See `routes::handle`'s docs for the full
+    /// scope drift with it). It *is* deliberately reassignable through one
+    /// specific, explicit user action — `PUT /pick-root` (the tree pane's
+    /// folder button) or the macOS ⌘⇧O menu item — which is the only other
+    /// thing besides `open_file` that's ever allowed to write here; see
+    /// [`set_root_dir`] (the single write site both funnel through) and
+    /// [`reestablish_root`] for how that path decides what happens to the
+    /// window's currently open file and history when the root underneath
+    /// them moves. See `routes::handle`'s docs for the read-boundary
     /// rationale, and `routes::tree_root_dir` for how a `None` here (only
     /// ever true for `server.rs`, which has no `WindowCtx` at all) falls
     /// back to the pre-fix `asset_parent_dir(file)` behavior.
@@ -561,6 +590,16 @@ pub fn run(initial: Vec<PathBuf>, allow_remote_images: bool) -> Result<()> {
                     open_in_window_or_new(&mut windows, target, path, &factory);
                 }
             }
+            Event::UserEvent(UserEvent::PickRootMenu) => {
+                // Resolved to the frontmost window here, at the moment the
+                // event actually arrives — see this variant's own docs for
+                // why the menu handler can't do that itself.
+                if let Some(id) = focused_window_id(&windows) {
+                    if let Some(ctx) = windows.get_mut(&id) {
+                        pick_and_reestablish_root(ctx);
+                    }
+                }
+            }
             Event::UserEvent(UserEvent::Zoom(dir)) => {
                 if let Some(ctx) = focused_window_id(&windows).and_then(|id| windows.get(&id)) {
                     let script = format!(
@@ -615,6 +654,15 @@ pub fn run(initial: Vec<PathBuf>, allow_remote_images: bool) -> Result<()> {
                             open_file(ctx, path, false, true);
                         }
                     }
+                }
+            }
+            Event::UserEvent(UserEvent::PickRoot(window_id)) => {
+                // A window that's since closed (a race between the request
+                // and `CloseRequested`) is silently a no-op, same treatment
+                // every other best-effort post-startup action in this
+                // module gets.
+                if let Some(ctx) = windows.get_mut(&window_id) {
+                    pick_and_reestablish_root(ctx);
                 }
             }
             Event::UserEvent(UserEvent::Navigate(direction, window_id)) => {
@@ -1011,7 +1059,7 @@ fn open_file(ctx: &mut WindowCtx, path: PathBuf, establish_root: bool, push_hist
     ctx.canonical_file = Some(canonical.clone());
     if establish_root {
         let root = canonical_or_given(routes::asset_parent_dir(&path));
-        *ctx.root_dir.lock().expect("root dir mutex poisoned") = Some(root);
+        set_root_dir(ctx, root);
     }
     if push_history {
         let mut history = ctx.history.lock().expect("history mutex poisoned");
@@ -1027,6 +1075,163 @@ fn open_file(ctx: &mut WindowCtx, path: PathBuf, establish_root: bool, push_hist
     ctx.watcher = start_watch(&path, &ctx.version);
     ctx.version.fetch_add(1, Ordering::SeqCst);
     ctx.window.set_title(&window_title(Some(&path)));
+}
+
+/// The single write site for [`WindowCtx::root_dir`] — called from
+/// `open_file`'s `establish_root: true` branch (a window's very first
+/// file) and from [`reestablish_root`] (`PUT /pick-root`/⌘⇧O, reassigning
+/// it after the fact). Factored out purely so "there is exactly one place
+/// this field is ever written" — the invariant its own doc comment states
+/// — stays true in the source, not just by convention as more ways to
+/// reach it get added.
+fn set_root_dir(ctx: &mut WindowCtx, root: PathBuf) {
+    *ctx.root_dir.lock().expect("root dir mutex poisoned") = Some(root);
+}
+
+/// Whether `file` (a window's cached [`WindowCtx::canonical_file`]) is
+/// still inside `new_root` — the pure decision half of [`reestablish_root`],
+/// split out so it can be unit-tested without a real `WindowCtx` (which
+/// needs a live `WebView`/`Window`, not available to `#[cfg(test)]` here —
+/// see this module's own doc comment on why GUI/event-loop code is mostly
+/// exercised by hand instead). `new_root` is expected to already be
+/// canonicalized (as [`reestablish_root`] does before calling this);
+/// `file` may or may not be, though in practice it always is too (see
+/// [`WindowCtx::canonical_file`]).
+fn file_stays_under_root(file: Option<&Path>, new_root: &Path) -> bool {
+    file.is_some_and(|file| file.starts_with(new_root))
+}
+
+/// Opens the OS-native "choose a folder" dialog, pre-selecting `initial` (a
+/// window's current `root_dir`, if any) via `set_directory` — mirrors
+/// [`pick_file_dialog`], just `pick_folder` instead of `pick_file` and no
+/// extension filter (a folder has none to filter on). Returns `None` if the
+/// user cancels. Deliberately the *only* thing in this module that talks to
+/// `rfd` for this feature — [`reestablish_root`] (the part that actually
+/// applies the result) takes a plain `PathBuf` and knows nothing about
+/// dialogs, which is what keeps that half unit-testable (via
+/// [`file_stays_under_root`]) despite this half not being.
+fn pick_folder_dialog(initial: Option<&Path>) -> Option<PathBuf> {
+    let mut dialog = rfd::FileDialog::new();
+    if let Some(dir) = initial {
+        dialog = dialog.set_directory(dir);
+    }
+    dialog.pick_folder()
+}
+
+/// The script [`reestablish_root`]'s `stays_open` branch evaluates: refresh
+/// the tree pane (`assets/tree.js`'s `window.__mdviewTree.reload()`) *and*
+/// the doc header's back/forward buttons and root-relative path label
+/// (`assets/viewer.js`'s `window.__mdviewViewer.refreshDocHeader()`) —
+/// without a full `load_url`, so the document itself (scroll position,
+/// selection, review highlighting) stays untouched. Both are guarded with
+/// `&&` the same way every other `evaluate_script` call in this module
+/// guards its target (the hook might not exist yet if this somehow raced
+/// page setup).
+const TREE_AND_DOC_HEADER_REFRESH_SCRIPT: &str = "\
+    window.__mdviewTree && window.__mdviewTree.reload && window.__mdviewTree.reload(); \
+    window.__mdviewViewer && window.__mdviewViewer.refreshDocHeader && window.__mdviewViewer.refreshDocHeader();";
+
+/// Reassigns `ctx`'s file-tree root to `picked` (as returned by
+/// [`pick_folder_dialog`], not yet canonicalized) — the effect of a
+/// successful `PUT /pick-root`/⌘⇧O. Canonicalizes it first via
+/// [`canonical_or_given`] (falling back to the path as given if that fails,
+/// though a folder a native dialog just returned should always exist).
+///
+/// If the window's currently open file is still inside the new root (see
+/// [`file_stays_under_root`]), it's left completely alone — no reload, no
+/// watcher change, no version bump — so the document's scroll position/
+/// selection/review highlighting all survive untouched; [`set_root_dir`]
+/// alone is enough (the file is, by construction, under *both* the old and
+/// the new root for the whole transition — see below — so there's no
+/// window where `file`/`root_dir` disagree). Only the tree pane and doc
+/// header are told to refresh, via `evaluate_script` running
+/// [`TREE_AND_DOC_HEADER_REFRESH_SCRIPT`] — deliberately *not* the
+/// live-reload `onBodyReplaced` path, since no body was replaced here.
+///
+/// If the file is *not* inside the new root (or there was no file open at
+/// all), the window falls back to the empty "drop a file here" state — the
+/// *document* pane starts empty the same way a brand-new window's does,
+/// though unlike a truly new window this one already has `root_dir: Some`
+/// (just established above), so its tree pane still shows the new root's
+/// contents rather than the 409 a brand-new empty window's `GET /tree`
+/// would give (see `routes::handle_tree`'s docs) — by clearing `file`/
+/// `canonical_file`/the watcher/the title *before* [`set_root_dir`], then
+/// reloading the WebView (`load_url`, same as `open_file` does on every
+/// switch, which itself re-syncs the doc header for free via the fresh
+/// page's own `initDocHeader()`).
+///
+/// That ordering — clear the old file first, *then* move `root_dir` — is
+/// the whole point of splitting this into two branches instead of always
+/// calling [`set_root_dir`] up front: [`protocol_response`] (running
+/// concurrently on the WebView's own protocol-handler thread) reads
+/// `file`/`root_dir`/`history` through three *independent* `Mutex`es, one
+/// short-lived lock at a time, never all three held together — so it can
+/// observe any interleaving of this function's individual writes, not just
+/// the state before or after it as a whole. Setting `root_dir` to the new
+/// value while `file` still named the *old* (now out-of-root) file would
+/// let a `GET /tree` landing in that window observe exactly that
+/// mismatched pair; `tree_relative_path` would then fall back to a bare
+/// file name for `"current"`, and if a same-named file happens to sit at
+/// the new root's top level, `assets/tree.js`'s `highlightCurrent()` would
+/// wrongly highlight it. Clearing `file` to `None` first instead means the
+/// only intermediate states any request can ever observe are `(file: old,
+/// root: old)` and `(file: None, root: old)` (both already-valid,
+/// already-existing pairs — a `None` file with a `Some` root is exactly
+/// what an ordinary empty window looks like) before landing on `(file:
+/// None, root: new)`. No lock is ever held while acquiring another here —
+/// each of `set_root_dir`/the `file` clear/the `history` clear locks,
+/// writes, and immediately releases its own `Mutex` in turn — so this
+/// ordering constraint is about which *intermediate states* become briefly
+/// observable, not about lock nesting/deadlock avoidance.
+///
+/// Either way, [`WindowCtx::history`] is cleared to `None`: every entry in
+/// it names a path under the *old* root, and `root_dir` is never
+/// recomputed once established except through this very function (see that
+/// field's docs) — so once the boundary itself has just moved, keeping any
+/// of the old entries around would violate "every history entry lives
+/// under the window's current root_dir".
+fn reestablish_root(ctx: &mut WindowCtx, picked: PathBuf) {
+    let root = canonical_or_given(&picked);
+    let stays_open = file_stays_under_root(ctx.canonical_file.as_deref(), &root);
+
+    if stays_open {
+        set_root_dir(ctx, root);
+        *ctx.history.lock().expect("history mutex poisoned") = None;
+        if let Err(err) = ctx
+            .webview
+            .evaluate_script(TREE_AND_DOC_HEADER_REFRESH_SCRIPT)
+        {
+            eprintln!("warning: failed to refresh the file tree: {err}");
+        }
+    } else {
+        // Clear the old file *before* moving `root_dir` — see the ordering
+        // rationale in this function's own doc comment above.
+        ctx.canonical_file = None;
+        *ctx.file.lock().expect("file state mutex poisoned") = None;
+        ctx.watcher = None;
+        ctx.window.set_title(&window_title(None));
+        set_root_dir(ctx, root);
+        *ctx.history.lock().expect("history mutex poisoned") = None;
+        if let Err(err) = ctx.webview.load_url(INITIAL_URL) {
+            eprintln!("warning: failed to reload the view: {err}");
+        }
+    }
+}
+
+/// Opens the folder dialog (pre-selected at `ctx`'s current `root_dir`) and,
+/// if the user picks one, applies it — the shared tail both
+/// [`UserEvent::PickRootMenu`] and [`UserEvent::PickRoot`] run once each has
+/// resolved its own way to a specific `&mut WindowCtx` (frontmost window vs.
+/// the exact window the `PUT /pick-root` request came in on).
+fn pick_and_reestablish_root(ctx: &mut WindowCtx) {
+    let initial = ctx
+        .root_dir
+        .lock()
+        .expect("root dir mutex poisoned")
+        .clone();
+    if let Some(folder) = pick_folder_dialog(initial.as_deref()) {
+        reestablish_root(ctx, folder);
+    }
 }
 
 /// `path.canonicalize()`, or `path` itself if that fails (most likely
@@ -1305,6 +1510,9 @@ fn protocol_response(
         routes::Action::Navigate(direction) => {
             let _ = proxy.send_event(UserEvent::Navigate(direction, window_id));
         }
+        routes::Action::PickRoot => {
+            let _ = proxy.send_event(UserEvent::PickRoot(window_id));
+        }
         routes::Action::None => {}
     }
     if debug {
@@ -1448,6 +1656,7 @@ fn install_menu(proxy: &EventLoopProxy<UserEvent>) -> Result<muda::Menu> {
     use muda::{Menu, MenuEvent, MenuItem, PredefinedMenuItem, Submenu};
 
     const OPEN_ITEM_ID: &str = "open";
+    const OPEN_FOLDER_ITEM_ID: &str = "open-folder";
     const ZOOM_IN_ITEM_ID: &str = "zoom-in";
     const ZOOM_OUT_ITEM_ID: &str = "zoom-out";
     const ZOOM_RESET_ITEM_ID: &str = "zoom-reset";
@@ -1465,7 +1674,20 @@ fn install_menu(proxy: &EventLoopProxy<UserEvent>) -> Result<muda::Menu> {
         true,
         Some(Accelerator::new(Some(Modifiers::SUPER), Code::KeyO)),
     );
-    let file = Submenu::with_items("File", true, &[&open])?;
+    // Re-picks the frontmost window's file-tree root — see
+    // `UserEvent::PickRootMenu`/`reestablish_root`. Same feature the tree
+    // pane's own folder button reaches via `PUT /pick-root`; this is just
+    // the macOS menu/accelerator route to it.
+    let open_folder = MenuItem::with_id(
+        OPEN_FOLDER_ITEM_ID,
+        "Open Folder…",
+        true,
+        Some(Accelerator::new(
+            Some(Modifiers::SUPER | Modifiers::SHIFT),
+            Code::KeyO,
+        )),
+    );
+    let file = Submenu::with_items("File", true, &[&open, &open_folder])?;
     let edit = Submenu::with_items(
         "Edit",
         true,
@@ -1512,6 +1734,8 @@ fn install_menu(proxy: &EventLoopProxy<UserEvent>) -> Result<muda::Menu> {
     MenuEvent::set_event_handler(Some(move |event: MenuEvent| {
         let user_event = if event.id() == OPEN_ITEM_ID {
             Some(UserEvent::PickFile)
+        } else if event.id() == OPEN_FOLDER_ITEM_ID {
+            Some(UserEvent::PickRootMenu)
         } else if event.id() == ZOOM_IN_ITEM_ID {
             Some(UserEvent::Zoom(ZoomDir::In))
         } else if event.id() == ZOOM_OUT_ITEM_ID {
@@ -1622,5 +1846,48 @@ mod tests {
         // is needed there.
         assert!("mdview://localhost/body".starts_with("mdview://"));
         assert!(!"mdview-evil://localhost/".starts_with("mdview://"));
+    }
+
+    // `file_stays_under_root` is `reestablish_root`'s pure decision half —
+    // see its own doc comment for why the rest of that function (touching a
+    // real `WebView`/`Window`) isn't unit-tested here.
+    #[test]
+    fn file_stays_under_root_is_true_for_a_file_inside_the_new_root() {
+        assert!(file_stays_under_root(
+            Some(Path::new("/new/root/sub/doc.md")),
+            Path::new("/new/root"),
+        ));
+    }
+
+    #[test]
+    fn file_stays_under_root_is_true_for_a_file_directly_in_the_new_root() {
+        assert!(file_stays_under_root(
+            Some(Path::new("/new/root/doc.md")),
+            Path::new("/new/root"),
+        ));
+    }
+
+    #[test]
+    fn file_stays_under_root_is_false_for_a_file_outside_the_new_root() {
+        assert!(!file_stays_under_root(
+            Some(Path::new("/elsewhere/doc.md")),
+            Path::new("/new/root"),
+        ));
+    }
+
+    #[test]
+    fn file_stays_under_root_is_false_for_a_sibling_path_sharing_a_prefix() {
+        // `/new/root-2/doc.md` textually starts with "/new/root" as a
+        // *string*, but not as a `Path` component prefix — must not be
+        // mistaken for something inside `/new/root`.
+        assert!(!file_stays_under_root(
+            Some(Path::new("/new/root-2/doc.md")),
+            Path::new("/new/root"),
+        ));
+    }
+
+    #[test]
+    fn file_stays_under_root_is_false_when_no_file_is_open() {
+        assert!(!file_stays_under_root(None, Path::new("/new/root")));
     }
 }

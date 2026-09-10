@@ -331,3 +331,34 @@ comments and export" and "Platform notes" sections).
       useful either way — if the app wasn't already running, this opens an
       empty window plus, after a short grace period, a file-picker dialog; if
       it was already running, nothing happens at all.
+
+## 12. File-tree root re-picking (`PUT /pick-root`, native window only)
+
+Manual verification items for re-establishing a window's file-tree root (see README's
+"File tree and multi-window navigation" section and `docs/SECURITY.md`'s "Re-establishing
+`root_dir`" bullet). `PUT /pick-root` is `501` in `--browser` mode, so none of this
+applies there beyond the last item.
+
+- [ ] Clicking the tree header's folder button opens the OS-native "choose a folder"
+      dialog. On macOS, `⌘⇧O` (File ▸ Open Folder…) does the same for whichever window
+      is frontmost.
+- [ ] The dialog's initial location is the window's current root folder.
+- [ ] Picking a folder that contains the currently open file (e.g. a parent of the
+      current root): the file stays open exactly as it was — scroll position, block
+      selection, and review highlighting are all untouched — and only the tree pane
+      redraws, rooted at the newly picked folder.
+- [ ] Picking a folder that does *not* contain the currently open file: the document
+      pane goes to its empty "drop a file here" state, but the tree pane still shows
+      the newly picked folder's contents (not blank, and not a "no file open"
+      placeholder).
+- [ ] Cancelling the dialog changes nothing — same file open, same tree, same history.
+- [ ] After either kind of successful re-pick, the doc header's Back/Forward buttons
+      reflect the just-cleared history (both disabled) rather than whatever
+      enabled/disabled state they had before the re-pick.
+- [ ] After either kind of successful re-pick, the doc header's path label reflects
+      the current file's path relative to the *new* root (empty if the document pane
+      fell back to the empty state).
+- [ ] Clicking the folder button again while a dialog from a previous click is still
+      open (or while its request is still in flight) doesn't queue up a second dialog
+      — the button is disabled meanwhile.
+- [ ] In `--browser` mode, the tree header's folder button doesn't appear at all.

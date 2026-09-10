@@ -39,10 +39,12 @@ This document summarizes the results of a security audit performed on `markdown-
       can manipulate the filesystem at that exact moment (the same exposure `--browser`
       already carries).
   - Other `.md`/`.markdown`/`.txt` files under `root_dir` (the parent directory of the
-    **first file that window ever opened**, canonicalized, and fixed for the lifetime
-    of that window — never recomputed on a later switch, so `GET /tree`'s listing and
-    `PUT /open`'s switch target both stay confined to that same directory for as long
-    as the window is open). There are two ways to
+    **first file that window ever opened**, canonicalized, and fixed for as long as
+    the window keeps that root — never recomputed as a *side effect* of a later file
+    switch, so `GET /tree`'s listing and `PUT /open`'s switch target both stay
+    confined to that same directory across ordinary navigation. It can still move,
+    but only through one explicit, user-driven action — see "Re-establishing
+    `root_dir`" below, which is the *only* other way it's ever written). There are two ways to
     reach one: clicking an entry in the left-hand file tree, and clicking a relative
     link in the document body (`.md`/`.markdown` only, `assets/viewer.js`). The latter
     means the input feeding `path` in `PUT /open` now ranges from "the list this app
@@ -120,6 +122,35 @@ This document summarizes the results of a security audit performed on `markdown-
   `X-Mdview-Request` header (missing it returns `403`), and it always answers `501`
   under `--browser` (only meaningful in the native window — `--browser` has no notion
   of per-window history at all).
+- `PUT /pick-root` (the file tree's folder button, or ⌘⇧O) re-establishes the current
+  window's `root_dir` — the one deliberate exception to "fixed for the lifetime of the
+  window" described above. It requires the `X-Mdview-Request` header (missing it
+  returns `403`) and always answers `501` under `--browser` (which has no window/root
+  concept to reassign), same as `PUT /open`/`PUT /nav`. The important property: **this
+  route never reads its own request body at all** — there is no `path`/`root`/anything
+  else it looks for in there, so a client cannot choose the new root by sending one
+  over HTTP/the custom protocol, no matter what the body contains (a request with a
+  JSON body naming an arbitrary path behaves identically to one with no body at all).
+  A successful request only ever gets a `202` back and a promise that the native app
+  will, on its own event loop, open the OS's native "choose a folder" dialog; the path
+  that actually becomes the new `root_dir` is whatever the user picks in *that*
+  dialog, never anything that arrived as request input. This makes re-establishing
+  `root_dir` exactly as trustworthy as establishing it the first time (the window's
+  very first file, via a CLI argument, ⌘O, drag-and-drop, or Finder's "Open" —
+  see above): both are values a human chose through an OS-owned picker, never a string
+  parsed out of a network-facing request. Once the dialog resolves: if the window's
+  currently open file is still inside the new root, it's left completely alone (no
+  reload — scroll position/selection/review highlighting all survive) and only the
+  tree pane (and the doc header's back/forward buttons/path label) refresh; otherwise
+  the *document* pane falls back to its empty "no file open" state — but, unlike a
+  truly new window (which has no `root_dir` at all yet, so `GET /tree` answers `409`
+  and shows nothing), this window already has `root_dir: Some(<new root>)` at that
+  point, so its file tree keeps showing the new root's contents rather than going
+  blank too. Either way, that window's `PUT /nav` history is
+  cleared — every entry in it names a path under the *old* root, and (per the history
+  bullet above) `PUT /nav` never re-validates a history entry against the current
+  `root_dir`, so keeping old entries around after the boundary itself moved would
+  reopen exactly the class of risk re-validation exists to avoid.
 
 ## Exceptions (deliberately outside the guarded surface)
 

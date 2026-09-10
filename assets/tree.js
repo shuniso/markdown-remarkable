@@ -14,6 +14,7 @@
 
   var TREE_URL = "/tree";
   var OPEN_URL = "/open";
+  var PICK_ROOT_URL = "/pick-root";
   var REQUEST_HEADERS = { "X-Mdview-Request": "1" };
 
   // Whole-pane width/collapse — mirrors assets/review.js's
@@ -35,8 +36,12 @@
     entries: [],
     truncated: false,
     loading: true,
-    // True only for the specific "no file open yet" case (GET /tree ->
-    // 409) — mirrors assets/review.js's state.noFileOpen.
+    // True only for the specific "no root established at all yet" case
+    // (GET /tree -> 409) — mirrors assets/review.js's state.noFileOpen.
+    // Note this is *not* "no file is currently open": once a root exists
+    // (this window's first file, or a later PUT /pick-root), GET /tree
+    // succeeds and shows the tree even with no file open — see
+    // routes::handle_tree's docs.
     noFileOpen: false,
     error: null,
   };
@@ -434,6 +439,61 @@
       });
   }
 
+  // True while a PUT /pick-root request is in flight — guards buildHeader()'s
+  // folder button against a rapid double-click re-issuing the request (which
+  // would queue up a second native dialog behind the first). This only
+  // covers the request round-trip itself (typically near-instant — the
+  // server answers 202 before the dialog even opens, see pickRoot()'s own
+  // comment below); it re-enables as soon as that response lands, not once
+  // the dialog itself closes, since nothing here is ever told when that
+  // happens (a cancelled dialog never triggers app.rs's reestablish_root at
+  // all, so no reload/evaluate_script arrives to hang a "done" signal off
+  // of). Good enough to stop rapid-click spam without pretending to track
+  // the dialog's own lifetime.
+  var pickRootPending = false;
+
+  function pickRoot() {
+    if (pickRootPending) {
+      return;
+    }
+    pickRootPending = true;
+    render();
+    // Fire-and-forget beyond this guard: a 202 here means the native app is
+    // about to open its OS-native folder dialog on the event loop's own
+    // thread (see app.rs's UserEvent::PickRoot/PickRootMenu) — nothing in
+    // *this* response says what the user picked, or whether they
+    // cancelled. Whatever happens next arrives asynchronously, via app.rs's
+    // reestablish_root calling either window.__mdviewTree.reload()
+    // (current file stays open, under the new root) or a full page reload
+    // (current file falls outside the new root, or there wasn't one) —
+    // see this file's own `reload` export below.
+    fetch(PICK_ROOT_URL, {
+      method: "PUT",
+      cache: "no-store",
+      headers: REQUEST_HEADERS,
+    })
+      .then(function (response) {
+        if (response.ok) {
+          return;
+        }
+        return response
+          .json()
+          .then(function (payload) {
+            state.error = errorMessage(payload, "Couldn't open the folder picker");
+          })
+          .catch(function () {
+            state.error = "Couldn't open the folder picker";
+          });
+      })
+      .catch(function () {
+        state.error = "Couldn't open the folder picker";
+      })
+      .then(function () {
+        pickRootPending = false;
+        render();
+      });
+  }
+
   // -- rendering ------------------------------------------------------------
 
   function buildRow(entry) {
@@ -468,6 +528,15 @@
   function buildHeader() {
     var header = el("div", "tree-header");
     header.appendChild(el("span", "tree-root-name", state.root));
+    var folderBtn = button("tree-folder-btn icon-btn", "", function () {
+      pickRoot();
+    });
+    // Disabled while a PUT /pick-root request is in flight — see
+    // pickRootPending's own comment.
+    folderBtn.disabled = pickRootPending;
+    folderBtn.setAttribute("aria-label", "Open folder…");
+    folderBtn.title = "Open folder… (⌘⇧O)";
+    header.appendChild(folderBtn);
     var collapseBtn = button(
       "tree-collapse-btn icon-btn chevron-left",
       "",
@@ -565,6 +634,13 @@
     getCurrent: function () {
       return state.current;
     },
+    // Called from app.rs's reestablish_root (via evaluate_script) once
+    // PUT /pick-root's dialog moves root_dir but the currently open file
+    // stays open (still inside the new root) — just refetches GET /tree
+    // against the new root. Deliberately not routed through
+    // onBodyReplaced: no body was replaced, so re-running that would
+    // needlessly imply a live-reload happened.
+    reload: loadTree,
   };
 
   function init() {
