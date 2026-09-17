@@ -168,6 +168,34 @@ impl ZoomDir {
     }
 }
 
+/// Which of the three reading widths a `View ▸ Standard/Wide/Full Width`
+/// menu item (or its accelerator) selects. Forwarded to the focused
+/// window's WebView as
+/// `window.__mdviewViewer.setContentWidth("standard" | "wide" | "full")` —
+/// see `assets/viewer.js` and [`UserEvent::ContentWidth`].
+///
+/// Same macOS-only construction story as [`ZoomDir`]: every variant is
+/// only ever built inside `install_menu`, so each still needs its own
+/// dead_code allowance on non-macOS builds.
+enum ContentWidthMode {
+    #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+    Standard,
+    #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+    Wide,
+    #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+    Full,
+}
+
+impl ContentWidthMode {
+    fn as_js_arg(&self) -> &'static str {
+        match self {
+            ContentWidthMode::Standard => "standard",
+            ContentWidthMode::Wide => "wide",
+            ContentWidthMode::Full => "full",
+        }
+    }
+}
+
 /// Events posted to the loop from outside it: a window's drag&drop handler,
 /// the menu handler, and (on macOS) the OS asking us to open a document
 /// (handled directly in the `Event::Opened` arm, not via this enum).
@@ -192,6 +220,13 @@ enum UserEvent {
     /// frontmost window, same as `PickFile`.
     #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
     Zoom(ZoomDir),
+    /// Only the macOS menu's View submenu's Standard/Wide/Full Width items
+    /// post this — see [`install_menu`]. Other platforms have no menu bar
+    /// at all; their content-width shortcuts are handled entirely in
+    /// `assets/viewer.js`, same as [`UserEvent::Zoom`]. Applies to the
+    /// frontmost window, same as `PickFile`.
+    #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+    ContentWidth(ContentWidthMode),
     /// Only the macOS menu's View ▸ Reload posts this — see
     /// [`install_menu`]. `assets/review.js` handles ⌘R/Ctrl+R directly with
     /// `location.reload()` everywhere else (including in every native
@@ -608,6 +643,17 @@ pub fn run(initial: Vec<PathBuf>, allow_remote_images: bool) -> Result<()> {
                     );
                     if let Err(err) = ctx.webview.evaluate_script(&script) {
                         eprintln!("warning: failed to change zoom: {err}");
+                    }
+                }
+            }
+            Event::UserEvent(UserEvent::ContentWidth(mode)) => {
+                if let Some(ctx) = focused_window_id(&windows).and_then(|id| windows.get(&id)) {
+                    let script = format!(
+                        "window.__mdviewViewer && window.__mdviewViewer.setContentWidth('{}')",
+                        mode.as_js_arg()
+                    );
+                    if let Err(err) = ctx.webview.evaluate_script(&script) {
+                        eprintln!("warning: failed to change content width: {err}");
                     }
                 }
             }
@@ -1641,10 +1687,12 @@ fn window_title(file: Option<&Path>) -> String {
 /// shortcuts (Cmd+Q, Cmd+W, Cmd+C, Cmd+A) work in any window. File ▸ Open…
 /// (Cmd+O) posts [`UserEvent::PickFile`] back to the event loop; the View
 /// submenu's Zoom In/Out/Actual Size/Reload post [`UserEvent::Zoom`]/
-/// [`UserEvent::Reload`] — `run` resolves all three to whichever window is
-/// currently frontmost (see [`focused_window_id`]) and turns them into an
-/// `evaluate_script` call into `assets/viewer.js` (zoom) or a full
-/// `load_url` (reload) on that window's WebView. Window ▸ Close closes just
+/// [`UserEvent::Reload`], and its Standard/Wide/Full Width items (below a
+/// separator) post [`UserEvent::ContentWidth`] — `run` resolves all of
+/// these to whichever window is currently frontmost (see
+/// [`focused_window_id`]) and turns them into an `evaluate_script` call
+/// into `assets/viewer.js` (zoom, content width) or a full `load_url`
+/// (reload) on that window's WebView. Window ▸ Close closes just
 /// the frontmost window natively (see `run`'s doc comment). Because these
 /// accelerators are handled by the menu, the corresponding keydown never
 /// reaches any WebView at all on macOS, so `assets/viewer.js`'s own
@@ -1661,6 +1709,9 @@ fn install_menu(proxy: &EventLoopProxy<UserEvent>) -> Result<muda::Menu> {
     const ZOOM_OUT_ITEM_ID: &str = "zoom-out";
     const ZOOM_RESET_ITEM_ID: &str = "zoom-reset";
     const RELOAD_ITEM_ID: &str = "reload";
+    const CONTENT_WIDTH_STANDARD_ITEM_ID: &str = "content-width-standard";
+    const CONTENT_WIDTH_WIDE_ITEM_ID: &str = "content-width-wide";
+    const CONTENT_WIDTH_FULL_ITEM_ID: &str = "content-width-full";
 
     let menu = Menu::new();
     let app = Submenu::with_items(
@@ -1720,7 +1771,58 @@ fn install_menu(proxy: &EventLoopProxy<UserEvent>) -> Result<muda::Menu> {
         true,
         Some(Accelerator::new(Some(Modifiers::SUPER), Code::KeyR)),
     );
-    let view = Submenu::with_items("View", true, &[&zoom_in, &zoom_out, &zoom_reset, &reload])?;
+    // Reading width — see `ContentWidthMode`/`UserEvent::ContentWidth`.
+    // Cmd+Shift+1/2/0 rather than the more obvious Cmd+Shift+1/2/3: macOS
+    // reserves Cmd+Shift+3/4/5(/6) system-wide for screenshots, which would
+    // either not reach this accelerator at all or shadow it depending on
+    // the OS version — 0 stands in for "full" (no cap), echoing zoom's own
+    // Cmd+0 "back to the unmodified state". Plain Cmd+Alt+1/2/3 was ruled
+    // out too: `assets/viewer.js`'s keydown handler (Windows/Linux and
+    // `--browser`) deliberately ignores every Ctrl/Cmd shortcut while
+    // `event.altKey` is set, since AltGr (many European layouts) arrives as
+    // Ctrl+Alt and would otherwise misfire it on ordinary typing — see that
+    // handler's own comment.
+    let content_width_standard = MenuItem::with_id(
+        CONTENT_WIDTH_STANDARD_ITEM_ID,
+        "Standard Width",
+        true,
+        Some(Accelerator::new(
+            Some(Modifiers::SUPER | Modifiers::SHIFT),
+            Code::Digit1,
+        )),
+    );
+    let content_width_wide = MenuItem::with_id(
+        CONTENT_WIDTH_WIDE_ITEM_ID,
+        "Wide Width",
+        true,
+        Some(Accelerator::new(
+            Some(Modifiers::SUPER | Modifiers::SHIFT),
+            Code::Digit2,
+        )),
+    );
+    let content_width_full = MenuItem::with_id(
+        CONTENT_WIDTH_FULL_ITEM_ID,
+        "Full Width",
+        true,
+        Some(Accelerator::new(
+            Some(Modifiers::SUPER | Modifiers::SHIFT),
+            Code::Digit0,
+        )),
+    );
+    let view = Submenu::with_items(
+        "View",
+        true,
+        &[
+            &zoom_in,
+            &zoom_out,
+            &zoom_reset,
+            &reload,
+            &PredefinedMenuItem::separator(),
+            &content_width_standard,
+            &content_width_wide,
+            &content_width_full,
+        ],
+    )?;
     let window = Submenu::with_items("Window", true, &[&PredefinedMenuItem::close_window(None)])?;
     menu.append(&app)?;
     menu.append(&file)?;
@@ -1744,6 +1846,12 @@ fn install_menu(proxy: &EventLoopProxy<UserEvent>) -> Result<muda::Menu> {
             Some(UserEvent::Zoom(ZoomDir::Reset))
         } else if event.id() == RELOAD_ITEM_ID {
             Some(UserEvent::Reload)
+        } else if event.id() == CONTENT_WIDTH_STANDARD_ITEM_ID {
+            Some(UserEvent::ContentWidth(ContentWidthMode::Standard))
+        } else if event.id() == CONTENT_WIDTH_WIDE_ITEM_ID {
+            Some(UserEvent::ContentWidth(ContentWidthMode::Wide))
+        } else if event.id() == CONTENT_WIDTH_FULL_ITEM_ID {
+            Some(UserEvent::ContentWidth(ContentWidthMode::Full))
         } else {
             None
         };
@@ -1770,6 +1878,26 @@ fn install_menu(_proxy: &EventLoopProxy<UserEvent>) -> Result<NoMenu> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // `as_js_arg`'s match arms are only ever exercised via `install_menu`
+    // (macOS-only, and only when a menu item is actually clicked), so these
+    // pin down the string vocabulary `assets/viewer.js`'s
+    // `setContentWidth` expects directly, on every platform `cargo test`
+    // runs on.
+    #[test]
+    fn content_width_mode_as_js_arg_standard() {
+        assert_eq!(ContentWidthMode::Standard.as_js_arg(), "standard");
+    }
+
+    #[test]
+    fn content_width_mode_as_js_arg_wide() {
+        assert_eq!(ContentWidthMode::Wide.as_js_arg(), "wide");
+    }
+
+    #[test]
+    fn content_width_mode_as_js_arg_full() {
+        assert_eq!(ContentWidthMode::Full.as_js_arg(), "full");
+    }
 
     // `request_path` is what feeds `RouteRequest::path` in
     // `protocol_response` — see its doc comment for why `Uri::path()` alone

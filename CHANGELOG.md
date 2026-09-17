@@ -7,6 +7,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- Reading width can now be switched between Standard (55rem, the previous
+  fixed width), Wide (80rem), and Full (no cap) via the macOS View menu
+  (Standard/Wide/Full Width, ⌘⇧1/⌘⇧2/⌘⇧0) or the same shortcuts handled in
+  JS on Windows/Linux and `--browser` mode. The choice persists across
+  reloads the same way zoom does (`localStorage` key
+  `mdview.contentWidth`); `--export`'s embedded HTML never loads the
+  viewer script, so it always renders at the standard width.
+
 ## [0.2.0] - 2026-09-10
 
 ### Added

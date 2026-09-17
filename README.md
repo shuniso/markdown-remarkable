@@ -95,10 +95,11 @@ window's back/forward history is cleared either way, since every entry in
 it names a path under the folder that just stopped being the root.
 
 Each `FILE` on the command line gets its own independent native window —
-own watcher, title, zoom level, and history — cascaded slightly down and to
-the right of the last one so new windows don't stack exactly on top of each
-other. Closing a window (⌘W) only closes that one; the app quits once every
-window is closed, or all at once on ⌘Q. `--browser` mode has no per-window
+own watcher, title, zoom level, reading width, and history — cascaded
+slightly down and to the right of the last one so new windows don't stack
+exactly on top of each other. Closing a window (⌘W) only closes that one;
+the app quits once
+every window is closed, or all at once on ⌘Q. `--browser` mode has no per-window
 history, and a relative link is just left to the browser's own default
 click behavior — but the file tree still renders in `--browser`; switching
 files from it (and the back/forward buttons) is disabled, since `PUT
@@ -144,6 +145,7 @@ macOS uses Cmd; Windows/Linux use Ctrl for the same shortcuts unless noted.
 | ⌘Q | Quit — closes every window at once (macOS menu only) |
 | ⌘R | Reload |
 | ⌘+ / ⌘- / ⌘0 | Zoom in / out / reset |
+| ⌘⇧1 / ⌘⇧2 / ⌘⇧0 | Reading width: standard / wide / full |
 | ⌘[ / ⌘] | Navigate back / forward through file history |
 | ⌘⇧E | Toggle the file tree pane |
 | ⌘\ or ⌘J | Toggle the review pane |
@@ -160,10 +162,11 @@ reachable — the doc header's own buttons still work.
 `⌘O`/`⌘W`/`⌘Q` come from the macOS app menu (see Platform notes) and only
 work there; Windows/Linux have no menu bar, so open a file by dragging it
 onto a window or passing it as a CLI argument, and close a window with its
-own close button. On macOS, ⌘R and the zoom shortcuts (⌘+/⌘-/⌘0) are menu
-accelerators from the app menu's View submenu; everywhere else, and for
-every other shortcut in the table above, the same keys are handled in JS
-instead. The effect is identical either way.
+own close button. On macOS, ⌘R, the zoom shortcuts (⌘+/⌘-/⌘0), and the
+reading-width shortcuts (⌘⇧1/⌘⇧2/⌘⇧0) are menu accelerators from the app
+menu's View submenu; everywhere else, and for every other shortcut in the
+table above, the same keys are handled in JS instead. The effect is
+identical either way.
 
 ## CLI reference
 
@@ -261,12 +264,13 @@ The icon comes from `packaging/macos/mdview.icns` (regenerate with
 
 The native windows share a single minimal menu bar on macOS only (Open,
 Quit, Copy, Select All, Close Window, plus a View submenu with Zoom In,
-Zoom Out, Actual Size, and Reload) — this is where `⌘O`/`⌘W`/`⌘Q` and the
-zoom/`⌘R` accelerators come from. On Linux and Windows there's no menu
-bar: open a file by dragging it onto a window or passing it as a CLI
-argument, close a window with its own close button, and use the
-JS-handled shortcuts from the table above (`⌘R`/zoom/history/pane-toggle/
-etc., with Ctrl in place of ⌘) for everything else.
+Zoom Out, Actual Size, Reload, and — below a separator — Standard/Wide/Full
+Width) — this is where `⌘O`/`⌘W`/`⌘Q` and the zoom/`⌘R`/reading-width
+accelerators come from. On Linux and Windows there's no menu bar: open a
+file by dragging it onto a window or passing it as a CLI argument, close a
+window with its own close button, and use the JS-handled shortcuts from the
+table above (`⌘R`/zoom/reading-width/history/pane-toggle/etc., with Ctrl in
+place of ⌘) for everything else.
 
 ### Linux dependencies
 
@@ -310,8 +314,8 @@ terminal's console so `--browser`/`--export` still print their usual
 output there. There's no menu bar (macOS only), so `⌘O`/`⌘W`/`⌘Q` have no
 Windows equivalent: open a file by dragging it onto a window or passing it
 as a CLI argument, and close a window with its own close button. The
-JS-handled shortcuts from the table above (`Ctrl+R`/zoom/history/
-pane-toggle/etc.) work the same as on macOS. `--export`'s same-path and
+JS-handled shortcuts from the table above (`Ctrl+R`/zoom/reading-width/
+history/pane-toggle/etc.) work the same as on macOS. `--export`'s same-path and
 symlink self-overwrite checks apply on Windows too; the additional
 hard-link check is Unix-only.
 

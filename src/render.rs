@@ -28,7 +28,8 @@ const IMAGE_PATH_ENCODE_SET: &AsciiSet = &NON_ALPHANUMERIC
 /// binary needs no external assets at runtime.
 const STYLE_CSS: &str = include_str!("../assets/style.css");
 
-/// The bundled viewer client script (zoom + `window.__mdviewViewer`),
+/// The bundled viewer client script (zoom + reading width +
+/// `window.__mdviewViewer`),
 /// embedded at compile time. Injected right before [`LIVE_JS`] whenever
 /// live-reload is requested — see [`page`].
 const VIEWER_JS: &str = include_str!("../assets/viewer.js");

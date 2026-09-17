@@ -46,7 +46,7 @@ is listed here.
 - [ ] Narrowing the window below 720px automatically fits a width that had been set
       wider (no horizontal scrolling or broken layout shows up in the console).
 
-## 2. Zoom
+## 2. Zoom and reading width
 
 - [ ] `⌘+` / `⌘=` (`Ctrl` on Windows/Linux) enlarges the body and review pane text.
 - [ ] `⌘-` shrinks it.
@@ -64,6 +64,29 @@ is listed here.
 - [ ] On a layout with an AltGr key, typing ordinary characters that involve AltGr
       doesn't misfire zoom (the zoom shortcuts are ignored while `event.altKey` is
       set).
+- [ ] `⌘⇧1` / `⌘⇧2` / `⌘⇧0` (`Ctrl` on Windows/Linux) switch the body between Standard
+      (55rem), Wide (80rem), and Full (no max-width) reading widths.
+- [ ] Native window (macOS): the View menu's Standard/Wide/Full Width items (below the
+      separator after Reload) each switch the body to the width they name (the items
+      carry no checkmark for the active width).
+- [ ] On the macOS native window, mashing both the Width menu items and their keyboard
+      shortcuts doesn't double up (each press applies once; no flicker between widths).
+- [ ] On a layout where Shift+digit yields a digit or "+" (e.g. French AZERTY, Swiss
+      German), `Ctrl+Shift+0` / `Ctrl+Shift+1` (Windows/Linux, `--browser`) switch the
+      reading width instead of resetting or zooming in.
+- [ ] The reading width also switches via the keyboard shortcuts in `--browser` mode
+      (there's no menu there, so only the key shortcuts apply).
+- [ ] The reading width from before a reload is restored after reloading (`localStorage`
+      key `mdview.contentWidth`), the same way the zoom level is.
+- [ ] The reading width survives a live update (saving the file → body replacement).
+- [ ] Reading width and zoom can be combined freely (e.g. Wide width at 150% zoom) —
+      the body's max-width still scales with zoom either way, since both are rem-based.
+- [ ] With multiple windows open, switching the reading width only affects whichever
+      window is currently frontmost (background windows' width doesn't change) — same
+      as zoom (see "Multiple windows" below).
+- [ ] `--export`'s HTML always renders at the standard (55rem) width, regardless of
+      whatever width the live view was showing when exported (the exported HTML never
+      loads `assets/viewer.js`, so it can't read or apply `data-content-width`).
 
 ## 3. Basic interactions
 
@@ -226,9 +249,10 @@ tree and multi-window navigation" section).
 - [ ] Pressing ⌘Q with multiple windows open closes all of them and quits the app.
 - [ ] A newly opened window appears cascaded — offset down and to the right from the
       previous window's position.
-- [ ] Using the macOS View menu (Zoom In/Out/Actual Size/Reload) only affects whichever
-      window is currently frontmost among the open windows (background windows' zoom
-      level/reload state don't change).
+- [ ] Using the macOS View menu (Zoom In/Out/Actual Size/Reload, or
+      Standard/Wide/Full Width) only affects whichever window is currently frontmost
+      among the open windows (background windows' zoom level/reading width/reload
+      state don't change).
 - [ ] Switching windows and then using the View menu affects whichever window is now
       frontmost after the switch.
 - [ ] After moving/resizing any window, check

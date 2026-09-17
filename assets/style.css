@@ -56,6 +56,19 @@ body {
   word-wrap: break-word;
 }
 
+/* Reading width, toggled via `data-content-width` on <html> — see
+   assets/viewer.js's `setContentWidth` function and the View menu's
+   Standard/Wide/Full Width items in app.rs's `install_menu`. Left
+   unattributed (standard, 55rem above) covers `--export`'s embedded HTML
+   too, which never loads viewer.js and so never sets the attribute. */
+html[data-content-width="wide"] .markdown-body {
+  max-width: 80rem;
+}
+
+html[data-content-width="full"] .markdown-body {
+  max-width: none;
+}
+
 .markdown-body h1,
 .markdown-body h2,
 .markdown-body h3,

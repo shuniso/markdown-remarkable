@@ -101,6 +101,48 @@
     return memoryBacked();
   })();
 
+  // Reading width. `document.documentElement`'s `data-content-width`
+  // attribute selects which `.markdown-body` max-width rule in
+  // assets/style.css applies — the unattributed default (55rem) still
+  // covers `--export`'s embedded HTML, which never loads this script.
+  //
+  // Applied before zoom (below) restores its own persisted value, not
+  // after, to keep the first paint as close to the persisted choice as
+  // possible; persisted the same way (via `storage`, above) so it survives
+  // a reload the same way zoom does.
+
+  var CONTENT_WIDTH_STORAGE_KEY = "mdview.contentWidth";
+  var CONTENT_WIDTH_DEFAULT = "standard";
+  var CONTENT_WIDTH_VALUES = ["standard", "wide", "full"];
+
+  // Falls back to the default for anything not in `CONTENT_WIDTH_VALUES` —
+  // an unrecognized/stale localStorage value, or a bad argument to
+  // `setContentWidth` — same "clamp, never throw" spirit as `normalizeZoom`
+  // below.
+  function normalizeContentWidth(value) {
+    return CONTENT_WIDTH_VALUES.indexOf(value) === -1
+      ? CONTENT_WIDTH_DEFAULT
+      : value;
+  }
+
+  function loadStoredContentWidth() {
+    return normalizeContentWidth(storage.get(CONTENT_WIDTH_STORAGE_KEY));
+  }
+
+  var contentWidth = loadStoredContentWidth();
+
+  function applyContentWidth() {
+    document.documentElement.setAttribute("data-content-width", contentWidth);
+  }
+
+  function setContentWidth(mode) {
+    contentWidth = normalizeContentWidth(mode);
+    applyContentWidth();
+    storage.set(CONTENT_WIDTH_STORAGE_KEY, contentWidth);
+  }
+
+  applyContentWidth();
+
   // Rounds to one decimal place (avoiding float drift across repeated +/-
   // presses, e.g. 0.1 + 0.2 in JS) and clamps to [ZOOM_MIN, ZOOM_MAX].
   function normalizeZoom(value) {
@@ -145,7 +187,11 @@
 
   applyZoom();
 
-  window.__mdviewViewer = { zoom: zoom_, reload: reload };
+  window.__mdviewViewer = {
+    zoom: zoom_,
+    reload: reload,
+    setContentWidth: setContentWidth,
+  };
 
   // -- relative-link navigation, http(s) links in --browser mode, and
   //    back/forward history (doc header + ⌘[/⌘]) ---------------------------
@@ -627,11 +673,13 @@
   // Keyboard shortcuts, for every mode/platform that has no native menu to
   // intercept them first: Windows, Linux, and `--browser` mode on every OS
   // (including macOS — the muda menu only exists in the native window). On
-  // macOS's native window, the menu's accelerators (Cmd+=/-/0, see app.rs)
-  // consume the keydown before the WebView ever sees it, so this listener
-  // simply never fires there for those keys — nothing to double-handle.
+  // macOS's native window, the menu's accelerators (Cmd+=/-/0 and
+  // Cmd+Shift+1/2/0, see app.rs) consume the keydown before the WebView
+  // ever sees it, so this listener simply never fires there for those keys
+  // — nothing to double-handle.
   // ⌘[/⌘] (back/forward) has no menu accelerator at all, on any platform,
-  // so unlike zoom this fires everywhere, macOS's native window included.
+  // so unlike zoom/content-width this fires everywhere, macOS's native
+  // window included.
   document.addEventListener("keydown", function (event) {
     // `event.altKey` excluded: on layouts where AltGr is used to type
     // punctuation (many European keyboards), AltGr commonly arrives as
@@ -640,9 +688,32 @@
     if (!(event.metaKey || event.ctrlKey) || event.altKey) {
       return;
     }
-    // "+" needs Shift on most layouts, so it and the unshifted "=" both
-    // mean zoom in (matching every browser's own Cmd/Ctrl+= shortcut).
-    if (event.key === "+" || event.key === "=") {
+    if (
+      event.shiftKey &&
+      (event.code === "Digit1" || event.code === "Digit2" || event.code === "Digit0")
+    ) {
+      // Content width — mirrors the View menu's Standard/Wide/Full Width
+      // items (see `install_menu`/`UserEvent::ContentWidth` in app.rs),
+      // which consume the keydown first on macOS's native window the same
+      // way the zoom accelerators below do (see this listener's own module
+      // docs). `event.code`, not `event.key`, so a Shift+digit still reads
+      // as the physical key on a layout where Shift turns a digit into a
+      // symbol instead (e.g. Shift+1 is "!" on a US layout, but still
+      // `event.code === "Digit1"`). Checked before the zoom keys, which
+      // match on `event.key`: on AZERTY Shift+Digit0 yields "0" and on a
+      // Swiss layout Shift+Digit1 yields "+", which would otherwise be
+      // swallowed as zoom reset / zoom in.
+      event.preventDefault();
+      if (event.code === "Digit1") {
+        setContentWidth("standard");
+      } else if (event.code === "Digit2") {
+        setContentWidth("wide");
+      } else {
+        setContentWidth("full");
+      }
+    } else if (event.key === "+" || event.key === "=") {
+      // "+" needs Shift on most layouts, so it and the unshifted "=" both
+      // mean zoom in (matching every browser's own Cmd/Ctrl+= shortcut).
       event.preventDefault();
       zoom_("in");
     } else if (event.key === "-") {
@@ -651,7 +722,7 @@
     } else if (event.key === "0") {
       event.preventDefault();
       zoom_("reset");
-    } else if (event.key === "[" && !isTextInputFocused() && !isBrowserMode()) {
+    } else if (event.key === "["&& !isTextInputFocused() && !isBrowserMode()) {
       // `--browser` has no per-window history to move through (`PUT /nav`
       // is always `501` there) — left out of the branch entirely rather
       // than preventDefault-ing a keystroke that would otherwise still do
